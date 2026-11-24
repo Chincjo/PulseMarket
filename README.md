@@ -9,9 +9,18 @@ after the buyer confirms with photo and video.
 ## Stack
 
 - React + Vite + Tailwind CSS, mobile-first
-- Netlify Identity for accounts, Netlify Database for data, Netlify Blobs for
-  ID documents and evidence media
+- Supabase (free tier) for accounts (email + Google), database and storage
 - Paystack (test mode until live keys are added after activation)
+
+## Accounts (Milestone 2)
+
+The app is login-first: a signed-out visitor sees only the welcome page, then
+the separate sign-up / sign-in pages. The home page, Sell and the rest unlock
+only after the account is created AND student verification is submitted.
+Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (see `.env.example`) in
+Vercel → Project → Settings → Environment Variables, and set the Supabase
+Site URL to the Vercel URL. Until the keys are set, the welcome page says
+accounts are being switched on.
 
 ## Develop
 
@@ -22,8 +31,8 @@ npm run dev
 
 ## Deploy
 
-Pushes to `main` deploy on Netlify (15 credits per production deploy on the
-free plan). The live site is https://pulsemarket-app-1c9cef.netlify.app
+Pushes to `main` auto-deploy on Vercel. The live site is
+https://pulse-market-nine.vercel.app (also https://pulse-market-yqz8.vercel.app).
 
 ## Fees
 

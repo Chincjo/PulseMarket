@@ -1,9 +1,10 @@
 import { Link } from "react-router-dom";
 import { getVerification } from "../lib/store";
 import { GhostButton, PrimaryButton } from "../components/ui";
-import { logout } from "../lib/identity";
+import { useAuth } from "../lib/auth";
 
 export default function Profile({ user }) {
+  const { signOut } = useAuth();
   const verification = getVerification();
   return (
     <div className="space-y-4">
@@ -66,7 +67,7 @@ export default function Profile({ user }) {
             </>
           ) : null}
           <button
-            onClick={() => logout()}
+            onClick={() => signOut()}
             className="w-full rounded-full border border-neutral-300 px-4 py-2.5 text-sm font-semibold dark:border-neutral-700"
           >
             Sign out
