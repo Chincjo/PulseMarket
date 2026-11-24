@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate } from "react-router-dom";
+import { Analytics } from "@vercel/analytics/react";
 import Home from "./pages/Home.jsx";
 import Search from "./pages/Search.jsx";
 import Sell from "./pages/Sell.jsx";
@@ -175,6 +176,7 @@ export default function App() {
   return (
     <AuthProvider>
       <Shell />
+      <Analytics />
     </AuthProvider>
   );
 }
