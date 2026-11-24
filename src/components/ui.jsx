@@ -25,10 +25,10 @@ export function EmptyState({ title, body, action }) {
   );
 }
 
-export function PrimaryButton({ children, ...props }) {
+export function PrimaryButton({ children, className = "", ...props }) {
   return (
     <button
-      className="inline-flex items-center justify-center rounded-full bg-brown px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+      className={`inline-flex items-center justify-center rounded-full bg-brown px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50 ${className}`}
       {...props}
     >
       {children}
@@ -36,10 +36,10 @@ export function PrimaryButton({ children, ...props }) {
   );
 }
 
-export function GhostButton({ children, ...props }) {
+export function GhostButton({ children, className = "", ...props }) {
   return (
     <button
-      className="inline-flex items-center justify-center rounded-full border border-neutral-300 px-4 py-2 text-sm font-semibold dark:border-neutral-700"
+      className={`inline-flex items-center justify-center rounded-full border border-neutral-300 px-4 py-2 text-sm font-semibold dark:border-neutral-700 ${className}`}
       {...props}
     >
       {children}

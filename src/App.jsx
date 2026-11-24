@@ -55,7 +55,7 @@ export default function App() {
             <>
               <button
                 onClick={() => openAuth("login")}
-                className="rounded-full px-3 py-1.5 text-sm font-semibold"
+                className="rounded-full border border-neutral-300 px-3 py-1.5 text-sm font-semibold dark:border-neutral-700"
               >
                 Sign in
               </button>
