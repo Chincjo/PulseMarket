@@ -11,6 +11,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { UNIVERSITY_NAMES } from "../lib/data";
 import { getVerification, saveVerification } from "../lib/store";
 import { saveVerificationRow } from "../lib/listings";
+import { generateInviteCode } from "../lib/ratings";
 import { GhostButton, PrimaryButton, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
@@ -48,6 +49,7 @@ export default function Verify({ onVerified }) {
   const [university, setUniversity] = useState(UNIVERSITY_NAMES[0]);
   const [studentEmail, setStudentEmail] = useState("");
   const [studentId, setStudentId] = useState("");
+  const [referralCode, setReferralCode] = useState("");
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
 
@@ -101,6 +103,9 @@ export default function Verify({ onVerified }) {
   }
 
   async function submitVerification() {
+    // Milestone 11: a referral code is accepted only in the real
+    // PM-XXXXXX shape; anything else is ignored, never blocks joining.
+    const cleanReferral = referralCode.trim().toUpperCase();
     const rec = {
       userId: user?.id || null,
       email: user?.email || email,
@@ -108,7 +113,8 @@ export default function Verify({ onVerified }) {
       studentEmail,
       studentId,
       status: "pending review",
-      inviteCode: `PM-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+      inviteCode: generateInviteCode(),
+      referredBy: /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral) ? cleanReferral : null,
       submittedAt: new Date().toISOString(),
     };
     saveVerification(rec);
@@ -187,6 +193,10 @@ export default function Verify({ onVerified }) {
         <label className="block text-sm font-semibold">
           Student ID / matric number
           <input value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. U2026/04115" className={`${inputCls} mt-1`} />
+        </label>
+        <label className="block text-sm font-semibold">
+          Invite code (optional) — if a friend invited you
+          <input value={referralCode} onChange={(e) => setReferralCode(e.target.value)} placeholder="e.g. PM-AB12CD" className={`${inputCls} mt-1`} />
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">

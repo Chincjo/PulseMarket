@@ -1,0 +1,491 @@
+// Milestone 6 — Orders + manual escrow. Every function returns null / []
+// and logs the error when the tables do not exist yet (owner has not run
+// supabase/milestone-6.sql), so the app says so honestly instead of
+// crashing. Money functions re-read the order first and refuse invalid
+// transitions with a clear Error.
+//
+// Money model (manual escrow):
+//   - Cash orders are settled face to face. No money ever touches the
+//     ledger for them: reserved -> delivered (buyer confirms the meetup
+//     happened) and the listing becomes sold. Nothing is held, nothing
+//     is released.
+//   - Held orders: buyer transfers to PulseMarket (reference = order
+//     code). The owner confirms the transfer arrived: reserved -> paid
+//     -> held, and one ledger entry puts the full total in the seller's
+//     "held" bucket. Buyer confirms delivery: held/shipped -> delivered.
+//     Release (buyer or owner): held -> available, the seller's available
+//     balance gains the item price + the shipping fee; the service and
+//     secure fees stay with PulseMarket, so they never enter "available".
+//     If a shipping advance was already released (Milestone 8), the
+//     release subtracts it from both legs, so the seller is never paid
+//     the advance twice — same math as the Milestone 10 SQL function
+//     auto_release_overdue_orders(). A frozen order (open dispute,
+//     Milestone 12) cannot be confirmed or released until the team
+//     resolves it.
+import { supabase } from "./supabase";
+import { feeBreakdown } from "./fees";
+import { updateListing } from "./listings";
+import { handoffComplete, logSecurityEvent } from "./handoff";
+import { notifyUser } from "./notifications";
+import {
+  OWNER_EMAIL,
+  PAYMENTS_MODE,
+  shippingZone,
+} from "./payments";
+
+export { PAYMENTS_MODE };
+
+function dbError(err, where) {
+  console.error(`[PulseMarket] ${where}:`, err?.message || err);
+  return null;
+}
+
+// Order codes: PM-ORD- + 6 uppercase letters/digits. The buyer uses the
+// code as the bank-transfer reference, so it must be unique and readable.
+export function generateOrderCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `PM-ORD-${code}`;
+}
+
+function isOwner(user) {
+  return user?.email === OWNER_EMAIL;
+}
+
+// Single internal helper for every ledger write. `moves` is an array of
+// { userId, bucket, kind, amount, note } — paired entries (e.g. release:
+// -total out of "held", +item+shipping into "available") are written in
+// one insert so the ledger can never hold half a move.
+async function recordLedgerMove(order, moves) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const rows = moves.map((m) => ({
+    order_id: order.id,
+    user_id: m.userId,
+    bucket: m.bucket,
+    kind: m.kind,
+    amount: m.amount,
+    note: m.note || null,
+    created_by: order.buyer_id,
+  }));
+  const { error } = await supabase.from("wallet_ledger").insert(rows);
+  if (error) throw error;
+}
+
+async function readOrder(id) {
+  if (!supabase || !id) return null;
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) return dbError(error, "fetch order");
+  return data;
+}
+
+// Shipping advance already paid out for this order (Milestone 8:
+// kind 'shipping_advance' in the seller's available bucket). The
+// release subtracts it so the seller is never paid the same money
+// twice. Returns 0 when the ledger table is missing.
+async function advanceAlreadyReleased(orderId) {
+  if (!supabase || !orderId) return 0;
+  const { data, error } = await supabase
+    .from("wallet_ledger")
+    .select("amount")
+    .eq("order_id", orderId)
+    .eq("kind", "shipping_advance")
+    .eq("bucket", "available");
+  if (error) {
+    dbError(error, "read shipping advance");
+    return 0;
+  }
+  return (data || []).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+}
+
+async function updateOrder(id, patch) {
+  const { data, error } = await supabase
+    .from("orders")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Create + read
+// ---------------------------------------------------------------------------
+
+// buyerState comes from the buyer's verification record (their
+// university's state) and decides the shipping zone. Pass "" when it is
+// unknown — the zone then defaults to same-state and the team confirms
+// the real shipping fee when the parcel is booked.
+export async function createOrder({
+  listing,
+  buyerId,
+  paymentMethod,
+  deliveryMethod,
+  meetupSpot,
+  shipToState,
+  courier,
+  buyerState,
+}) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!listing || !buyerId) throw new Error("Missing listing or buyer.");
+  if (listing.seller_id === buyerId) {
+    throw new Error("You cannot buy your own listing.");
+  }
+  if (listing.status !== "active") {
+    throw new Error("This item is no longer available.");
+  }
+  if (!["cash", "held"].includes(paymentMethod)) {
+    throw new Error("Choose cash or pay through the app.");
+  }
+  if (!["meetup", "shipping"].includes(deliveryMethod)) {
+    throw new Error("Choose meet in person or shipping.");
+  }
+  if (deliveryMethod === "meetup" && !meetupSpot) {
+    throw new Error("Choose a safe meetup spot.");
+  }
+  if (deliveryMethod === "shipping" && !shipToState) {
+    throw new Error("Choose the state to ship to.");
+  }
+
+  const fees = feeBreakdown(
+    listing.price,
+    paymentMethod === "cash" ? "cash" : "held"
+  );
+  const zone =
+    deliveryMethod === "shipping"
+      ? shippingZone(buyerState, listing.state)
+      : null;
+  const shippingFee = zone ? zone.fee : 0;
+  const total = fees.total + shippingFee;
+
+  const { data, error } = await supabase
+    .from("orders")
+    .insert({
+      code: generateOrderCode(),
+      listing_id: listing.id,
+      buyer_id: buyerId,
+      seller_id: listing.seller_id,
+      item_price: fees.price,
+      service_fee: fees.serviceFee,
+      secure_fee: fees.secureFee,
+      shipping_fee: shippingFee,
+      total,
+      payment_method: paymentMethod,
+      delivery_method: deliveryMethod,
+      status: "reserved",
+      meetup_spot: deliveryMethod === "meetup" ? meetupSpot : null,
+      ship_to_state: deliveryMethod === "shipping" ? shipToState : null,
+      courier: deliveryMethod === "shipping" ? courier || null : null,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+
+  // Hold the listing so nobody else can buy it while this order is open.
+  // If that fails, remove the order again rather than leaving a stray.
+  try {
+    await updateListing(listing.id, { status: "reserved" });
+  } catch (err) {
+    await supabase.from("orders").delete().eq("id", data.id);
+    throw err;
+  }
+  return data;
+}
+
+export async function fetchOrder(id) {
+  return readOrder(id);
+}
+
+export async function fetchMyOrders(userId) {
+  if (!supabase || !userId) return [];
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
+    .order("created_at", { ascending: false });
+  if (error) {
+    dbError(error, "fetch my orders");
+    return [];
+  }
+  return data || [];
+}
+
+export async function fetchOrdersForListing(listingId) {
+  if (!supabase || !listingId) return [];
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("listing_id", listingId)
+    .order("created_at", { ascending: false });
+  if (error) {
+    dbError(error, "fetch orders for listing");
+    return [];
+  }
+  return data || [];
+}
+
+// ---------------------------------------------------------------------------
+// Money transitions — each re-reads the order and refuses bad transitions.
+// ---------------------------------------------------------------------------
+
+// Buyer says "I have transferred" (held orders only). The money is NOT
+// held yet — the owner must still confirm the transfer arrived.
+export async function markPaid(orderId, userId) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.payment_method === "cash") {
+    throw new Error("Cash orders are paid face to face — nothing to transfer.");
+  }
+  if (userId && order.buyer_id !== userId) {
+    throw new Error("Only the buyer can mark this order as paid.");
+  }
+  if (order.status !== "reserved") {
+    throw new Error(`This order is ${order.status} — it cannot be marked as paid.`);
+  }
+  return updateOrder(orderId, { status: "paid", paid_at: new Date().toISOString() });
+}
+
+// Owner only: the bank transfer arrived, so the money is now HELD for
+// the seller. One ledger entry puts the full total in the seller's
+// "held" bucket.
+export async function confirmReceipt(orderId, user) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (!isOwner(user)) {
+    throw new Error("Only the PulseMarket team can confirm a bank transfer arrived.");
+  }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  if (order.status !== "paid") {
+    throw new Error(`This order is ${order.status} — there is no transfer to confirm.`);
+  }
+  await recordLedgerMove(order, [
+    {
+      userId: order.seller_id,
+      bucket: "held",
+      kind: "hold",
+      amount: order.total,
+      note: `Held for order ${order.code}`,
+    },
+  ]);
+  const updated = await updateOrder(orderId, { status: "held", held_at: new Date().toISOString() });
+  notifyUser(order.buyer_id, {
+    kind: "order",
+    title: "Payment confirmed",
+    body: `Your transfer for order ${order.code} arrived — the money is now held.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  notifyUser(order.seller_id, {
+    kind: "order",
+    title: "Money held",
+    body: `The buyer paid for order ${order.code} — the money is held until delivery.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  return updated;
+}
+
+// Milestone 9 gate: a shipping order is confirmed delivered only
+// when the buyer has a verified unboxing video for it (kind
+// 'unboxing', media_type 'video', verified=true). Meet-in-person
+// orders are gated by the Milestone 7 handoff instead, so this
+// helper does nothing for them. If the evidence table does not exist
+// yet (the owner has not run supabase/milestone-9.sql), delivery
+// FAILS OPEN with a console warning — a missing table must not block
+// a real delivery.
+async function requireUnboxingEvidence(order) {
+  if (!order || order.delivery_method !== "shipping") return;
+  if (!supabase) return;
+  const { data, error } = await supabase
+    .from("evidence")
+    .select("id")
+    .eq("order_id", order.id)
+    .eq("kind", "unboxing")
+    .eq("media_type", "video")
+    .eq("verified", true)
+    .limit(1);
+  if (error) {
+    const code = String(error.code || "");
+    const message = String(error.message || "");
+    const missingTable =
+      code === "42P01" ||
+      code === "PGRST205" ||
+      /relation .* does not exist|Could not find the table/i.test(message);
+    if (missingTable) {
+      console.warn(
+        "[PulseMarket] Evidence table not found — delivery gate skipped. Run supabase/milestone-9.sql to switch on the Evidence Locker."
+      );
+      return;
+    }
+    dbError(error, "check unboxing evidence");
+    throw new Error(
+      "Add your unboxing video first — it must be recorded in the app and no longer than 60 seconds."
+    );
+  }
+  if (!data || data.length === 0) {
+    throw new Error(
+      "Add your unboxing video first — it must be recorded in the app and no longer than 60 seconds."
+    );
+  }
+}
+
+// Buyer confirms the item arrived. NOTE: Milestone 9 adds the photo/video
+// evidence requirement to this step. Milestone 7 gate: for meet-in-person
+// orders the buyer confirms delivery only after the handoff — the code
+// scanned, both handover photos taken and both sides confirmed.
+export async function confirmDelivery(orderId, userId) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (userId && order.buyer_id !== userId) {
+    throw new Error("Only the buyer can confirm delivery.");
+  }
+  const now = new Date().toISOString();
+  if (order.payment_method === "cash") {
+    // Cash was settled face to face, so there is no held money to
+    // release. Confirming the meetup closes the order and sells the item.
+    if (order.status !== "reserved") {
+      throw new Error(`This order is ${order.status} — delivery cannot be confirmed.`);
+    }
+    if (order.delivery_method === "meetup" && !handoffComplete(order)) {
+      await logSecurityEvent(orderId, userId, "delivery_blocked", `Delivery confirmation blocked — handoff not complete for order ${order.code}.`);
+      throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
+    }
+    await requireUnboxingEvidence(order);
+    const updated = await updateOrder(orderId, { status: "delivered", delivered_at: now });
+    await updateListing(order.listing_id, { status: "sold" });
+    return updated;
+  }
+  if (!["held", "shipped"].includes(order.status)) {
+    throw new Error(`This order is ${order.status} — delivery cannot be confirmed yet.`);
+  }
+  if (order.delivery_method === "meetup" && !handoffComplete(order)) {
+    await logSecurityEvent(orderId, userId, "delivery_blocked", `Delivery confirmation blocked — handoff not complete for order ${order.code}.`);
+    throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
+  }
+  await requireUnboxingEvidence(order);
+  return updateOrder(orderId, { status: "delivered", delivered_at: now });
+}
+
+// Buyer confirming, or the owner: release the held money to the seller.
+// Two ledger entries: the full total leaves "held", and the item price +
+// shipping fee enters "available". The service and secure fees stay with
+// PulseMarket and never enter the seller's available balance.
+export async function releaseOrder(orderId, user) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.payment_method === "cash") {
+    throw new Error("Cash orders are settled face to face — there is no held money to release.");
+  }
+  const allowed =
+    (user && order.buyer_id === user.id) || isOwner(user);
+  if (!allowed) {
+    throw new Error("Only the buyer or the PulseMarket team can release this order.");
+  }
+  if (!["held", "delivered"].includes(order.status)) {
+    throw new Error(`This order is ${order.status} — there is no held money to release.`);
+  }
+  // Milestone 12 gate: a frozen order (open dispute) cannot release
+  // until the PulseMarket team resolves it. `frozen` is undefined
+  // until supabase/milestone-12.sql is run, which is safely falsy.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  // Milestone 7 gate: a meet-in-person order releases only after the
+  // handoff is complete — code scanned, both photos, both confirmations.
+  if (order.delivery_method === "meetup" && !handoffComplete(order)) {
+    await logSecurityEvent(orderId, user?.id, "release_blocked", `Release blocked — handoff not complete for order ${order.code}.`);
+    throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
+  }
+  // Milestone 8 advance: part of the shipping fee may already sit in
+  // the seller's available bucket. Release only what is still held,
+  // so the seller is never paid the advance twice — same math as the
+  // Milestone 10 SQL function auto_release_overdue_orders().
+  const advance = await advanceAlreadyReleased(order.id);
+  const heldAmount = -Math.max(0, order.total - advance);
+  const availableAmount = Math.max(
+    0,
+    order.item_price + ((order.shipping_fee || 0) - advance)
+  );
+  await recordLedgerMove(order, [
+    {
+      userId: order.seller_id,
+      bucket: "held",
+      kind: "release",
+      amount: heldAmount,
+      note: `Released from hold for order ${order.code}`,
+    },
+    {
+      userId: order.seller_id,
+      bucket: "available",
+      kind: "release",
+      amount: availableAmount,
+      note: `Released to seller for order ${order.code}`,
+    },
+  ]);
+  const updated = await updateOrder(orderId, {
+    status: "released",
+    released_at: new Date().toISOString(),
+  });
+  await updateListing(order.listing_id, { status: "sold" });
+  notifyUser(order.buyer_id, {
+    kind: "release",
+    title: "Money released",
+    body: `The held money for order ${order.code} was released to the seller.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  notifyUser(order.seller_id, {
+    kind: "release",
+    title: "Money released",
+    body: `The held money for order ${order.code} is now in your available balance.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  return updated;
+}
+
+// Buyer only, while the order is still 'reserved' or 'paid'. The listing
+// goes back to 'active'. In manual mode a 'paid' order has no hold entry
+// yet, so cancelling it just cancels — but if a hold entry ever exists
+// for this order it is reversed with a matching negative entry.
+export async function cancelOrder(orderId, userId) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (userId && order.buyer_id !== userId) {
+    throw new Error("Only the buyer can cancel this order.");
+  }
+  if (!["reserved", "paid"].includes(order.status)) {
+    throw new Error(`This order is ${order.status} — it can no longer be cancelled.`);
+  }
+  if (supabase) {
+    const { data } = await supabase
+      .from("wallet_ledger")
+      .select("amount")
+      .eq("order_id", order.id)
+      .eq("kind", "hold");
+    const held = (data || []).reduce((sum, r) => sum + (r.amount || 0), 0);
+    if (held !== 0) {
+      await recordLedgerMove(order, [
+        {
+          userId: order.seller_id,
+          bucket: "held",
+          kind: "refund",
+          amount: -held,
+          note: `Hold reversed — order ${order.code} cancelled`,
+        },
+      ]);
+    }
+  }
+  const updated = await updateOrder(orderId, { status: "cancelled" });
+  await updateListing(order.listing_id, { status: "active" });
+  return updated;
+}

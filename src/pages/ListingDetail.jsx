@@ -20,6 +20,8 @@ import {
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
 import { BoostedBadge } from "../components/ListingCard";
 import ListingEditForm from "../components/ListingEditForm";
+import { startConversation } from "../lib/chat";
+import { fetchSellerRating } from "../lib/ratings";
 import { useAuth } from "../lib/auth";
 
 export default function ListingDetail() {
@@ -37,6 +39,36 @@ export default function ListingDetail() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [chatting, setChatting] = useState(false);
+  const [sellerRating, setSellerRating] = useState(null);
+
+  // Milestone 11: the seller's rating summary for the seller card.
+  useEffect(() => {
+    if (!listing?.seller_id) return;
+    let cancelled = false;
+    fetchSellerRating(listing.seller_id).then((r) => {
+      if (!cancelled) setSellerRating(r);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [listing?.seller_id]);
+
+  async function chatSeller() {
+    if (!user || !listing) return;
+    setError("");
+    setChatting(true);
+    try {
+      const { conversation, error: chatError } = await startConversation(listing);
+      if (chatError || !conversation) {
+        setError(chatError || "Could not start the chat. Please try again.");
+        return;
+      }
+      navigate(`/chat/${conversation.id}`);
+    } finally {
+      setChatting(false);
+    }
+  }
 
   const isOwner = user && listing && listing.seller_id === user.id;
 
@@ -211,6 +243,13 @@ export default function ListingDetail() {
           <p className="text-sm text-neutral-500">
             {listing.university} · {listing.state}
           </p>
+          {sellerRating && sellerRating.count > 0 ? (
+            <p className="text-sm font-semibold text-brown">
+              ★ {sellerRating.average} · {sellerRating.count} rating{sellerRating.count === 1 ? "" : "s"}
+            </p>
+          ) : (
+            <p className="text-sm text-neutral-400">No ratings yet</p>
+          )}
         </div>
         <span className="rounded-full bg-brown-soft px-2.5 py-1 text-xs font-bold text-brown-dark">
           Verified student
@@ -272,6 +311,11 @@ export default function ListingDetail() {
       {/* Buyer actions */}
       {!isOwner && listing.status === "active" ? (
         <div className="space-y-2">
+          {error ? (
+            <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+              {error}
+            </p>
+          ) : null}
           <button
             onClick={toggleWatch}
             disabled={savingWatch}
@@ -279,13 +323,19 @@ export default function ListingDetail() {
           >
             {saved ? "★ Saved to watchlist" : "☆ Save to watchlist"}
           </button>
-          <div className="rounded-2xl border border-neutral-200 p-4 text-sm text-neutral-500 dark:border-neutral-800">
-            <p className="font-bold text-neutral-900 dark:text-white">Chat &amp; Make Offer — coming next</p>
-            <p className="mt-1">
-              Chat and offers arrive with the next build. For now, save this
-              item and check back once chat is live.
-            </p>
-          </div>
+          <PrimaryButton
+            onClick={() => navigate(`/checkout/${listing.id}`)}
+            className="w-full py-3 text-base"
+          >
+            Buy — Reserve this item
+          </PrimaryButton>
+          <GhostButton onClick={chatSeller} disabled={chatting} className="w-full py-2.5">
+            {chatting ? "Opening chat…" : "Chat Seller"}
+          </GhostButton>
+          <p className="text-center text-xs text-neutral-500">
+            Chat to ask questions or make an offer. Buying puts the money on
+            hold until you confirm the item.
+          </p>
         </div>
       ) : null}
 

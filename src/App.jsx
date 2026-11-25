@@ -5,6 +5,16 @@ import Home from "./pages/Home.jsx";
 import Search from "./pages/Search.jsx";
 import Sell from "./pages/Sell.jsx";
 import Chat from "./pages/Chat.jsx";
+import ChatThread from "./pages/ChatThread.jsx";
+import Checkout from "./pages/Checkout.jsx";
+import OrderDetail from "./pages/OrderDetail.jsx";
+import Handoff from "./pages/Handoff.jsx";
+import Tracking from "./pages/Tracking.jsx";
+import EvidenceLocker from "./pages/EvidenceLocker.jsx";
+import Notifications from "./pages/Notifications.jsx";
+import Invite from "./pages/Invite.jsx";
+import Dispute from "./pages/Dispute.jsx";
+import Admin from "./pages/Admin.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Wallet from "./pages/Wallet.jsx";
 import Profile from "./pages/Profile.jsx";
@@ -16,6 +26,8 @@ import ListingDetail from "./pages/ListingDetail.jsx";
 import { Logo } from "./components/ui.jsx";
 import { getSettings, getVerification, saveVerification } from "./lib/store";
 import { fetchVerificationRow, saveVerificationRow } from "./lib/listings";
+import { fetchUnreadCount } from "./lib/notifications";
+import { runAutoReleaseCheck } from "./lib/autoRelease";
 import { AuthProvider, useAuth } from "./lib/auth";
 
 const TABS = [
@@ -41,6 +53,7 @@ function Shell() {
   const navigate = useNavigate();
   const [verification, setVerification] = useState(() => getVerification());
   const [verifying, setVerifying] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
 
   useEffect(() => {
     applyAppearance(getSettings());
@@ -75,6 +88,32 @@ function Shell() {
       });
     return () => {
       cancelled = true;
+    };
+  }, [user]);
+
+  // Milestone 10: app-side 48h auto-release — once per sign-in, release
+  // any of this student's delivered orders whose 48h window has passed.
+  // Fire-and-forget; runAutoReleaseCheck never throws.
+  useEffect(() => {
+    if (!user) return;
+    runAutoReleaseCheck(user).catch(() => {});
+  }, [user]);
+
+  // Milestone 10: unread notification count for the header bell,
+  // refreshed every minute while signed in.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    const refresh = () => {
+      fetchUnreadCount(user.id).then((n) => {
+        if (!cancelled) setUnreadCount(n);
+      });
+    };
+    refresh();
+    const timer = setInterval(refresh, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
     };
   }, [user]);
 
@@ -139,6 +178,14 @@ function Shell() {
             <span className="text-lg font-bold">PulseMarket</span>
           </Link>
           <div className="flex-1" />
+          <Link to="/notifications" aria-label="Notifications" className="relative rounded-full p-2 text-lg leading-none">
+            🔔
+            {unreadCount > 0 && (
+              <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-brown px-1 text-[10px] font-bold text-white">
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
+          </Link>
           <button
             onClick={() => navigate("/profile")}
             className="flex h-8 w-8 items-center justify-center rounded-full bg-brown text-sm font-bold text-white"
@@ -158,6 +205,16 @@ function Shell() {
           <Route path="/sell" element={<Sell verification={verification} />} />
           <Route path="/listing/:id" element={<ListingDetail />} />
           <Route path="/chat" element={<Chat />} />
+          <Route path="/chat/:id" element={<ChatThread />} />
+          <Route path="/checkout/:listingId" element={<Checkout />} />
+          <Route path="/order/:id" element={<OrderDetail />} />
+          <Route path="/handoff/:orderId" element={<Handoff />} />
+          <Route path="/tracking/:orderId" element={<Tracking />} />
+          <Route path="/evidence" element={<EvidenceLocker />} />
+          <Route path="/notifications" element={<Notifications />} />
+          <Route path="/invite" element={<Invite />} />
+          <Route path="/dispute/:orderId" element={<Dispute />} />
+          <Route path="/admin" element={<Admin />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/wallet" element={<Wallet />} />
           <Route path="/profile" element={<Profile user={user} />} />
@@ -175,6 +232,7 @@ function Shell() {
             Support: pulsemarketsupport@gmail.com
           </p>
           <p className="mt-2 flex flex-wrap gap-3">
+            <Link to="/invite" className="underline">Invite friends</Link>
             <Link to="/settings" className="underline">About</Link>
             <Link to="/settings" className="underline">Terms</Link>
             <Link to="/settings" className="underline">Privacy</Link>

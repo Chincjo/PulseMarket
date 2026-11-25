@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { getSettings, saveSettings } from "../lib/store";
 import { inputCls } from "../components/ui";
+import { supabase } from "../lib/supabase";
+import { useAuth } from "../lib/auth";
 
 const BACKGROUNDS = [
   { id: "system", label: "System" },
@@ -10,6 +12,7 @@ const BACKGROUNDS = [
 ];
 
 export default function Settings({ applyAppearance }) {
+  const { user } = useAuth();
   const [settings, setSettings] = useState(getSettings());
   const [copied, setCopied] = useState(false);
   const [cleared, setCleared] = useState(false);
@@ -19,6 +22,23 @@ export default function Settings({ applyAppearance }) {
     setSettings(next);
     saveSettings(next);
     applyAppearance(next);
+  }
+
+  // The verified-only chat toggle is enforced server-side (Milestone 5):
+  // the value lives on the verifications row so it follows the student to
+  // any phone. The device copy in pm-settings stays as the fallback.
+  function toggleVerifiedOnlyChat() {
+    const next = !settings.verifiedOnlyChat;
+    update({ verifiedOnlyChat: next });
+    if (supabase && user) {
+      supabase
+        .from("verifications")
+        .update({ chat_verified_only: next })
+        .eq("user_id", user.id)
+        .then(({ error }) => {
+          if (error) console.error("[PulseMarket] save verified-only chat:", error.message);
+        });
+    }
   }
 
   function toggleNotif(key) {
@@ -74,7 +94,7 @@ export default function Settings({ applyAppearance }) {
           <input
             type="checkbox"
             checked={settings.verifiedOnlyChat}
-            onChange={() => update({ verifiedOnlyChat: !settings.verifiedOnlyChat })}
+            onChange={toggleVerifiedOnlyChat}
             className="h-5 w-5 accent-[#7d5027]"
           />
         </label>

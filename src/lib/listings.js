@@ -79,6 +79,16 @@ export async function saveVerificationRow(userId, rec) {
     dbError(error, "save verification");
     return false;
   }
+  // Milestone 11: referral attribution, saved as a separate update so
+  // a missing referred_by column (milestone-11.sql not run yet) can
+  // never break the verification save itself.
+  if (rec.referredBy) {
+    const { error: refError } = await supabase
+      .from("verifications")
+      .update({ referred_by: rec.referredBy })
+      .eq("user_id", userId);
+    if (refError) dbError(refError, "save referral code");
+  }
   return true;
 }
 
