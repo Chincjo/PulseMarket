@@ -4,6 +4,16 @@
 // listing-photos bucket first; the listing stores their public URLs.
 // No sample or fake listings are ever created here — only what the student
 // publishes themselves.
+//
+// EVERYTHING the form asks for is compulsory: the seller must pick a
+// condition, a category, a delivery method (and courier + ships-to for
+// shipping, or a safe meetup spot for meetups), add at least 1 photo and
+// write a description of at least 20 characters. Only "What does it cost
+// new?" is optional — it only feeds the suggested price. Each step refuses
+// to advance until its own fields are filled, and Publish stays blocked
+// until the whole form is valid. Milestone 13 adds the same rules as
+// database CHECK constraints, so a listing cannot be slipped in by
+// bypassing this form.
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CATEGORIES, CONDITIONS, SAFE_MEETUP_SPOTS, universityState } from "../lib/data";
@@ -40,16 +50,17 @@ export default function Sell({ verification }) {
   const navigate = useNavigate();
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
-  const [condition, setCondition] = useState("Good");
-  const [category, setCategory] = useState(CATEGORIES[0]);
+  // No defaults on the choice fields: the seller must pick each one.
+  const [condition, setCondition] = useState("");
+  const [category, setCategory] = useState("");
   const [newPrice, setNewPrice] = useState("");
   const [price, setPrice] = useState("");
-  const [delivery, setDelivery] = useState("meetup");
-  const [courier, setCourier] = useState("GIG");
-  const [shipsTo, setShipsTo] = useState("same_state");
+  const [delivery, setDelivery] = useState("");
+  const [courier, setCourier] = useState("");
+  const [shipsTo, setShipsTo] = useState("");
   const [photos, setPhotos] = useState([]);
   const [description, setDescription] = useState("");
-  const [spot, setSpot] = useState(SAFE_MEETUP_SPOTS[0]);
+  const [spot, setSpot] = useState("");
   const [published, setPublished] = useState(null);
   const [publishing, setPublishing] = useState(false);
   const [error, setError] = useState("");
@@ -58,8 +69,89 @@ export default function Sell({ verification }) {
   const university = verification?.university || "";
   const state = universityState(university);
 
-  const suggested = newPrice ? suggestPrice(newPrice, condition) : null;
+  const suggested = newPrice && condition ? suggestPrice(newPrice, condition) : null;
   const fees = feeBreakdown(price, "held");
+
+  // -------------------------------------------------------------------------
+  // Compulsory-field rules. missingFor(step) names exactly what is still
+  // missing on one step; missingAll() covers the whole form for Publish.
+  // -------------------------------------------------------------------------
+  function missingFor(i) {
+    switch (i) {
+      case 0: {
+        const missing = [];
+        if (!name.trim()) missing.push("Item name");
+        if (!condition) missing.push("Condition");
+        if (!category) missing.push("Category");
+        return missing;
+      }
+      case 1: {
+        const n = Math.round(Number(price) || 0);
+        if (!price || n <= 0) return ["Your price (above ₦0)"];
+        return [];
+      }
+      case 2: {
+        const missing = [];
+        if (!delivery) {
+          missing.push("Delivery choice (Meet in person or Ship it)");
+        } else if (delivery === "shipping") {
+          if (!courier) missing.push("Courier");
+          if (!shipsTo) missing.push("Who can buy this (same state or anywhere in Nigeria)");
+        }
+        return missing;
+      }
+      case 3:
+        // Campus is locked from verification — nothing to fill in here.
+        return [];
+      case 4:
+        return photos.length === 0 ? ["At least 1 photo"] : [];
+      case 5:
+        return description.trim().length < 20
+          ? ["Description (at least 20 characters)"]
+          : [];
+      case 6:
+        return delivery === "meetup" && !spot ? ["Safe meetup spot"] : [];
+      default:
+        return [];
+    }
+  }
+
+  function missingAll() {
+    return [0, 1, 2, 3, 4, 5, 6].flatMap((i) => missingFor(i));
+  }
+
+  function missingMessage(missing) {
+    return `Still needed: ${missing.join(", ")}.`;
+  }
+
+  // Advance one step only when this step is complete.
+  function nextStep() {
+    const missing = missingFor(step);
+    if (missing.length > 0) {
+      setError(missingMessage(missing));
+      return;
+    }
+    setError("");
+    setStep(step + 1);
+  }
+
+  // Step pills: free to go back, forward only through completed steps.
+  function goToStep(i) {
+    if (i <= step) {
+      setError("");
+      setStep(i);
+      return;
+    }
+    for (let s = step; s < i; s++) {
+      const missing = missingFor(s);
+      if (missing.length > 0) {
+        setError(missingMessage(missing));
+        return;
+      }
+    }
+    setError("");
+    setStep(i);
+  }
 
   async function onPhotos(e) {
     const files = [...e.target.files].slice(0, 4 - photos.length);
@@ -70,6 +162,13 @@ export default function Sell({ verification }) {
 
   async function publish() {
     setError("");
+    // Defence in depth: never publish an incomplete listing, even if the
+    // button state and this check ever disagree.
+    const missing = missingAll();
+    if (missing.length > 0) {
+      setError(missingMessage(missing));
+      return;
+    }
     if (!isSupabaseConfigured() || !user) {
       setError("Publishing is not switched on yet — the owner is setting up the listings database. Try again soon.");
       return;
@@ -138,7 +237,7 @@ export default function Sell({ verification }) {
         {STEPS.map((s, i) => (
           <button
             key={s}
-            onClick={() => setStep(i)}
+            onClick={() => goToStep(i)}
             className={`rounded-full px-2.5 py-1 text-xs font-semibold ${i === step ? "bg-brown text-white" : "bg-neutral-100 dark:bg-neutral-900"}`}
           >
             {i + 1}. {s}
@@ -153,12 +252,14 @@ export default function Sell({ verification }) {
           </label>
           <label className="block text-sm font-semibold">Condition
             <select value={condition} onChange={(e) => setCondition(e.target.value)} className={`${inputCls} mt-1`}>
-              {CONDITIONS.map((c) => <option key={c}>{c}</option>)}
+              <option value="">Choose a condition…</option>
+              {CONDITIONS.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
           </label>
           <label className="block text-sm font-semibold">Category
             <select value={category} onChange={(e) => setCategory(e.target.value)} className={`${inputCls} mt-1`}>
-              {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
+              <option value="">Choose a category…</option>
+              {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
           </label>
         </div>
@@ -192,6 +293,7 @@ export default function Sell({ verification }) {
 
       {step === 2 && (
         <div className="space-y-3">
+          <p className="text-sm font-semibold">How will the buyer get it?</p>
           <div className="flex gap-2">
             <button onClick={() => setDelivery("meetup")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${delivery === "meetup" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>Meet in person</button>
             <button onClick={() => setDelivery("shipping")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${delivery === "shipping" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>Ship it</button>
@@ -200,7 +302,8 @@ export default function Sell({ verification }) {
             <>
               <label className="block text-sm font-semibold">Courier
                 <select value={courier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
-                  {["GIG", "GUO", "Peace Mass Transit", "ABC Transport", "DHL", "Chowdeck Relay", "Bus Park"].map((c) => <option key={c}>{c}</option>)}
+                  <option value="">Choose a courier…</option>
+                  {["GIG", "GUO", "Peace Mass Transit", "ABC Transport", "DHL", "Chowdeck Relay", "Bus Park"].map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
               </label>
               <div>
@@ -212,7 +315,9 @@ export default function Sell({ verification }) {
                 <p className="mt-1 text-sm text-neutral-500">
                   {shipsTo === "same_state"
                     ? "Only students in your state will see this listing."
-                    : "Students in every state will see this listing, because you ship anywhere."}
+                    : shipsTo === "nationwide"
+                      ? "Students in every state will see this listing, because you ship anywhere."
+                      : "Pick one so buyers know where this item can go."}
                 </p>
               </div>
             </>
@@ -220,7 +325,9 @@ export default function Sell({ verification }) {
           <p className="text-sm text-neutral-500">
             {delivery === "meetup"
               ? "Face-to-face: the buyer scans your seller code at handoff before any money moves."
-              : "Shipping: GIG / GUO between states, Chowdeck Relay same-city. You get 50% after shipping proof, 50% after delivery."}
+              : delivery === "shipping"
+                ? "Shipping: GIG / GUO between states, Chowdeck Relay same-city. You get 50% after shipping proof, 50% after delivery."
+                : "Choose one to continue."}
           </p>
         </div>
       )}
@@ -237,7 +344,7 @@ export default function Sell({ verification }) {
       {step === 4 && (
         <div className="space-y-3">
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-6 text-center text-sm dark:border-neutral-700">
-            Add up to 4 photos
+            Add at least 1 photo (up to 4)
             <input type="file" accept="image/*" multiple onChange={onPhotos} className="mt-2 block w-full text-sm" />
           </label>
           <div className="grid grid-cols-2 gap-2">
@@ -245,23 +352,41 @@ export default function Sell({ verification }) {
               <img key={i} src={p} alt={`Photo ${i + 1}`} className="h-32 w-full rounded-xl object-cover" />
             ))}
           </div>
-          <p className="text-sm text-neutral-500">Clear photos sell faster. Photos are uploaded with your listing.</p>
+          <p className="text-sm text-neutral-500">
+            {photos.length === 0
+              ? "Buyers need to see the item — add at least 1 photo to continue."
+              : "Clear photos sell faster. Photos are uploaded with your listing."}
+          </p>
         </div>
       )}
 
       {step === 5 && (
-        <label className="block text-sm font-semibold">Description
-          <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={5} placeholder="Condition, what's included, any faults — be honest, it builds trust." className={`${inputCls} mt-1`} />
-        </label>
+        <div className="space-y-3">
+          <label className="block text-sm font-semibold">Description
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={5} placeholder="Condition, what's included, any faults — be honest, it builds trust." className={`${inputCls} mt-1`} />
+          </label>
+          <p className="text-sm text-neutral-500">
+            {description.trim().length} / 20 characters minimum
+            {description.trim().length < 20 ? " — say a little more about the item." : ""}
+          </p>
+        </div>
       )}
 
       {step === 6 && (
         <div className="space-y-3">
-          <label className="block text-sm font-semibold">Safe meetup spot
-            <select value={spot} onChange={(e) => setSpot(e.target.value)} className={`${inputCls} mt-1`}>
-              {SAFE_MEETUP_SPOTS.map((s) => <option key={s}>{s}</option>)}
-            </select>
-          </label>
+          {delivery === "meetup" ? (
+            <label className="block text-sm font-semibold">Safe meetup spot
+              <select value={spot} onChange={(e) => setSpot(e.target.value)} className={`${inputCls} mt-1`}>
+                <option value="">Choose a safe meetup spot…</option>
+                {SAFE_MEETUP_SPOTS.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </label>
+          ) : (
+            <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+              <p className="font-bold">Shipping chosen</p>
+              <p className="mt-1 text-neutral-500">The buyer pays the courier at delivery or as agreed in chat. You get 50% after shipping proof, 50% after delivery.</p>
+            </div>
+          )}
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
             <p className="font-bold">Stay safe</p>
             <ul className="mt-1 list-disc space-y-1 pl-5 text-neutral-500">
@@ -270,6 +395,11 @@ export default function Sell({ verification }) {
               <li>The buyer must scan your seller code at handoff.</li>
             </ul>
           </div>
+          {missingAll().length > 0 && (
+            <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+              {missingMessage(missingAll())}
+            </p>
+          )}
         </div>
       )}
 
@@ -279,13 +409,17 @@ export default function Sell({ verification }) {
         </p>
       ) : null}
 
-      <div className="fixed inset-x-0 bottom-16 z-10 border-t border-neutral-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-neutral-800 dark:bg-black/95 sm:bottom-0">
+      {/* Action bar sits ABOVE the bottom nav (bottom-16) at every width.
+          The nav is fixed bottom-0 z-20 on desktop too, so dropping this bar
+          to bottom-0 on desktop (sm:bottom-0) put it underneath the nav and
+          the Publish button could not be seen or clicked. */}
+      <div className="fixed inset-x-0 bottom-16 z-30 border-t border-neutral-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-neutral-800 dark:bg-black/95">
         <div className="mx-auto flex max-w-2xl gap-2">
-          {step > 0 && <GhostButton onClick={() => setStep(step - 1)}>Back</GhostButton>}
+          {step > 0 && <GhostButton onClick={() => { setError(""); setStep(step - 1); }}>Back</GhostButton>}
           {step < STEPS.length - 1 ? (
-            <PrimaryButton className="flex-1" onClick={() => setStep(step + 1)}>Continue</PrimaryButton>
+            <PrimaryButton className="flex-1" onClick={nextStep}>Continue</PrimaryButton>
           ) : (
-            <button onClick={publish} disabled={!name || !price || publishing} className="flex-1 rounded-full bg-brown px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
+            <button onClick={publish} disabled={missingAll().length > 0 || publishing} className="flex-1 rounded-full bg-brown px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
               {publishing ? "Publishing…" : "Publish listing"}
             </button>
           )}

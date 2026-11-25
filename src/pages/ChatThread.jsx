@@ -12,6 +12,7 @@ import { useAuth } from "../lib/auth";
 import { SAFE_MEETUP_SPOTS } from "../lib/data";
 import { formatNaira } from "../lib/fees";
 import {
+  MAX_MESSAGE_LENGTH,
   QUICK_REPLIES,
   blockUser,
   fetchBlockedIds,
@@ -110,6 +111,10 @@ export default function ChatThread() {
   async function handleSend(e) {
     e.preventDefault();
     if (!draft.trim() || sending) return;
+    if (draft.trim().length > MAX_MESSAGE_LENGTH) {
+      setError(`Message is too long — keep it under ${MAX_MESSAGE_LENGTH} characters.`);
+      return;
+    }
     setSending(true);
     setError("");
     const sent = await sendMessage(id, draft);

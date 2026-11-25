@@ -14,8 +14,22 @@
 // - You cannot message yourself about your own listing.
 // - If the seller set chat_verified_only, the buyer must be verified.
 // - If either side blocked the other, no new chat can start.
+// - Messages are capped at 1000 characters and a student cannot send
+//   more than one message every 2 seconds (spam throttle, client-side).
+// - Only the two participants can read a conversation or its messages —
+//   that is enforced by RLS in milestone-5.sql, not here. There is no
+//   end-to-end encryption by design: the owner must be able to read chats
+//   to settle disputes. No IP blocking is possible inside the app: the
+//   platform never exposes a visitor's IP address.
 import { supabase } from "./supabase";
 import { notifyUser } from "./notifications";
+
+// Longest message the app will send. Longer text is refused, never cut.
+export const MAX_MESSAGE_LENGTH = 1000;
+
+// Minimum gap between two sends from the same device (spam throttle).
+const SEND_THROTTLE_MS = 2000;
+let lastSendAt = 0;
 
 export const QUICK_REPLIES = [
   "Still available?",
@@ -228,6 +242,12 @@ export async function fetchMessages(conversationId) {
 async function insertMessage(conversationId, row) {
   const senderId = await currentUserId();
   if (!senderId) return null;
+  // Spam throttle: one send per device every 2 seconds. The clock only
+  // moves after a send succeeds, so a failed send never blocks a retry.
+  if (Date.now() - lastSendAt < SEND_THROTTLE_MS) {
+    console.error("[PulseMarket] send message: too fast — wait a moment before sending again.");
+    return null;
+  }
   const { data, error } = await supabase
     .from("messages")
     .insert({ conversation_id: conversationId, sender_id: senderId, ...row })
@@ -237,6 +257,7 @@ async function insertMessage(conversationId, row) {
     dbError(error, "send message");
     return null;
   }
+  lastSendAt = Date.now();
   // Keep the conversation list ordered by the latest message.
   await supabase
     .from("conversations")
@@ -249,6 +270,12 @@ export async function sendMessage(conversationId, body) {
   if (!supabase || !conversationId) return null;
   const text = String(body || "").trim();
   if (!text) return null;
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    return dbError(
+      `Message is too long — keep it under ${MAX_MESSAGE_LENGTH} characters.`,
+      "send message"
+    );
+  }
   const sent = await insertMessage(conversationId, { body: text, kind: "text" });
   if (sent) {
     // Milestone 10: tell the other participant (never blocks the send).
