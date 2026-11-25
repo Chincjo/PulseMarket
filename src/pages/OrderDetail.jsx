@@ -351,7 +351,16 @@ export default function OrderDetail() {
             {busy === "held" ? "Saving…" : "Confirm receipt — money now held"}
           </PrimaryButton>
         )}
-        {(isOwner || isBuyer) && ["held", "delivered"].includes(order.status) && order.payment_method === "held" && !order.frozen && order.return_status !== "opened" && (
+        {/* Milestone 17: release opens only after delivery is
+            confirmed — a held order shows this note instead of the
+            button, so nobody is left wondering where it went. The
+            next step is the "Confirm delivery" button above. */}
+        {(isOwner || isBuyer) && order.status === "held" && order.payment_method === "held" && !order.frozen && order.return_status !== "opened" && (
+          <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+            The money stays held until delivery is confirmed — once you confirm delivery, the release to the seller opens here.
+          </p>
+        )}
+        {(isOwner || isBuyer) && order.status === "delivered" && order.payment_method === "held" && !order.frozen && order.return_status !== "opened" && (
           <PrimaryButton
             className="w-full py-3"
             disabled={busy !== ""}

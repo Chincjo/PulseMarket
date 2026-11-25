@@ -8,8 +8,8 @@
 // (supabase/milestone-10.sql) is the server-side path for the same
 // release, for when pg_cron is enabled — the two must never both be
 // relied on blindly: each guards against double-release (this file by
-// re-reading the order through releaseOrder, which refuses any order
-// that is no longer 'held'/'delivered'; the SQL function by checking
+// re-reading the order through releaseOrder, which (Milestone 17)
+// refuses any order that is not 'delivered'; the SQL function by checking
 // for an existing 'release' ledger entry). If pg_cron is live, this
 // check is a harmless backup — it finds nothing due, because the
 // server already released it.

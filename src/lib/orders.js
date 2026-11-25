@@ -13,7 +13,9 @@
 //     code). The owner confirms the transfer arrived: reserved -> paid
 //     -> held, and one ledger entry puts the full total in the seller's
 //     "held" bucket. Buyer confirms delivery: held/shipped -> delivered.
-//     Release (buyer or owner): held -> available, the seller's available
+//     Release (buyer or owner, Milestone 17): delivered -> available
+//     only — a held order cannot release, so money never moves
+//     before the buyer confirms delivery. The seller's available
 //     balance gains the item price + the shipping fee; the service and
 //     secure fees stay with PulseMarket, so they never enter "available".
 //     If a shipping advance was already released (Milestone 8), the
@@ -528,6 +530,8 @@ export async function confirmDelivery(orderId, userId) {
 }
 
 // Buyer confirming, or the owner: release the held money to the seller.
+// Milestone 17: only from 'delivered' — a held order cannot release,
+// so money never moves before the buyer confirms delivery.
 // Two ledger entries: the full total leaves "held", and the item price +
 // shipping fee enters "available". The service and secure fees stay with
 // PulseMarket and never enter the seller's available balance.
@@ -550,7 +554,17 @@ export async function releaseOrder(orderId, user) {
   if (await ledgerMoveExists(order.id, "release", "held")) {
     return finishRelease();
   }
-  if (!["held", "delivered"].includes(order.status)) {
+  // Milestone 17: release opens only after delivery is confirmed.
+  // A held order cannot release — the money stays held until the
+  // buyer confirms the item arrived, so a buyer can never release
+  // before the item ships. The buyer is told what to do next
+  // instead of getting a cryptic refusal.
+  if (order.status === "held") {
+    throw new Error(
+      "The money is still held — release opens once delivery is confirmed. Confirm delivery first, then release the money to the seller."
+    );
+  }
+  if (order.status !== "delivered") {
     throw new Error(`This order is ${order.status} — there is no held money to release.`);
   }
   // Milestone 12 gate: a frozen order (open dispute) cannot release
@@ -585,10 +599,13 @@ export async function releaseOrder(orderId, user) {
   // The database refuses a second release pair too (unique indexes
   // in supabase/milestone-14.sql); this check gives the plain error
   // and stops a double-click or two racing devices from paying twice.
-  // BUT a release pair can exist while the order still says 'held' /
+  // BUT a release pair can exist while the order still says
   // 'delivered' — the money moved, then the status update never
   // landed (network dropped). Throwing "already released" then would
   // leave the order stuck for ever, so finish the move instead.
+  // (A pair with the order still 'held' is a pre-Milestone-17
+  // leftover — finishRelease refuses it in plain words; the team
+  // closes it out by hand.)
   async function finishRelease() {
     // A frozen order never completes its release — same rule as
     // the first attempt. Without this check a retry after a
@@ -616,7 +633,19 @@ export async function releaseOrder(orderId, user) {
       await markSold();
       return order;
     }
-    if (!["held", "delivered"].includes(order.status)) {
+    // Milestone 17: same rule as the first attempt — only a
+    // delivered order completes its release. A held order with a
+    // release pair is a leftover from before this rule (the money
+    // already moved, but the status update never landed); it cannot
+    // close out here, because the database refuses held -> released
+    // — the team closes it out by hand instead of stranding it
+    // silently, and the buyer is told so in plain words.
+    if (order.status === "held") {
+      throw new Error(
+        "This order's release already went through while it was held — the PulseMarket team will close the order out. Nothing more was charged."
+      );
+    }
+    if (order.status !== "delivered") {
       throw new Error("This order was already released — the money moved once.");
     }
     const updated = await updateOrder(orderId, {

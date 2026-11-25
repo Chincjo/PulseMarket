@@ -6,11 +6,22 @@
 // Milestone 3: the submitted details are saved to the server
 // (verifications table) as well as on the device, so they follow the
 // student to any phone they sign in on. The university locks after submit.
-import { useState } from "react";
+// Milestone 17: the ID photos are uploaded FIRST, to the PRIVATE
+// verification-ids bucket — never to a public bucket — and their storage
+// paths go on the verification row with status 'pending review'. Only
+// the team can approve (or reject) a row; a rejected student can submit
+// again with new photos through the resubmit_verification RPC.
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { UNIVERSITY_NAMES } from "../lib/data";
 import { getVerification, saveVerification } from "../lib/store";
-import { saveVerificationRow } from "../lib/listings";
+import {
+  fetchVerificationRow,
+  removeVerificationIdPhotos,
+  resubmitVerification,
+  saveVerificationRow,
+  uploadVerificationIdPhotos,
+} from "../lib/listings";
 import { generateInviteCode } from "../lib/ratings";
 import { GhostButton, PrimaryButton, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -49,26 +60,82 @@ export default function Verify({ onVerified }) {
   const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
 
   // Step 2 — student verification.
-  const [university, setUniversity] = useState(UNIVERSITY_NAMES[0]);
-  const [studentEmail, setStudentEmail] = useState("");
-  const [studentId, setStudentId] = useState("");
-  const [referralCode, setReferralCode] = useState("");
+  // A rejected student submits again, so the form starts filled with
+  // their saved details (university, student email, student ID and
+  // invite code are kept — they are never changed on a re-submit).
+  const [university, setUniversity] = useState(saved?.university || UNIVERSITY_NAMES[0]);
+  const [studentEmail, setStudentEmail] = useState(saved?.studentEmail || "");
+  const [studentId, setStudentId] = useState(saved?.studentId || "");
+  const [referralCode, setReferralCode] = useState(saved?.referredBy || "");
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
+  // The picked files themselves (the previews above are data URLs for
+  // the <img> tags only — the files are what gets uploaded).
+  const [idFrontFile, setIdFrontFile] = useState(null);
+  const [idBackFile, setIdBackFile] = useState(null);
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [checking, setChecking] = useState(false);
 
-  function filePreview(e, set) {
+  // Milestone 17: the device copy can be stale — the team may have
+  // approved or rejected this student since it was saved. When the
+  // student is signed in, the server row wins, so a rejected student
+  // is offered the form again instead of a stale "under review"
+  // screen, and an approved student is not asked to submit again.
+  // A failed check changes nothing: the device copy stays.
+  useEffect(() => {
+    if (!user?.id) return;
+    let cancelled = false;
+    fetchVerificationRow(user.id).then((row) => {
+      if (cancelled || !row) return;
+      const rec = {
+        userId: row.userId,
+        email: user.email,
+        university: row.university,
+        studentEmail: row.studentEmail,
+        studentId: row.studentId,
+        status: row.status,
+        inviteCode: row.inviteCode,
+        submittedAt: row.submittedAt,
+        idFrontUrl: row.idFrontUrl || null,
+        idBackUrl: row.idBackUrl || null,
+        // The server row carries no referrer — keep the device copy's.
+        referredBy: saved?.referredBy ?? null,
+      };
+      saveVerification(rec);
+      setSaved(rec);
+      if (row.status === "rejected") {
+        // Pre-fill the form for the re-submit — only where the
+        // student has not already typed something.
+        setUniversity((prev) => (prev === UNIVERSITY_NAMES[0] ? row.university : prev));
+        setStudentEmail((prev) => prev || row.studentEmail || "");
+        setStudentId((prev) => prev || row.studentId || "");
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function filePreview(e, setPreview, setFile) {
     const f = e.target.files?.[0];
     if (!f) return;
+    if (f.type && !f.type.startsWith("image/")) {
+      setFormError("That file is not a photo — take a photo of your student ID.");
+      e.target.value = "";
+      setFile(null);
+      return;
+    }
     if (f.size > MAX_FILE_MB * 1024 * 1024) {
       setFormError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
       e.target.value = "";
+      setFile(null);
       return;
     }
     setFormError("");
+    setFile(f);
     const r = new FileReader();
-    r.onload = () => set(r.result);
+    r.onload = () => setPreview(r.result);
     r.readAsDataURL(f);
   }
 
@@ -141,47 +208,195 @@ export default function Verify({ onVerified }) {
       setFormError("That student email is too long.");
       return;
     }
-    // Milestone 11: a referral code is accepted only in the real
-    // PM-XXXXXX shape; anything else is ignored, never blocks joining.
-    // Your own invite code can never count as your referrer — the code
-    // is generated first so it can be compared here, and
-    // saveVerificationRow drops a self-referral too.
-    const inviteCode = generateInviteCode();
-    const cleanReferral = referralCode.trim().toUpperCase();
-    if (cleanReferral && cleanReferral === inviteCode) {
-      setFormError("That is your own invite code — ask the student who invited you for theirs.");
+    // Milestone 17: both sides of the student ID are needed — the
+    // team cannot approve a student they cannot check. Refuse here,
+    // plainly, instead of saving a photo-less row that would sit in
+    // "pending review" forever with nothing to review.
+    if (!idFrontFile || !idBackFile) {
+      setFormError("Add a photo of the front and back of your student ID — the team checks them before approving you.");
       return;
     }
-    const rec = {
-      userId: user?.id || null,
-      email: user?.email || email,
-      university,
-      studentEmail: cleanStudentEmail,
-      studentId: cleanStudentId,
-      status: "pending review",
-      inviteCode,
-      referredBy: /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral) ? cleanReferral : null,
-      submittedAt: new Date().toISOString(),
-    };
+    if (!user?.id) {
+      setFormError("Sign in first, then submit your verification.");
+      return;
+    }
     setSubmitting(true);
     try {
+      // Fresh server check first: the device copy can be stale, and
+      // the right path depends on the server status — a first submit,
+      // a re-submit after a rejection, or nothing at all because the
+      // student is already approved or already under review. A failed
+      // check (null) falls back to the device copy below.
+      let serverRow = null;
+      try {
+        serverRow = await fetchVerificationRow(user.id);
+      } catch {
+        serverRow = null;
+      }
+      const serverStatus = serverRow?.status || null;
+      if (serverStatus === "approved") {
+        // Already approved — nothing to submit. Sync the device copy
+        // and go to the app instead of saving a second row.
+        const rec = {
+          userId: user.id,
+          email: user.email,
+          university: serverRow.university,
+          studentEmail: serverRow.studentEmail,
+          studentId: serverRow.studentId,
+          status: "approved",
+          inviteCode: serverRow.inviteCode,
+          referredBy: saved?.referredBy ?? null,
+          submittedAt: serverRow.submittedAt,
+          idFrontUrl: serverRow.idFrontUrl || null,
+          idBackUrl: serverRow.idBackUrl || null,
+        };
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        navigate("/");
+        return;
+      }
+      if (serverStatus === "pending review") {
+        // Already waiting — do not upload again and do not save a
+        // second row. Sync the device copy and say so plainly.
+        const rec = {
+          userId: user.id,
+          email: user.email,
+          university: serverRow.university,
+          studentEmail: serverRow.studentEmail,
+          studentId: serverRow.studentId,
+          status: "pending review",
+          inviteCode: serverRow.inviteCode,
+          referredBy: saved?.referredBy ?? null,
+          submittedAt: serverRow.submittedAt,
+          idFrontUrl: serverRow.idFrontUrl || null,
+          idBackUrl: serverRow.idBackUrl || null,
+        };
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        // No form error here: onVerified moves the app to its
+        // "under review" screen, which carries the message.
+        return;
+      }
+      // Rejected on the server, or rejected on the device copy when
+      // the server could not be reached: submit again with new
+      // photos. The invite code and referrer are kept from the first
+      // submit — a re-submit never changes who the student is or who
+      // invited them.
+      const isResubmit =
+        serverStatus === "rejected" || (!serverRow && saved?.status === "rejected");
+      const keptCode = serverRow?.inviteCode || saved?.inviteCode || null;
+      const inviteCode =
+        isResubmit && keptCode ? keptCode : generateInviteCode();
+      // Milestone 11: a referral code is accepted only in the real
+      // PM-XXXXXX shape; anything else is ignored, never blocks joining.
+      // Your own invite code can never count as your referrer — the code
+      // is generated first so it can be compared here, and
+      // saveVerificationRow drops a self-referral too.
+      const cleanReferral = referralCode.trim().toUpperCase();
+      if (cleanReferral && cleanReferral === inviteCode) {
+        setFormError("That is your own invite code — ask the student who invited you for theirs.");
+        return;
+      }
+      const referredBy = isResubmit
+        ? saved?.referredBy || null
+        : /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral)
+          ? cleanReferral
+          : null;
+      // Milestone 17: the ID photos go up FIRST, to the private
+      // verification-ids bucket. If either upload fails, nothing is
+      // saved — no row is ever written claiming photos exist when
+      // they do not.
+      let photoPaths;
+      try {
+        photoPaths = await uploadVerificationIdPhotos(user.id, idFrontFile, idBackFile);
+      } catch {
+        setFormError("Your ID photos could not be uploaded. Please check your connection and try again.");
+        return;
+      }
+      const rec = {
+        userId: user.id,
+        email: user.email,
+        university,
+        studentEmail: cleanStudentEmail,
+        studentId: cleanStudentId,
+        status: "pending review",
+        inviteCode,
+        referredBy,
+        submittedAt: new Date().toISOString(),
+        idFrontUrl: photoPaths.frontPath,
+        idBackUrl: photoPaths.backPath,
+      };
+      if (isResubmit) {
+        // Back to 'pending review' through the RPC — the app never
+        // writes a status itself. If it fails, remove the new photos
+        // again so they do not sit orphaned in the bucket.
+        try {
+          await resubmitVerification(photoPaths.frontPath, photoPaths.backPath);
+        } catch (err) {
+          await removeVerificationIdPhotos([photoPaths.frontPath, photoPaths.backPath]);
+          setFormError(
+            err?.message ||
+              "Could not submit your verification again. Please check your connection and try again."
+          );
+          return;
+        }
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        navigate("/");
+        return;
+      }
       saveVerification(rec);
       setSaved(rec);
       onVerified?.(rec);
       // Also save to the server so the record follows the student to any
       // phone. If the tables are not set up yet, the device copy above is
-      // still the fallback — the app keeps working either way.
-      if (user?.id) {
-        try {
-          await saveVerificationRow(user.id, rec);
-        } catch {
-          // Server save failed (tables not run yet, or offline) — local
-          // record still unlocks the app; the next app load retries the sync.
-        }
+      // still the fallback — the app keeps working either way. (The
+      // photos are already in the private bucket, and their paths are
+      // on the device copy, so the next app load retries this save
+      // with the same paths instead of uploading again.)
+      try {
+        await saveVerificationRow(user.id, rec);
+      } catch {
+        // Server save failed (tables not run yet, or offline) — local
+        // record still unlocks the app; the next app load retries the sync.
       }
       navigate("/");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // A student under review asks the server again instead of signing
+  // out and back in — the team may have approved them since this
+  // page loaded. A fresh 'approved' row opens the app at once.
+  async function checkStatus() {
+    if (!user?.id || checking) return;
+    setChecking(true);
+    try {
+      const row = await fetchVerificationRow(user.id);
+      if (!row) return;
+      const rec = {
+        userId: row.userId,
+        email: user.email,
+        university: row.university,
+        studentEmail: row.studentEmail,
+        studentId: row.studentId,
+        status: row.status,
+        inviteCode: row.inviteCode,
+        referredBy: saved?.referredBy ?? null,
+        submittedAt: row.submittedAt,
+        idFrontUrl: row.idFrontUrl || null,
+        idBackUrl: row.idBackUrl || null,
+      };
+      saveVerification(rec);
+      setSaved(rec);
+      onVerified?.(rec);
+      if (row.status === "approved") navigate("/");
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -201,35 +416,81 @@ export default function Verify({ onVerified }) {
         </div>
       );
     }
-    return (
-      <div className="space-y-4 pt-4">
-        <h1 className="text-2xl font-bold">Verification {saved.status}</h1>
-        <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
-          <p><b>University:</b> {saved.university}</p>
-          <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
-          <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
-          <p className="mt-2 text-neutral-500">
-            Your university is now locked to {saved.university}. Your details
-            are saved on PulseMarket&apos;s server, so they follow you to any
-            phone you sign in on.
-          </p>
+    // Approved: nothing to do again — straight into the app.
+    if (saved.status === "approved") {
+      return (
+        <div className="space-y-4 pt-4">
+          <h1 className="text-2xl font-bold">Verification approved</h1>
+          <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+            <p><b>University:</b> {saved.university}</p>
+            <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
+            <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
+            <p className="mt-2 text-neutral-500">
+              Your university is now locked to {saved.university}. Your details
+              are saved on PulseMarket&apos;s server, so they follow you to any
+              phone you sign in on.
+            </p>
+          </div>
+          <PrimaryButton className="w-full" onClick={() => navigate("/")}>
+            Continue to the app
+          </PrimaryButton>
         </div>
-        <PrimaryButton className="w-full" onClick={() => navigate("/")}>
-          Continue to the app
-        </PrimaryButton>
-      </div>
-    );
+      );
+    }
+    // Under review (or any status that is not approved or rejected):
+    // plain waiting state, no way into the app from here, and no
+    // second submit — the team already has this one. "Check again"
+    // asks the server in case they have approved it since.
+    // A rejected student does NOT land here: they fall through to
+    // the form below and submit again with new photos.
+    if (saved.status !== "rejected") {
+      return (
+        <div className="space-y-4 pt-4">
+          <h1 className="text-2xl font-bold">Your verification is under review</h1>
+          <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+            <p><b>University:</b> {saved.university}</p>
+            <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
+            <p className="mt-2 text-neutral-500">
+              Thanks — we have your student details and ID photos. The
+              PulseMarket team is checking them. You will be able to post
+              items and chat with sellers once you are approved.
+            </p>
+          </div>
+          <PrimaryButton className="w-full" disabled={checking} onClick={checkStatus}>
+            {checking ? "Checking…" : "Check again — I may be approved now"}
+          </PrimaryButton>
+          <button
+            className="w-full text-center text-sm text-neutral-500 underline"
+            onClick={() => signOut()}
+          >
+            Not {user.email}? Sign out
+          </button>
+        </div>
+      );
+    }
   }
 
-  // Step 2 — signed in, not verified yet: the verification form.
+  // Step 2 — signed in, not verified yet (or rejected and submitting
+  // again): the verification form.
   if (user) {
+    const isResubmitForm = saved?.status === "rejected";
     return (
       <div className="space-y-5">
-        <h1 className="text-2xl font-bold">Verify you are a student</h1>
-        <p className="text-neutral-500">
-          Signed in as {user.email}. Prove you are a real student — your
-          university and currency lock after verification.
-        </p>
+        <h1 className="text-2xl font-bold">
+          {isResubmitForm ? "Submit your verification again" : "Verify you are a student"}
+        </h1>
+        {isResubmitForm ? (
+          <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+            Your verification was not approved. Check your details and take
+            clear photos of both sides of your student ID, then submit again.
+            Your university, student ID and invite code stay the same.
+          </p>
+        ) : (
+          <p className="text-neutral-500">
+            Signed in as {user.email}. Prove you are a real student — your
+            university and currency lock after verification.
+          </p>
+        )}
 
         <label className="block text-sm font-semibold">
           University
@@ -252,15 +513,21 @@ export default function Verify({ onVerified }) {
         <div className="grid grid-cols-2 gap-2">
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
             ID front
-            <input type="file" accept="image/*" onChange={(e) => filePreview(e, setIdFront)} className="mt-2 block w-full text-xs" />
+            <input type="file" accept="image/*" onChange={(e) => filePreview(e, setIdFront, setIdFrontFile)} className="mt-2 block w-full text-xs" />
             {idFront ? <img src={idFront} alt="ID front" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
           </label>
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
             ID back
-            <input type="file" accept="image/*" onChange={(e) => filePreview(e, setIdBack)} className="mt-2 block w-full text-xs" />
+            <input type="file" accept="image/*" onChange={(e) => filePreview(e, setIdBack, setIdBackFile)} className="mt-2 block w-full text-xs" />
             {idBack ? <img src={idBack} alt="ID back" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
           </label>
         </div>
+        {!idFrontFile || !idBackFile ? (
+          <p className="text-sm text-neutral-500">
+            Photos of the front and back of your student ID are needed — the
+            team checks them before approving you.
+          </p>
+        ) : null}
 
         {formError ? (
           <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
@@ -270,10 +537,10 @@ export default function Verify({ onVerified }) {
 
         <PrimaryButton
           className="w-full"
-          disabled={!studentId.trim() || submitting}
+          disabled={!studentId.trim() || !idFrontFile || !idBackFile || submitting}
           onClick={submitVerification}
         >
-          {submitting ? "Submitting…" : "Review & submit"}
+          {submitting ? "Submitting…" : isResubmitForm ? "Submit again" : "Review & submit"}
         </PrimaryButton>
         <button
           className="w-full text-center text-sm text-neutral-500 underline"

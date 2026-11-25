@@ -23,7 +23,7 @@ import Verify from "./pages/Verify.jsx";
 import Welcome from "./pages/Welcome.jsx";
 import SignIn from "./pages/SignIn.jsx";
 import ListingDetail from "./pages/ListingDetail.jsx";
-import { Logo } from "./components/ui.jsx";
+import { GhostButton, Logo, PrimaryButton } from "./components/ui.jsx";
 import { getSettings, getVerification, saveVerification } from "./lib/store";
 import { fetchVerificationRow, saveVerificationRow } from "./lib/listings";
 import { fetchUnreadCount } from "./lib/notifications";
@@ -49,10 +49,11 @@ function applyAppearance(s) {
 }
 
 function Shell() {
-  const { user, loading } = useAuth();
+  const { user, loading, signOut } = useAuth();
   const navigate = useNavigate();
   const [verification, setVerification] = useState(() => getVerification());
   const [verifying, setVerifying] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   // Poll guards: the hourly auto-release must never run twice at once
   // (a slow check overlapping the next hour's tick), and neither poll
@@ -65,7 +66,10 @@ function Shell() {
 
   // Milestone 3: when a student signs in, check the server for their
   // verification record. If it exists, it wins (and is saved on this device
-  // too). If the student verified on this device before the server tables
+  // too) — including its status: Milestone 17 gates the whole app on
+  // status 'approved', so a server row that says 'pending review' or
+  // 'rejected' must replace a stale device copy that says otherwise.
+  // If the student verified on this device before the server tables
   // existed, push the local record up so it follows them to other phones.
   // The device copy is always the fallback, so the app never locks a
   // verified student out because of a server hiccup.
@@ -94,6 +98,29 @@ function Shell() {
       cancelled = true;
     };
   }, [user]);
+
+  // Milestone 17: a student waiting for approval can ask for a fresh
+  // server check instead of signing out and back in — the team may
+  // have approved them since this page loaded. A fresh 'approved'
+  // row unlocks the full app at once; anything else leaves this
+  // screen exactly as it is. A failed check changes nothing.
+  async function refreshVerification() {
+    if (!user || checking) return;
+    setChecking(true);
+    try {
+      const row = await fetchVerificationRow(user.id);
+      if (row) {
+        const rec = { ...row, email: user.email };
+        setVerification(rec);
+        saveVerification(rec);
+      }
+    } catch {
+      // Server hiccup — stay on the under-review screen; the student
+      // can try again, and the next sign-in re-checks anyway.
+    } finally {
+      setChecking(false);
+    }
+  }
 
   // Milestone 10: app-side 48h auto-release — once per sign-in, release
   // any of this student's delivered orders whose 48h window has passed.
@@ -175,15 +202,47 @@ function Shell() {
     );
   }
 
-  // 2) Account created but student verification not submitted yet: the
-  // verification form only — still no bottom nav, no home page, no Sell.
-  if (!verification) {
+  // 2) Account created but student verification not submitted yet — or
+  // submitted and rejected, so the student is sent back to submit again:
+  // the verification form only — still no bottom nav, no home page, no Sell.
+  if (!verification || verification.status === "rejected") {
     return (
       <div className="min-h-screen bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
         <main className="mx-auto max-w-2xl px-4 pb-12 pt-4">
           <Routes>
             <Route path="*" element={<Verify onVerified={setVerification} />} />
           </Routes>
+        </main>
+      </div>
+    );
+  }
+
+  // 2b) Milestone 17: submitted, waiting for the team. Only a status of
+  // 'approved' is verified — a student under review sees this plain
+  // state and cannot post or chat, because the full app and its routes
+  // are never mounted for them. Grandfathered students are 'approved'
+  // in the database, so they never see this screen.
+  if (verification.status !== "approved") {
+    return (
+      <div className="min-h-screen bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
+        <main className="mx-auto max-w-2xl px-4 pb-12 pt-10">
+          <h1 className="text-2xl font-bold">Your verification is under review</h1>
+          <p className="mt-2 text-neutral-500">
+            Thanks — we have your student details and ID photos. The PulseMarket
+            team is checking them. You will be able to post items and chat with
+            sellers once you are approved.
+          </p>
+          <p className="mt-2 text-sm text-neutral-500">
+            Signed in as {user.email} · {verification.university}
+          </p>
+          <div className="mt-6 space-y-3">
+            <PrimaryButton className="w-full" disabled={checking} onClick={refreshVerification}>
+              {checking ? "Checking…" : "Check again — I may be approved now"}
+            </PrimaryButton>
+            <GhostButton className="w-full" onClick={() => signOut()}>
+              Not {user.email}? Sign out
+            </GhostButton>
+          </div>
         </main>
       </div>
     );

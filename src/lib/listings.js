@@ -3,6 +3,7 @@
 // when the tables do not exist yet (owner has not run the SQL), so the app
 // shows an honest "not switched on yet" message instead of crashing.
 import { supabase } from "./supabase";
+import { OWNER_EMAIL } from "./payments";
 import {
   CATEGORIES,
   CONDITIONS,
@@ -12,6 +13,19 @@ import {
 } from "./data";
 
 export const LISTING_PHOTOS_BUCKET = "listing-photos";
+
+// Milestone 17 — student ID photos live in this PRIVATE bucket, never
+// in a public one. The values stored in verifications.id_front_url /
+// id_back_url are the storage PATHS (e.g. "<uid>/front-....jpg"), not
+// public URLs: a private bucket has no working public URL, and the
+// team opens the photos with a signed URL made from the path
+// (verificationIdPhotoUrl below).
+export const VERIFICATION_IDS_BUCKET = "verification-ids";
+
+// Largest ID photo the app will upload (MB). The Verify form checks
+// this when the photo is picked too; the upload checks again so a
+// crafted call cannot skip it.
+export const MAX_VERIFICATION_PHOTO_MB = 10;
 
 // Highest listing price the app will publish or save (₦). The Sell
 // form and the edit form cap at this amount, but updateListing() /
@@ -186,6 +200,11 @@ export async function fetchVerificationRow(userId) {
     status: data.status,
     inviteCode: data.invite_code,
     submittedAt: data.created_at,
+    // Storage paths in the private verification-ids bucket (see
+    // VERIFICATION_IDS_BUCKET above), or null when no photos are on
+    // file — e.g. a student who verified before Milestone 17.
+    idFrontUrl: data.id_front_url || null,
+    idBackUrl: data.id_back_url || null,
   };
 }
 
@@ -198,8 +217,12 @@ export async function saveVerificationRow(userId, rec) {
       ? null
       : rec.referredBy;
   // A verification row is written once and then locked: university,
-  // student id and invite code are never overwritten from the app
-  // afterwards. Only a missing referred_by may still be filled in.
+  // student id, status and invite code are never overwritten from the
+  // app afterwards — not even by a re-save carrying different values.
+  // Only a missing referred_by may still be filled in. (Milestone 15
+  // rule, kept for Milestone 17: a re-save must never overwrite an
+  // approved row. A rejected student re-submits through the
+  // resubmit_verification RPC, not through this function.)
   const { data: existing, error: readError } = await supabase
     .from("verifications")
     .select("user_id, referred_by, invite_code")
@@ -235,6 +258,9 @@ export async function saveVerificationRow(userId, rec) {
   // re-save their way into — any other status. Only the PulseMarket
   // team can change it (the database trigger refuses anything else,
   // this just stops the app from ever sending a privileged value).
+  // Milestone 17: the two ID photo paths go on the row too, so the
+  // team can open them when they review the student. They are storage
+  // paths in the private verification-ids bucket, never public URLs.
   const { error } = await supabase.from("verifications").upsert({
     user_id: userId,
     university: rec.university,
@@ -242,6 +268,8 @@ export async function saveVerificationRow(userId, rec) {
     student_email: rec.studentEmail || null,
     invite_code: rec.inviteCode,
     status: "pending review",
+    id_front_url: rec.idFrontUrl || null,
+    id_back_url: rec.idBackUrl || null,
   });
   if (error) {
     dbError(error, "save verification");
@@ -258,6 +286,156 @@ export async function saveVerificationRow(userId, rec) {
     if (refError) dbError(refError, "save referral code");
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Verification approval flow (Milestone 17)
+// ---------------------------------------------------------------------------
+//
+// A student is verified only when verifications.status is 'approved'.
+// Anything else — 'pending review', 'rejected', or no row at all —
+// is not verified, and the app gates on that everywhere (App.jsx,
+// createListingRow below, chat.js startConversation). Students who
+// verified before this flow existed were grandfathered to 'approved'
+// by milestone-17.sql, so they are unaffected.
+//
+// The ID photos live in the PRIVATE verification-ids bucket at
+// <user-id>/front-<timestamp>.jpg and <user-id>/back-<timestamp>.jpg.
+// The bucket is private, so the app never builds a public URL for
+// them: the team opens them with a short-lived signed URL
+// (verificationIdPhotoUrl). The paths are what saveVerificationRow
+// and resubmit_verification store in id_front_url / id_back_url.
+
+// Team-only helpers check the signed-in email first (same pattern as
+// disputes.js requireOwner) so a non-owner never even sends the query;
+// the database (RLS + SECURITY DEFINER RPCs in milestone-17.sql)
+// enforces it again server-side.
+async function requireOwner() {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data?.user || data.user.email !== OWNER_EMAIL) {
+    throw new Error("This page is not available.");
+  }
+  return data.user;
+}
+
+// Uploads both ID photos to the private verification-ids bucket and
+// returns { frontPath, backPath } — the storage paths to store on the
+// verification row. Mirrors the evidence.js upload pattern: the file
+// must be a photo under the size limit, and if the second upload
+// fails the first file is removed again so a failed submit leaves no
+// orphan behind. Throws a plain Error; the caller must NOT save a
+// verification row claiming photos exist when this throws.
+export async function uploadVerificationIdPhotos(userId, frontFile, backFile) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!userId) throw new Error("Sign in first to upload your ID photos.");
+  if (!frontFile || !backFile) {
+    throw new Error("Add a photo of the front and back of your student ID.");
+  }
+  for (const [file, side] of [
+    [frontFile, "front"],
+    [backFile, "back"],
+  ]) {
+    if (file.type && !file.type.startsWith("image/")) {
+      throw new Error(
+        `The ${side} of your ID must be a photo — take a photo in the app.`
+      );
+    }
+    if (file.size > MAX_VERIFICATION_PHOTO_MB * 1024 * 1024) {
+      throw new Error(
+        `That photo is too big — keep ID photos under ${MAX_VERIFICATION_PHOTO_MB}MB.`
+      );
+    }
+  }
+  const stamp = Date.now();
+  const frontPath = `${userId}/front-${stamp}.jpg`;
+  const backPath = `${userId}/back-${stamp}.jpg`;
+  const { error: frontError } = await supabase.storage
+    .from(VERIFICATION_IDS_BUCKET)
+    .upload(frontPath, frontFile, { contentType: "image/jpeg", upsert: false });
+  if (frontError) throw frontError;
+  const { error: backError } = await supabase.storage
+    .from(VERIFICATION_IDS_BUCKET)
+    .upload(backPath, backFile, { contentType: "image/jpeg", upsert: false });
+  if (backError) {
+    // Best effort: a failed submit must not leave an orphan photo
+    // behind (same as uploadEvidence in evidence.js).
+    await supabase.storage.from(VERIFICATION_IDS_BUCKET).remove([frontPath]);
+    throw backError;
+  }
+  return { frontPath, backPath };
+}
+
+// Best-effort removal of ID photos, e.g. when the re-submit RPC
+// fails after the new photos were already uploaded. Never throws.
+export async function removeVerificationIdPhotos(paths) {
+  if (!supabase) return;
+  const clean = (paths || []).filter(Boolean);
+  if (clean.length === 0) return;
+  await supabase.storage.from(VERIFICATION_IDS_BUCKET).remove(clean);
+}
+
+// Rejected student submits new ID photos: the SECURITY DEFINER RPC
+// (milestone-17.sql) puts their row back to 'pending review' with
+// the new photo paths. It — not the app — decides who may re-submit,
+// so a student can never re-approve themselves this way.
+export async function resubmitVerification(frontPath, backPath) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!frontPath || !backPath) {
+    throw new Error("Add a photo of the front and back of your student ID.");
+  }
+  const { error } = await supabase.rpc("resubmit_verification", {
+    p_front_url: frontPath,
+    p_back_url: backPath,
+  });
+  if (error) throw error;
+  return true;
+}
+
+// All verifications waiting for the team, oldest first so the
+// longest-waiting student is reviewed first. Owner only.
+export async function fetchPendingVerifications() {
+  if (!supabase) return [];
+  await requireOwner();
+  const { data, error } = await supabase
+    .from("verifications")
+    .select(
+      "user_id, university, student_id, student_email, status, id_front_url, id_back_url, created_at"
+    )
+    .eq("status", "pending review")
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+// Team decision on one student. The SECURITY DEFINER RPC
+// (milestone-17.sql) is the only thing that may change a status —
+// the app never updates verifications.status directly.
+export async function reviewVerification(userId, status) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!userId) throw new Error("Missing student.");
+  if (status !== "approved" && status !== "rejected") {
+    throw new Error("Choose approve or reject.");
+  }
+  await requireOwner();
+  const { error } = await supabase.rpc("review_verification", {
+    p_user_id: userId,
+    p_status: status,
+  });
+  if (error) throw error;
+  return true;
+}
+
+// Signed URL for one ID photo in the private bucket. The link works
+// for `expiresInSeconds` (default 1 hour) and then stops working —
+// the photo is never public. Returns null when there is no photo.
+export async function verificationIdPhotoUrl(path, expiresInSeconds = 3600) {
+  if (!supabase || !path) return null;
+  const { data, error } = await supabase.storage
+    .from(VERIFICATION_IDS_BUCKET)
+    .createSignedUrl(path, expiresInSeconds);
+  if (error) throw error;
+  return data?.signedUrl || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,16 +502,18 @@ export async function fetchMyListings(userId) {
 export async function createListingRow(row) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!row || !row.seller_id) throw new Error("Missing seller.");
-  // A listing is only ever published by a student with a verification
-  // record on the server. The Sell page shows the form from the
+  // A listing is only ever published by a student whose verification
+  // is APPROVED on the server. The Sell page shows the form from the
   // device copy of the record, but that copy lives in localStorage
   // and anyone can write it — the server row is the check that
-  // counts. Fail closed when the check itself fails: the insert
-  // would be the next call, so a broken check must not let a listing
-  // through unchecked.
+  // counts, and mere existence of a row is not enough: a student
+  // still under review, or one who was rejected, must not sell.
+  // Fail closed when the check itself fails: the insert would be the
+  // next call, so a broken check must not let a listing through
+  // unchecked.
   const { data: verification, error: verificationError } = await supabase
     .from("verifications")
-    .select("user_id")
+    .select("user_id, status")
     .eq("user_id", row.seller_id)
     .maybeSingle();
   if (verificationError) {
@@ -341,6 +521,16 @@ export async function createListingRow(row) {
   }
   if (!verification) {
     throw new Error("Only verified students can sell — finish verification first.");
+  }
+  if (verification.status === "rejected") {
+    throw new Error(
+      "Your verification was not approved — submit it again with clear ID photos to sell."
+    );
+  }
+  if (verification.status !== "approved") {
+    throw new Error(
+      "Your verification is under review — you can sell once the team approves it."
+    );
   }
   validateListingKeys(
     row,

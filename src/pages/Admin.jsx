@@ -28,6 +28,11 @@ import {
   isOwnerUser,
   resolveDispute,
 } from "../lib/disputes";
+import {
+  fetchPendingVerifications,
+  reviewVerification,
+  verificationIdPhotoUrl,
+} from "../lib/listings";
 import { OWNER_EMAIL } from "../lib/payments";
 import { GhostButton, PrimaryButton, inputCls } from "../components/ui";
 
@@ -56,6 +61,10 @@ export default function Admin() {
   const [frozenOrders, setFrozenOrders] = useState([]);
   const [heldOrders, setHeldOrders] = useState([]);
   const [lockedHandoffs, setLockedHandoffs] = useState([]);
+  const [pendingVerifications, setPendingVerifications] = useState([]);
+  const [pendingError, setPendingError] = useState("");
+  const [photoUrls, setPhotoUrls] = useState({});
+  const [viewingPhotos, setViewingPhotos] = useState(null);
   const [busyAction, setBusyAction] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [selectedOrder, setSelectedOrder] = useState(null);
@@ -92,6 +101,18 @@ export default function Admin() {
       setError(err?.message || "Could not load the team panel.");
     } finally {
       setLoading(false);
+    }
+    // Milestone 17: pending verifications load separately, so a
+    // problem with them (e.g. the milestone-17.sql rules not run
+    // yet) shows a note on that section instead of blanking the
+    // whole team panel with an error.
+    try {
+      const pending = await fetchPendingVerifications();
+      setPendingVerifications(pending || []);
+      setPendingError("");
+    } catch (err) {
+      setPendingError(err?.message || "Could not load pending verifications.");
+      setPendingVerifications([]);
     }
   }, [isOwner, user]);
 
@@ -185,6 +206,66 @@ export default function Admin() {
     }
   }
 
+  // Milestone 17: open a student's ID photos. The bucket is private,
+  // so the photos are fetched with short-lived signed URLs (one hour)
+  // made from the storage paths on the verification row — never a
+  // public link. Already-opened links are reused until the list
+  // refreshes. A student with no photos on file has nothing to open.
+  async function handleViewPhotos(row) {
+    if (viewingPhotos === row.user_id) {
+      setViewingPhotos(null);
+      return;
+    }
+    setViewingPhotos(row.user_id);
+    if (photoUrls[row.user_id]) return;
+    setError("");
+    setBusyAction(`photos-${row.user_id}`);
+    try {
+      const [front, back] = await Promise.all([
+        verificationIdPhotoUrl(row.id_front_url),
+        verificationIdPhotoUrl(row.id_back_url),
+      ]);
+      setPhotoUrls((prev) => ({ ...prev, [row.user_id]: { front, back } }));
+    } catch (err) {
+      setError(err?.message || "Could not open the ID photos. Try again.");
+      setViewingPhotos(null);
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Milestone 17: team decision on one student. Approving lets them
+  // post and chat at once; rejecting sends them back to submit again
+  // with new photos — nothing about them is deleted. The list
+  // refreshes after the action, so a decided student leaves the queue.
+  async function handleReviewVerification(row, status) {
+    if (
+      status === "rejected" &&
+      !window.confirm(
+        `Reject the verification for ${row.student_id} (${row.university})? They will need to submit again with new ID photos.`
+      )
+    ) {
+      return;
+    }
+    setError("");
+    setNotice("");
+    setBusyAction(`${status}-${row.user_id}`);
+    try {
+      await reviewVerification(row.user_id, status);
+      setNotice(
+        status === "approved"
+          ? `Verification approved for ${row.student_id} (${row.university}). They can now post and chat.`
+          : `Verification rejected for ${row.student_id}. They can submit again with new photos.`
+      );
+      setViewingPhotos(null);
+      await load();
+    } catch (err) {
+      setError(err?.message || "Could not update this verification.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
   if (authLoading) {
     return (
       <main className="mx-auto max-w-3xl px-4 py-6">
@@ -217,6 +298,91 @@ export default function Admin() {
         <>
           {error ? <p className="mt-4 text-sm text-red-600">{error}</p> : null}
           {notice ? <p className="mt-4 text-sm font-semibold text-brown-dark">{notice}</p> : null}
+
+          {/* Milestone 17 — Pending verifications */}
+          <section className="mt-6">
+            <h2 className="font-semibold">Pending verifications ({pendingVerifications.length})</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Students waiting for approval. Check both sides of their student
+              ID before deciding — approving lets them post and chat, rejecting
+              sends them back to submit again with new photos. Photo links
+              work for an hour, then expire.
+            </p>
+            {pendingError ? <p className="mt-2 text-sm text-red-600">{pendingError}</p> : null}
+            {pendingVerifications.length === 0 ? (
+              <p className="mt-2 text-sm text-neutral-500">No verifications waiting.</p>
+            ) : (
+              <ul className="mt-2 space-y-2">
+                {pendingVerifications.map((v) => (
+                  <li
+                    key={v.user_id}
+                    className="rounded-xl border border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-950"
+                  >
+                    <p className="text-sm font-bold">{v.university}</p>
+                    <p className="text-sm">Student ID: {v.student_id}</p>
+                    <p className="text-xs text-neutral-500">
+                      {v.student_email || "No student email"} · {timeAgo(v.created_at)}
+                    </p>
+                    <p className="mt-1 text-xs text-neutral-500">User: {v.user_id}</p>
+                    {!v.id_front_url && !v.id_back_url ? (
+                      <p className="mt-2 text-sm text-red-600">
+                        No ID photo on file — this student verified before photos
+                        were collected. Approve only if you know this student, or
+                        reject so they can submit photos.
+                      </p>
+                    ) : null}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <GhostButton
+                        type="button"
+                        disabled={busyAction !== ""}
+                        onClick={() => handleViewPhotos(v)}
+                      >
+                        {busyAction === `photos-${v.user_id}`
+                          ? "Opening…"
+                          : viewingPhotos === v.user_id
+                            ? "Hide ID photos"
+                            : "View ID photos"}
+                      </GhostButton>
+                      <GhostButton
+                        type="button"
+                        disabled={busyAction !== ""}
+                        onClick={() => handleReviewVerification(v, "approved")}
+                      >
+                        {busyAction === `approved-${v.user_id}` ? "Approving…" : "Approve"}
+                      </GhostButton>
+                      <GhostButton
+                        type="button"
+                        disabled={busyAction !== ""}
+                        onClick={() => handleReviewVerification(v, "rejected")}
+                      >
+                        {busyAction === `rejected-${v.user_id}` ? "Rejecting…" : "Reject"}
+                      </GhostButton>
+                    </div>
+                    {viewingPhotos === v.user_id && photoUrls[v.user_id] ? (
+                      <div className="mt-3 grid grid-cols-2 gap-2">
+                        <div>
+                          <p className="text-xs font-semibold text-neutral-500">ID front</p>
+                          {photoUrls[v.user_id].front ? (
+                            <img src={photoUrls[v.user_id].front} alt="Student ID front" className="mt-1 w-full rounded-lg object-contain" />
+                          ) : (
+                            <p className="mt-1 text-sm text-neutral-500">No front photo on file.</p>
+                          )}
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold text-neutral-500">ID back</p>
+                          {photoUrls[v.user_id].back ? (
+                            <img src={photoUrls[v.user_id].back} alt="Student ID back" className="mt-1 w-full rounded-lg object-contain" />
+                          ) : (
+                            <p className="mt-1 text-sm text-neutral-500">No back photo on file.</p>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
 
           {/* (a) Open disputes */}
           <section className="mt-6">

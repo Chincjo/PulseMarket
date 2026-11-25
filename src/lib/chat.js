@@ -10,7 +10,9 @@
 // functions follow the listings.js style: data or null/[] on failure.
 //
 // Rules enforced here (and again by RLS in milestone-5.sql):
-// - Only verified students chat: the sender must have a verifications row.
+// - Only verified students chat: the sender must have an APPROVED
+//   verifications row — a row under review or a rejected row is not
+//   verified (Milestone 17).
 // - You cannot message yourself about your own listing.
 // - If the seller set chat_verified_only, the buyer must be verified.
 // - If either side blocked the other, no new chat can start.
@@ -71,7 +73,7 @@ async function fetchVerification(userId) {
   if (!supabase || !userId) return null;
   const { data, error } = await supabase
     .from("verifications")
-    .select("user_id, chat_verified_only, flagged")
+    .select("user_id, status, chat_verified_only, flagged")
     .eq("user_id", userId)
     .maybeSingle();
   if (error) return dbError(error, "fetch verification for chat");
@@ -110,12 +112,27 @@ export async function startConversation(listing) {
     return { conversation: null, error: "You cannot message yourself about your own listing." };
   }
 
-  // Only verified students chat.
+  // Only verified students chat. A verifications row on its own is
+  // not enough — Milestone 17: the row must be APPROVED. A student
+  // under review waits; a rejected student is told to submit again
+  // instead of being left wondering why chat never opens.
   const buyerVerification = await fetchVerification(buyerId);
   if (!buyerVerification) {
     return {
       conversation: null,
       error: "Only verified students can chat. Get verified first.",
+    };
+  }
+  if (buyerVerification.status === "rejected") {
+    return {
+      conversation: null,
+      error: "Your verification was not approved — submit it again with clear ID photos to chat.",
+    };
+  }
+  if (buyerVerification.status !== "approved") {
+    return {
+      conversation: null,
+      error: "Your verification is under review — you can chat once the team approves it.",
     };
   }
 
