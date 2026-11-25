@@ -144,6 +144,12 @@ export default function Dispute() {
 
   async function uploadClip() {
     if (!clip) return;
+    // A clip outside 10–20s can never count as evidence — refuse the
+    // save plainly instead of storing an unverified video.
+    if (clip.durationSeconds < DISPUTE_RULE.minSeconds || clip.durationSeconds > DISPUTE_RULE.maxSeconds) {
+      setClipError(`That video is ${clip.durationSeconds}s — dispute evidence must be ${DISPUTE_RULE.minSeconds}–${DISPUTE_RULE.maxSeconds} seconds. Record again.`);
+      return;
+    }
     setClipError("");
     setClipNotice("");
     setClipBusy(true);
@@ -285,12 +291,14 @@ export default function Dispute() {
             id="dispute-explanation"
             className={`${inputCls} mt-1 min-h-28`}
             value={explanation}
-            onChange={(e) => setExplanation(e.target.value)}
+            onChange={(e) => setExplanation(e.target.value.slice(0, 2000))}
             placeholder="Say what you received, what was wrong, and what you expected — at least 20 characters."
+            maxLength={2000}
             disabled={submitting}
           />
           <p className="mt-1 text-xs text-neutral-500">
             {explanation.trim().length} / 20 characters minimum
+            {explanation.trim().length > 0 ? ` · ${explanation.trim().length}/2000 max` : ""}
           </p>
         </div>
 

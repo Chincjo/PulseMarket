@@ -40,6 +40,7 @@ export default function ListingDetail() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [chatting, setChatting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
   const [sellerRating, setSellerRating] = useState(null);
 
   // Milestone 11: the seller's rating summary for the seller card.
@@ -75,12 +76,19 @@ export default function ListingDetail() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchListing(id).then((row) => {
-      if (cancelled) return;
-      setListing(row);
-      setLoading(false);
-      if (row && (!user || row.seller_id !== user.id)) bumpViews(row);
-    });
+    fetchListing(id)
+      .then((row) => {
+        if (cancelled) return;
+        setListing(row);
+        setLoading(false);
+        if (row && (!user || row.seller_id !== user.id)) bumpViews(row);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setListing(null);
+          setLoading(false);
+        }
+      });
     if (user) {
       fetchWatchlistIds(user.id).then((ids) => {
         if (!cancelled) setSaved(ids.includes(id));
@@ -94,8 +102,10 @@ export default function ListingDetail() {
   async function toggleWatch() {
     if (!user) return;
     setSavingWatch(true);
+    setError("");
     const ok = await setWatchlisted(user.id, id, !saved);
     if (ok) setSaved(!saved);
+    else setError("Could not save to your watchlist. Try again.");
     setSavingWatch(false);
   }
 
@@ -147,11 +157,16 @@ export default function ListingDetail() {
   }
 
   async function doDuplicate() {
+    if (duplicating) return;
+    setDuplicating(true);
+    setError("");
     try {
       const copy = await duplicateListing(listing);
       navigate(`/listing/${copy.id}`);
     } catch (err) {
       setError(err?.message || "Could not duplicate the listing. Try again.");
+    } finally {
+      setDuplicating(false);
     }
   }
 
@@ -291,11 +306,16 @@ export default function ListingDetail() {
           <span>{formatNaira(held.price)}</span>
         </p>
         <p className="flex justify-between text-neutral-500">
-          <span>Service fee (5%)</span>
+          <span>
+            Service fee{" "}
+            {listing.price < 5000
+              ? "(flat ₦150 under ₦5,000)"
+              : "(5%, capped at ₦2,000)"}
+          </span>
           <span>{formatNaira(held.serviceFee)}</span>
         </p>
         <p className="flex justify-between text-neutral-500">
-          <span>Secure payment fee</span>
+          <span>Secure payment fee (1.5% + ₦100)</span>
           <span>{formatNaira(held.secureFee)}</span>
         </p>
         <p className="mt-1 flex justify-between font-bold">
@@ -362,7 +382,9 @@ export default function ListingDetail() {
           ) : (
             <div className="flex flex-wrap gap-2">
               <GhostButton onClick={() => setEditing(true)}>Edit</GhostButton>
-              <GhostButton onClick={doDuplicate}>Duplicate</GhostButton>
+              <GhostButton onClick={doDuplicate} disabled={duplicating}>
+                {duplicating ? "Duplicating…" : "Duplicate"}
+              </GhostButton>
               {listing.status === "active" ? (
                 <>
                   <GhostButton onClick={() => setStatus("reserved")}>Mark reserved</GhostButton>

@@ -122,19 +122,24 @@ export default function Tracking() {
   const isInterstate = order && !isSameCity;
 
   const load = useCallback(async () => {
-    const result = await fetchTracking(orderId);
-    if (result) {
-      setOrder(result.order);
-      setCheckpoints(result.checkpoints || []);
-      const item = await fetchListing(result.order.listing_id);
-      setListing(item);
-      if (user) {
-        const chats = await fetchConversations(user.id);
-        const match = (chats || []).find((c) => c.listing_id === result.order.listing_id);
-        if (match) setChatId(match.id);
+    try {
+      const result = await fetchTracking(orderId);
+      if (result) {
+        setOrder(result.order);
+        setCheckpoints(result.checkpoints || []);
+        const item = await fetchListing(result.order.listing_id);
+        setListing(item);
+        if (user) {
+          const chats = await fetchConversations(user.id);
+          const match = (chats || []).find((c) => c.listing_id === result.order.listing_id);
+          if (match) setChatId(match.id);
+        }
       }
+    } catch (err) {
+      setError(err?.message || "Could not load tracking. Try again.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, [orderId, user]);
 
   useEffect(() => {
@@ -163,11 +168,52 @@ export default function Tracking() {
   async function onPhotoInput(e, setPhoto) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setError("That photo is too big — keep photos under 10MB.");
+      e.target.value = "";
+      return;
+    }
     try {
       setPhoto(await fileToDataUrl(file));
     } catch (err) {
       setError(err?.message || "Could not read that photo.");
     }
+  }
+
+  // Shipping-proof + checkpoint fields had no limits: a 10,000-char
+  // waybill number or a nonsense driver phone went straight to the
+  // order. Validate here before anything is submitted.
+  function proofReady() {
+    if (!waybillNumber.trim()) {
+      setError("Enter the waybill number.");
+      return false;
+    }
+    if (waybillNumber.trim().length > 64) {
+      setError("Keep the waybill number under 64 characters.");
+      return false;
+    }
+    if (!waybillPhoto) {
+      setError("Take a photo of the waybill first.");
+      return false;
+    }
+    const phone = driverPhone.trim();
+    if (phone && !/^\+?[0-9][0-9 ()-]{6,14}$/.test(phone)) {
+      setError("That driver phone number does not look right.");
+      return false;
+    }
+    return true;
+  }
+
+  function checkpointReady() {
+    if (cpLocation.trim().length > 120) {
+      setError("Keep the location under 120 characters.");
+      return false;
+    }
+    if (cpNote.trim().length > 280) {
+      setError("Keep the note under 280 characters.");
+      return false;
+    }
+    return true;
   }
 
   if (loading) {
@@ -489,6 +535,7 @@ export default function Tracking() {
                 <input
                   className={`${inputCls} mt-1`}
                   placeholder="e.g. GIG123456789"
+                  maxLength={64}
                   value={waybillNumber}
                   onChange={(e) => setWaybillNumber(e.target.value)}
                 />
@@ -543,15 +590,16 @@ export default function Tracking() {
               <PrimaryButton
                 className="w-full py-3"
                 disabled={busy !== "" || !waybillNumber.trim() || !waybillPhoto}
-                onClick={() =>
+                onClick={() => {
+                  if (!proofReady()) return;
                   run(
                     "proof",
                     () =>
                       submitShippingProof(order.id, {
-                        waybillNumber,
+                        waybillNumber: waybillNumber.trim(),
                         waybillPhoto,
                         receiptPhoto,
-                        driverPhone,
+                        driverPhone: driverPhone.trim(),
                       }),
                     () => {
                       setWaybillNumber("");
@@ -559,8 +607,8 @@ export default function Tracking() {
                       setReceiptPhoto(null);
                       setDriverPhone("");
                     }
-                  )
-                }
+                  );
+                }}
               >
                 {busy === "proof" ? "Submitting…" : "Submit shipping proof"}
               </PrimaryButton>
@@ -622,6 +670,7 @@ export default function Tracking() {
             <input
               className={`${inputCls} mt-1`}
               placeholder="e.g. Onitsha park, GIG terminal Port Harcourt"
+              maxLength={120}
               value={cpLocation}
               onChange={(e) => setCpLocation(e.target.value)}
             />
@@ -631,6 +680,7 @@ export default function Tracking() {
             <input
               className={`${inputCls} mt-1`}
               placeholder="Anything the buyer should know"
+              maxLength={280}
               value={cpNote}
               onChange={(e) => setCpNote(e.target.value)}
             />
@@ -648,17 +698,18 @@ export default function Tracking() {
           <PrimaryButton
             className="w-full py-3"
             disabled={busy !== ""}
-            onClick={() =>
+            onClick={() => {
+              if (!checkpointReady()) return;
               run(
                 "checkpoint",
-                () => addCheckpoint(order.id, { status: cpStatus, location: cpLocation, note: cpNote, photo: cpPhoto }),
+                () => addCheckpoint(order.id, { status: cpStatus, location: cpLocation.trim(), note: cpNote.trim(), photo: cpPhoto }),
                 () => {
                   setCpLocation("");
                   setCpNote("");
                   setCpPhoto(null);
                 }
-              )
-            }
+              );
+            }}
           >
             {busy === "checkpoint" ? "Adding…" : "Add stop"}
           </PrimaryButton>

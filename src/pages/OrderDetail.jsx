@@ -23,11 +23,12 @@ import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
 import RatingForm from "../components/RatingForm";
 
-const HELD_STEPS = ["reserved", "paid", "held", "delivered", "released"];
+const HELD_STEPS = ["reserved", "paid", "held", "shipped", "delivered", "released"];
 const STEP_LABELS = {
   reserved: "Reserved",
   paid: "Paid — transfer sent",
   held: "Held by PulseMarket",
+  shipped: "Shipped",
   delivered: "Delivered",
   released: "Released to seller",
 };
@@ -57,13 +58,16 @@ export default function OrderDetail() {
   const isOwner = user?.email === OWNER_EMAIL;
 
   const load = useCallback(async () => {
-    const row = await fetchOrder(id);
-    setOrder(row);
-    if (row) {
-      const item = await fetchListing(row.listing_id);
-      setListing(item);
+    try {
+      const row = await fetchOrder(id);
+      setOrder(row);
+      if (row) {
+        const item = await fetchListing(row.listing_id);
+        setListing(item);
+      }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, [id]);
 
   useEffect(() => {

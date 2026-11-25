@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getSettings, saveSettings } from "../lib/store";
 import { inputCls } from "../components/ui";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
+import { fetchBlockedIds } from "../lib/chat";
 
 const BACKGROUNDS = [
   { id: "system", label: "System" },
@@ -15,7 +16,38 @@ export default function Settings({ applyAppearance }) {
   const { user } = useAuth();
   const [settings, setSettings] = useState(getSettings());
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [cleared, setCleared] = useState(false);
+  const [blockedCount, setBlockedCount] = useState(null);
+
+  // The old line here always said "Blocked users: none", even after
+  // the student blocked someone in a chat. Read the real list.
+  useEffect(() => {
+    if (!user) return;
+    let alive = true;
+    fetchBlockedIds(user.id)
+      .then((ids) => {
+        if (alive) setBlockedCount((ids || []).length);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [user]);
+
+  async function copySupportEmail() {
+    setCopyFailed(false);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText("pulsemarketsupport@gmail.com");
+        setCopied(true);
+      } else {
+        setCopyFailed(true);
+      }
+    } catch {
+      setCopyFailed(true);
+    }
+  }
 
   function update(patch) {
     const next = { ...settings, ...patch };
@@ -98,7 +130,14 @@ export default function Settings({ applyAppearance }) {
             className="h-5 w-5 accent-[#7d5027]"
           />
         </label>
-        <p className="text-sm text-neutral-500">Blocked users: none. Blocking stops messages from that student.</p>
+        <p className="text-sm text-neutral-500">
+          Blocked users:{" "}
+          {blockedCount === null
+            ? "—"
+            : blockedCount === 0
+              ? "none. Blocking stops messages from that student."
+              : `${blockedCount} — unblock them from the chat with that student.`}
+        </p>
       </section>
 
       <section className="space-y-3">
@@ -107,11 +146,16 @@ export default function Settings({ applyAppearance }) {
           Questions, disputes and complaints go to our support email. We reply from there — never from a personal address.
         </p>
         <button
-          onClick={() => { navigator.clipboard?.writeText("pulsemarketsupport@gmail.com"); setCopied(true); }}
+          onClick={copySupportEmail}
           className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-semibold dark:border-neutral-700"
         >
           {copied ? "Email copied" : "Copy pulsemarketsupport@gmail.com"}
         </button>
+        {copyFailed ? (
+          <p className="text-sm text-neutral-500">
+            Copy did not work — the email is pulsemarketsupport@gmail.com.
+          </p>
+        ) : null}
       </section>
 
       <section className="space-y-3">

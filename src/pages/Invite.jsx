@@ -28,18 +28,23 @@ export default function Invite() {
         setLoading(false);
         return;
       }
-      const inviteCode = await getOrCreateInviteCode(user.id);
-      if (!alive) return;
-      if (!inviteCode) {
-        setNoVerification(true);
-        setLoading(false);
-        return;
+      try {
+        const inviteCode = await getOrCreateInviteCode(user.id);
+        if (!alive) return;
+        if (!inviteCode) {
+          setNoVerification(true);
+          setLoading(false);
+          return;
+        }
+        setCode(inviteCode);
+        const joined = await fetchReferralCount(inviteCode);
+        if (!alive) return;
+        setCount(joined);
+      } catch (err) {
+        if (alive) setError(err?.message || "Could not load your invite code. Try again.");
+      } finally {
+        if (alive) setLoading(false);
       }
-      setCode(inviteCode);
-      const joined = await fetchReferralCount(inviteCode);
-      if (!alive) return;
-      setCount(joined);
-      setLoading(false);
     }
     load();
     return () => {
@@ -49,6 +54,20 @@ export default function Invite() {
 
   if (loading) {
     return <p className="py-10 text-center text-sm text-neutral-500">Loading your invite code…</p>;
+  }
+
+  if (error) {
+    return (
+      <EmptyState
+        title="Could not load your invite code"
+        body={error}
+        action={
+          <Link to="/dashboard">
+            <GhostButton>Back to dashboard</GhostButton>
+          </Link>
+        }
+      />
+    );
   }
 
   if (!user) {

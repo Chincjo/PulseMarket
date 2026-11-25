@@ -14,17 +14,47 @@ export default function ListingEditForm({ listing, onSave, onCancel }) {
 
   async function save() {
     setError("");
-    if (!title.trim() || !price) {
-      setError("Give the item a name and a price.");
+    const cleanTitle = title.trim();
+    if (!cleanTitle) {
+      setError("Give the item a name.");
+      return;
+    }
+    if (cleanTitle.length > 120) {
+      setError("Keep the item name under 120 characters.");
+      return;
+    }
+    // Price must be a whole number above ₦0 (the database refuses ₦0
+    // too) and below ₦10,000,000 — before this fix a negative price
+    // silently became ₦0 and ₦999,999,999 sailed through.
+    const n = Math.round(Number(price));
+    if (!price || price.toString().trim() === "" || !Number.isFinite(n) || n < 1) {
+      setError("Enter a price above ₦0.");
+      return;
+    }
+    if (n > 10000000) {
+      setError("Price is too high — keep it under ₦10,000,000.");
+      return;
+    }
+    if (!CONDITIONS.includes(condition)) {
+      setError("Choose a condition from the list.");
+      return;
+    }
+    const cleanDescription = description.trim();
+    if (cleanDescription.length < 20) {
+      setError("Describe the item in at least 20 characters.");
+      return;
+    }
+    if (cleanDescription.length > 2000) {
+      setError("Keep the description under 2,000 characters.");
       return;
     }
     setBusy(true);
     try {
       await onSave({
-        title: title.trim(),
-        price: Math.max(0, Math.round(Number(price) || 0)),
+        title: cleanTitle,
+        price: n,
         condition,
-        description: description.trim(),
+        description: cleanDescription,
       });
     } catch (err) {
       setError(err?.message || "Could not save the changes. Try again.");
@@ -38,7 +68,7 @@ export default function ListingEditForm({ listing, onSave, onCancel }) {
       <p className="font-bold">Edit listing</p>
       <label className="block text-sm font-semibold">
         Item name
-        <input value={title} onChange={(e) => setTitle(e.target.value)} className={`${inputCls} mt-1`} />
+        <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={120} className={`${inputCls} mt-1`} />
       </label>
       <div className="grid grid-cols-2 gap-2">
         <label className="block text-sm font-semibold">
@@ -56,7 +86,10 @@ export default function ListingEditForm({ listing, onSave, onCancel }) {
       </div>
       <label className="block text-sm font-semibold">
         Description
-        <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={4} className={`${inputCls} mt-1`} />
+        <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={4} maxLength={2000} className={`${inputCls} mt-1`} />
+        <span className="mt-1 block text-right text-xs font-normal text-neutral-400">
+          {description.trim().length} / 20 characters minimum
+        </span>
       </label>
       {error ? (
         <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">

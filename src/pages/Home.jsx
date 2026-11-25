@@ -16,12 +16,24 @@ export default function Home({ user, verification }) {
 
   useEffect(() => {
     let cancelled = false;
-    fetchActiveListings().then((rows) => {
-      if (!cancelled) {
-        setListings(rows);
-        setLoadingListings(false);
-      }
-    });
+    // Home only ever shows 6 + 6 cards, so fetch 60 rows, not 200 —
+    // the full 200-row payload (with photo URL arrays) is what made
+    // "Near you" sit on "Loading listings…" on slow connections.
+    fetchActiveListings(60)
+      .then((rows) => {
+        if (!cancelled) {
+          setListings(rows);
+          setLoadingListings(false);
+        }
+      })
+      .catch(() => {
+        // A rejected fetch (offline, cold Supabase) must never leave
+        // the page stuck on "Loading listings…" for ever.
+        if (!cancelled) {
+          setListings([]);
+          setLoadingListings(false);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -48,12 +60,13 @@ export default function Home({ user, verification }) {
           className="mt-4 flex gap-2"
           onSubmit={(e) => {
             e.preventDefault();
-            const q = new FormData(e.target).get("q") || "";
+            const q = (new FormData(e.target).get("q") || "").toString().trim().slice(0, 200);
             navigate(`/search?q=${encodeURIComponent(q)}`);
           }}
         >
           <input
             name="q"
+            maxLength={200}
             placeholder="Search items, e.g. calculator"
             className="w-full rounded-full border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-brown dark:border-neutral-700 dark:bg-black"
           />
@@ -66,7 +79,7 @@ export default function Home({ user, verification }) {
             <Link to="/verify">
               <PrimaryButton>Join — get verified</PrimaryButton>
             </Link>
-            <Link to="/verify">
+            <Link to="/signin">
               <span className="inline-flex items-center rounded-full border border-neutral-300 px-4 py-2.5 text-sm font-semibold dark:border-neutral-700">
                 Sign in
               </span>

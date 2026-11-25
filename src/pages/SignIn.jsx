@@ -33,6 +33,16 @@ export default function SignIn() {
       setError("Student accounts are being switched on — please check back shortly.");
       return;
     }
+    // A whitespace-only email used to reach Supabase and come back as
+    // a confusing "invalid credentials" error.
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError("Enter a valid email address.");
+      return;
+    }
+    if (!password) {
+      setError("Enter your password.");
+      return;
+    }
     setBusy(true);
     try {
       await signInEmail(email.trim(), password);
@@ -92,7 +102,7 @@ export default function SignIn() {
         ) : null}
         <PrimaryButton
           className="w-full"
-          disabled={busy || !email || !password}
+          disabled={busy || !email.trim() || !password}
         >
           {busy ? "Signing in…" : "Sign in"}
         </PrimaryButton>

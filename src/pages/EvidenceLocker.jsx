@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { fetchMyOrders } from "../lib/orders";
-import { fetchListing } from "../lib/listings";
+import { fetchListingsByIds } from "../lib/listings";
 import {
   EVIDENCE_RULES,
   deleteEvidence,
@@ -189,6 +189,14 @@ function UploadBox({ order, onUploaded }) {
 
   async function uploadClip() {
     if (!clip) return;
+    // A clip outside the kind's range can never count — refuse the
+    // save plainly instead of storing an unverified video.
+    if ((rule.minSeconds > 0 && clip.durationSeconds < rule.minSeconds) || clip.durationSeconds > rule.maxSeconds) {
+      setError(
+        `That video is ${clip.durationSeconds}s — ${rule.label.toLowerCase()} must be ${rule.minSeconds > 0 ? `${rule.minSeconds}–${rule.maxSeconds}` : `no longer than ${rule.maxSeconds}`} seconds. Record again.`
+      );
+      return;
+    }
     setError("");
     setNotice("");
     setBusy(true);
@@ -215,6 +223,10 @@ function UploadBox({ order, onUploaded }) {
 
   async function uploadPhoto(file) {
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setError("That photo is too big — keep evidence photos under 10MB.");
+      return;
+    }
     setError("");
     setNotice("");
     setBusy(true);
@@ -285,7 +297,10 @@ function UploadBox({ order, onUploaded }) {
             <div>
               <video src={clipUrl} controls className="aspect-video w-full rounded-lg bg-black object-cover" />
               <p className="mt-2 text-center text-sm">
-                Recorded {clip.durationSeconds}s — {clip.durationSeconds > rule.maxSeconds ? "too long, record again." : "ready to save."}
+                Recorded {clip.durationSeconds}s —{" "}
+                {(rule.minSeconds > 0 && clip.durationSeconds < rule.minSeconds) || clip.durationSeconds > rule.maxSeconds
+                  ? "outside the range for this kind, record again."
+                  : "ready to save."}
               </p>
               <div className="mt-2 flex justify-center gap-2">
                 <PrimaryButton type="button" onClick={uploadClip} disabled={busy}>
@@ -354,19 +369,11 @@ export default function EvidenceLocker() {
       ]);
       setOrders(myOrders || []);
       setEvidence(myEvidence || []);
-      // Item titles come from the listings, one fetch per order.
+      // Item titles, in ONE query — the old code fetched one listing
+      // per order (N+1), which made the locker crawl with many orders.
       const listingIds = [...new Set((myOrders || []).map((o) => o.listing_id).filter(Boolean))];
-      const entries = await Promise.all(
-        listingIds.map(async (id) => {
-          try {
-            const listing = await fetchListing(id);
-            return [id, listing?.title || "Item"];
-          } catch {
-            return [id, "Item"];
-          }
-        })
-      );
-      setTitles(Object.fromEntries(entries));
+      const rows = await fetchListingsByIds(listingIds);
+      setTitles(Object.fromEntries(rows.map((l) => [l.id, l.title || "Item"])));
     } catch (err) {
       setError(err?.message || "Could not load your evidence.");
     } finally {

@@ -21,12 +21,18 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState(null);
 
   async function reload() {
     if (!user) return;
-    const rows = await fetchMyListings(user.id);
-    setListings(rows);
-    setLoading(false);
+    try {
+      const rows = await fetchMyListings(user.id);
+      setListings(rows);
+    } catch (err) {
+      setError(err?.message || "Could not load your listings. Try again.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
@@ -48,6 +54,9 @@ export default function Dashboard() {
   }
 
   async function remove(listing) {
+    // Deleting is permanent — ask first. (The listing detail page
+    // already asks with a two-tap confirm; this page had none.)
+    if (!window.confirm(`Delete "${listing.title}"? This cannot be undone.`)) return;
     setError("");
     try {
       await deleteListing(listing.id);
@@ -58,12 +67,16 @@ export default function Dashboard() {
   }
 
   async function duplicate(listing) {
+    if (busyId) return;
     setError("");
+    setBusyId(listing.id);
     try {
       await duplicateListing(listing);
       reload();
     } catch (err) {
       setError(err?.message || "Could not duplicate the listing. Try again.");
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -132,7 +145,9 @@ export default function Dashboard() {
                 <GhostButton onClick={() => setEditingId(editingId === d.id ? null : d.id)}>
                   {editingId === d.id ? "Close edit" : "Edit"}
                 </GhostButton>
-                <GhostButton onClick={() => duplicate(d)}>Duplicate</GhostButton>
+                <GhostButton onClick={() => duplicate(d)} disabled={busyId === d.id}>
+                  {busyId === d.id ? "Duplicating…" : "Duplicate"}
+                </GhostButton>
                 {d.status === "active" ? (
                   <>
                     <GhostButton onClick={() => setStatus(d, "reserved")}>Mark reserved</GhostButton>

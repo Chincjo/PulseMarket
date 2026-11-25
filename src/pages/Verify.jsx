@@ -32,6 +32,9 @@ function friendlyError(err) {
   return msg || "Something went wrong. Please try again.";
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_FILE_MB = 10;
+
 export default function Verify({ onVerified }) {
   const { user, configured, signUpEmail, signInGoogle, signOut } = useAuth();
   const navigate = useNavigate();
@@ -52,10 +55,17 @@ export default function Verify({ onVerified }) {
   const [referralCode, setReferralCode] = useState("");
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
+  const [formError, setFormError] = useState("");
 
   function filePreview(e, set) {
     const f = e.target.files?.[0];
     if (!f) return;
+    if (f.size > MAX_FILE_MB * 1024 * 1024) {
+      setFormError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
+      e.target.value = "";
+      return;
+    }
+    setFormError("");
     const r = new FileReader();
     r.onload = () => set(r.result);
     r.readAsDataURL(f);
@@ -66,6 +76,10 @@ export default function Verify({ onVerified }) {
     setError("");
     if (!configured) {
       setError("Student accounts are being switched on — please check back shortly.");
+      return;
+    }
+    if (!EMAIL_RE.test(email.trim())) {
+      setError("Enter a valid email address.");
       return;
     }
     if (password.length < 6) {
@@ -103,6 +117,25 @@ export default function Verify({ onVerified }) {
   }
 
   async function submitVerification() {
+    setFormError("");
+    // Before this fix a student ID of only spaces passed (the button
+    // only checked the raw string was non-empty) and a mistyped
+    // student email was saved without complaint — and step 2 had no
+    // error display at all, so a failed save failed silently.
+    const cleanStudentId = studentId.trim();
+    if (cleanStudentId.length < 2 || cleanStudentId.length > 50) {
+      setFormError("Enter your student ID / matric number (2–50 characters).");
+      return;
+    }
+    const cleanStudentEmail = studentEmail.trim();
+    if (cleanStudentEmail && !EMAIL_RE.test(cleanStudentEmail)) {
+      setFormError("That student email does not look right — check it and try again.");
+      return;
+    }
+    if (cleanStudentEmail.length > 120) {
+      setFormError("That student email is too long.");
+      return;
+    }
     // Milestone 11: a referral code is accepted only in the real
     // PM-XXXXXX shape; anything else is ignored, never blocks joining.
     const cleanReferral = referralCode.trim().toUpperCase();
@@ -110,8 +143,8 @@ export default function Verify({ onVerified }) {
       userId: user?.id || null,
       email: user?.email || email,
       university,
-      studentEmail,
-      studentId,
+      studentEmail: cleanStudentEmail,
+      studentId: cleanStudentId,
       status: "pending review",
       inviteCode: generateInviteCode(),
       referredBy: /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral) ? cleanReferral : null,
@@ -192,11 +225,11 @@ export default function Verify({ onVerified }) {
         </label>
         <label className="block text-sm font-semibold">
           Student ID / matric number
-          <input value={studentId} onChange={(e) => setStudentId(e.target.value)} placeholder="e.g. U2026/04115" className={`${inputCls} mt-1`} />
+          <input value={studentId} onChange={(e) => setStudentId(e.target.value)} maxLength={50} placeholder="e.g. U2026/04115" className={`${inputCls} mt-1`} />
         </label>
         <label className="block text-sm font-semibold">
           Invite code (optional) — if a friend invited you
-          <input value={referralCode} onChange={(e) => setReferralCode(e.target.value)} placeholder="e.g. PM-AB12CD" className={`${inputCls} mt-1`} />
+          <input value={referralCode} onChange={(e) => setReferralCode(e.target.value)} maxLength={9} placeholder="e.g. PM-AB12CD" className={`${inputCls} mt-1`} />
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
@@ -211,9 +244,15 @@ export default function Verify({ onVerified }) {
           </label>
         </div>
 
+        {formError ? (
+          <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+            {formError}
+          </p>
+        ) : null}
+
         <PrimaryButton
           className="w-full"
-          disabled={!studentId}
+          disabled={!studentId.trim()}
           onClick={submitVerification}
         >
           Review & submit

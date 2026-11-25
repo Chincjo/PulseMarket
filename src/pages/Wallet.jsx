@@ -36,12 +36,16 @@ export default function Wallet() {
       return;
     }
     setLoading(true);
-    Promise.all([getBalances(user.id), fetchLedger(user.id)]).then(([b, rows]) => {
-      if (cancelled) return;
-      setBalances(b);
-      setLedger(rows);
-      setLoading(false);
-    });
+    Promise.all([getBalances(user.id), fetchLedger(user.id)])
+      .then(([b, rows]) => {
+        if (cancelled) return;
+        setBalances(b);
+        setLedger(rows);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (!cancelled) setLoading(false);
+      });
     return () => {
       cancelled = true;
     };

@@ -4,12 +4,17 @@
 // has not run supabase/milestone-7.sql), so the app says so honestly
 // instead of crashing.
 //
-// Flow (see supabase/milestone-7.sql for the columns):
-//   1. Seller opens the handoff: ensureSellerCode() creates the one-time
-//      PM-XXXXXX code. The seller shows it (big text + a QR code made
-//      on their own phone — nothing leaves the device).
-//   2. Buyer scans / types the code: scanSellerCode(). 5 wrong guesses
-//      locks the handoff and flags the attempting account.
+// Flow (see supabase/milestone-7.sql and milestone-14.sql):
+//   1. Seller opens the handoff: ensureSellerCode() creates the
+//      one-time PM-XXXXXX code. It lives in the handoff_codes table
+//      (seller-only) — NEVER on the order row, because the buyer can
+//      read the order and would otherwise see the code without
+//      meeting the seller. The seller shows it (big text + a QR code
+//      made on their own phone — nothing leaves the device).
+//   2. Buyer scans / types the code: scanSellerCode() checks it
+//      server-side (verify_seller_code RPC), so the buyer never reads
+//      the code from the database. 5 wrong guesses locks the handoff
+//      and flags the attempting account.
 //   3. Both sides take a handover photo with the in-app camera:
 //      uploadHandoffPhoto().
 //   4. Both sides confirm: confirmHandoff(). Only then is the release
@@ -117,6 +122,12 @@ export async function logSecurityEvent(orderId, userId, action, detail) {
 // Generates and stores the seller code the first time the handoff is
 // opened for a meetup order. If a code already exists it is returned
 // unchanged — the code is one-time per deal and must never be re-rolled.
+// The code is stored in handoff_codes (seller-only, see
+// supabase/milestone-14.sql), never on the order row: the buyer reads
+// the order, so a code stored there would be visible to them without
+// meeting the seller. The returned order object carries the code
+// in-memory (seller_code) so the Handoff page can show it and build
+// the QR code — it is not saved on the order.
 export async function ensureSellerCode(orderId) {
   if (!supabase) throw new Error("Supabase is not configured.");
   const order = await readOrder(orderId);
@@ -127,76 +138,61 @@ export async function ensureSellerCode(orderId) {
   if (order.handoff_locked) {
     throw new Error("This handoff is locked — contact support.");
   }
-  if (order.seller_code) return order;
+  const { data: existing, error: readError } = await supabase
+    .from("handoff_codes")
+    .select("code")
+    .eq("order_id", orderId)
+    .maybeSingle();
+  if (readError) throw readError;
+  if (existing?.code) return { ...order, seller_code: existing.code };
   // A code collision (unique index) is rare; retry with a fresh code.
+  // A second device racing the first hits the same conflict — read
+  // the code that won instead of failing.
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await updateOrder(orderId, { seller_code: generateSellerCode() });
-    } catch (err) {
-      lastError = err;
-      if (err?.code !== "23505") break;
-    }
+    const code = generateSellerCode();
+    const { error } = await supabase
+      .from("handoff_codes")
+      .insert({ order_id: orderId, code });
+    if (!error) return { ...order, seller_code: code };
+    lastError = error;
+    if (error?.code !== "23505") break;
+    const { data: raced } = await supabase
+      .from("handoff_codes")
+      .select("code")
+      .eq("order_id", orderId)
+      .maybeSingle();
+    if (raced?.code) return { ...order, seller_code: raced.code };
   }
   throw lastError || new Error("Could not create the seller code. Try again.");
 }
 
 // The BUYER calls this with the code they scanned or typed from the
-// seller's phone. On a match the handoff is marked scanned. On a
-// mismatch the attempt is counted and logged; at 5 wrong attempts the
-// handoff locks, the attempting account is flagged, and a lock row is
-// logged.
+// seller's phone. The code is checked server-side (verify_seller_code
+// RPC, supabase/milestone-14.sql): the buyer never reads the code
+// from the database, so it cannot be looked up without meeting the
+// seller. A match marks the handoff scanned. A wrong code returns
+// false — the RPC counted it and logged it, and the order is re-read
+// here to say how many tries are left (or that the handoff locked
+// at 5 wrong attempts and the account was flagged).
 export async function scanSellerCode(orderId, code) {
   if (!supabase) throw new Error("Supabase is not configured.");
   const typed = String(code || "").trim().toUpperCase();
   if (!typed) throw new Error("Type the seller code shown on the seller's phone.");
+  const { data, error } = await supabase.rpc("verify_seller_code", {
+    p_order_id: orderId,
+    p_code: typed,
+  });
+  if (error) throw new Error(error.message || "Could not check the seller code. Try again.");
+  if (data) return readOrder(orderId);
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
-  const userId = await currentUserId();
-  if (userId && order.buyer_id !== userId) {
-    throw new Error("Only the buyer can scan the seller code.");
-  }
   if (order.handoff_locked) {
-    throw new Error("This handoff is locked — contact support.");
-  }
-  if (order.handoff_scanned_at) {
-    throw new Error("This handoff has already been scanned.");
-  }
-  if (typed === String(order.seller_code || "").toUpperCase()) {
-    return updateOrder(orderId, { handoff_scanned_at: new Date().toISOString() });
-  }
-
-  const attempts = (order.code_attempts || 0) + 1;
-  await logSecurityEvent(
-    orderId,
-    userId,
-    "wrong_code",
-    `Wrong seller code attempt ${attempts} of ${MAX_CODE_ATTEMPTS} for order ${order.code}.`
-  );
-  if (attempts >= MAX_CODE_ATTEMPTS) {
-    await updateOrder(orderId, {
-      code_attempts: attempts,
-      handoff_locked: true,
-    });
-    // Flag the attempting account for the PulseMarket team to review.
-    if (userId) {
-      const { error } = await supabase
-        .from("verifications")
-        .update({ flagged: true })
-        .eq("user_id", userId);
-      if (error) dbError(error, "flag account after handoff lock");
-    }
-    await logSecurityEvent(
-      orderId,
-      userId,
-      "handoff_locked",
-      `Handoff locked after ${attempts} wrong seller codes for order ${order.code}.`
-    );
     throw new Error("Too many wrong codes — this handoff is locked.");
   }
-  await updateOrder(orderId, { code_attempts: attempts });
+  const left = Math.max(0, MAX_CODE_ATTEMPTS - (order.code_attempts || 0));
   throw new Error(
-    `Wrong code — ${MAX_CODE_ATTEMPTS - attempts} ${MAX_CODE_ATTEMPTS - attempts === 1 ? "try" : "tries"} left before this handoff locks.`
+    `Wrong code — ${left} ${left === 1 ? "try" : "tries"} left before this handoff locks.`
   );
 }
 
@@ -277,9 +273,21 @@ export async function confirmHandoff(orderId, role) {
 export async function getHandoffStatus(orderId) {
   const order = await readOrder(orderId);
   if (!order) return null;
+  // The code comes from handoff_codes, which only the seller can
+  // read — a buyer asking for the status gets null here, never the
+  // code (see supabase/milestone-14.sql).
+  let code = null;
+  if (supabase) {
+    const { data } = await supabase
+      .from("handoff_codes")
+      .select("code")
+      .eq("order_id", orderId)
+      .maybeSingle();
+    code = data?.code || null;
+  }
   return {
     order,
-    code: order.seller_code || null,
+    code,
     scanned: Boolean(order.handoff_scanned_at),
     scannedAt: order.handoff_scanned_at || null,
     locked: Boolean(order.handoff_locked),

@@ -30,10 +30,10 @@ export default function Profile({ user }) {
         <Link to="/settings" className="flex-1">
           <GhostButton className="w-full">Settings</GhostButton>
         </Link>
-        <Link to="/settings" className="flex-1">
-          <GhostButton className="w-full">Saved items</GhostButton>
+        <Link to="/dashboard" className="flex-1">
+          <GhostButton className="w-full">My listings</GhostButton>
         </Link>
-        <Link to="/settings" className="flex-1">
+        <Link to="/notifications" className="flex-1">
           <GhostButton className="w-full">Notifications</GhostButton>
         </Link>
       </div>

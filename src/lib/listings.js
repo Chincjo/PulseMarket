@@ -96,16 +96,32 @@ export async function saveVerificationRow(userId, rec) {
 // Listings (Milestone 4)
 // ---------------------------------------------------------------------------
 
-export async function fetchActiveListings() {
+export async function fetchActiveListings(limit = 200) {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from("listings")
     .select("*")
     .eq("status", "active")
     .order("created_at", { ascending: false })
-    .limit(200);
+    .limit(Math.max(1, Math.min(200, Number(limit) || 200)));
   if (error) {
     dbError(error, "fetch listings");
+    return [];
+  }
+  return data || [];
+}
+
+// One query for many listings (e.g. Evidence Locker titles) —
+// never one fetch per listing.
+export async function fetchListingsByIds(ids) {
+  const clean = [...new Set((ids || []).filter(Boolean))];
+  if (!supabase || clean.length === 0) return [];
+  const { data, error } = await supabase
+    .from("listings")
+    .select("id, title")
+    .in("id", clean);
+  if (error) {
+    dbError(error, "fetch listings by ids");
     return [];
   }
   return data || [];

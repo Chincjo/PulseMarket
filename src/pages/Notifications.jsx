@@ -99,15 +99,20 @@ export default function Notifications() {
       setLoading(false);
       return;
     }
-    const [notes, myOrders, myListings] = await Promise.all([
-      fetchNotifications(user.id),
-      fetchMyOrders(user.id),
-      fetchMyListings(user.id),
-    ]);
-    setItems(notes || []);
-    setOrders(myOrders || []);
-    setListings(myListings || []);
-    setLoading(false);
+    try {
+      const [notes, myOrders, myListings] = await Promise.all([
+        fetchNotifications(user.id),
+        fetchMyOrders(user.id),
+        fetchMyListings(user.id),
+      ]);
+      setItems(notes || []);
+      setOrders(myOrders || []);
+      setListings(myListings || []);
+    } catch (err) {
+      setError(err?.message || "Could not load notifications. Try again.");
+    } finally {
+      setLoading(false);
+    }
   }, [user]);
 
   useEffect(() => {

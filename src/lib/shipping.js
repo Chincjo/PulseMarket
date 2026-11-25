@@ -279,22 +279,35 @@ export async function submitShippingProof(
   let advanceReleased = false;
   let reason;
   if (proofComplete && advanceAmount > 0) {
-    await recordLedgerMove(order, [
-      {
-        userId: order.seller_id,
-        bucket: "held",
-        kind: "shipping_advance",
-        amount: -advanceAmount,
-        note: `Shipping advance (50%) for order ${order.code}`,
-      },
-      {
-        userId: order.seller_id,
-        bucket: "available",
-        kind: "shipping_advance",
-        amount: advanceAmount,
-        note: `Shipping advance (50%) for order ${order.code}`,
-      },
-    ]);
+    // Double-submit guard: the advance must move exactly once. The
+    // database refuses a second advance pair too (unique indexes in
+    // supabase/milestone-14.sql); this check gives the plain error.
+    if (order.shipping_advance_released || (await advanceAlreadyReleased(order.id)) > 0) {
+      throw new Error("Shipping proof was already submitted for this order — the advance moved once.");
+    }
+    try {
+      await recordLedgerMove(order, [
+        {
+          userId: order.seller_id,
+          bucket: "held",
+          kind: "shipping_advance",
+          amount: -advanceAmount,
+          note: `Shipping advance (50%) for order ${order.code}`,
+        },
+        {
+          userId: order.seller_id,
+          bucket: "available",
+          kind: "shipping_advance",
+          amount: advanceAmount,
+          note: `Shipping advance (50%) for order ${order.code}`,
+        },
+      ]);
+    } catch (err) {
+      if (err?.code === "23505") {
+        throw new Error("Shipping proof was already submitted for this order — the advance moved once.");
+      }
+      throw err;
+    }
     advanceReleased = true;
     reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
   } else if (!courierEarnsAdvance(order.courier)) {
@@ -492,6 +505,21 @@ export async function resolveReturn(orderId, { fault }) {
   const itemPrice = Number(order.item_price) || 0;
   const shippingFee = Number(order.shipping_fee) || 0;
   const advance = await advanceAlreadyReleased(order.id);
+  // Double-resolve guard: the refund must move exactly once. The
+  // database refuses a second refund pair too (unique indexes in
+  // supabase/milestone-14.sql); this check gives the plain error.
+  if (supabase) {
+    const { data: existingRefund } = await supabase
+      .from("wallet_ledger")
+      .select("id")
+      .eq("order_id", order.id)
+      .eq("kind", "refund")
+      .eq("bucket", "held")
+      .limit(1);
+    if (existingRefund && existingRefund.length > 0) {
+      throw new Error("This return was already resolved — the refund moved once.");
+    }
+  }
   // Money still sitting in the seller's held bucket for this order:
   // the full total, minus any advance already released.
   const remainingHeld = Math.max(0, total - advance);
@@ -514,7 +542,14 @@ export async function resolveReturn(orderId, { fault }) {
         note: `Refund — seller fault return, order ${order.code}`,
       },
     ];
-    await recordLedgerMove(order, moves);
+    try {
+      await recordLedgerMove(order, moves);
+    } catch (err) {
+      if (err?.code === "23505") {
+        throw new Error("This return was already resolved — the refund moved once.");
+      }
+      throw err;
+    }
     if (advance > 0) {
       await recordSellerDebt(
         order.id,
@@ -554,7 +589,14 @@ export async function resolveReturn(orderId, { fault }) {
         note: `Remaining shipping fee — buyer fault return, order ${order.code}`,
       });
     }
-    await recordLedgerMove(order, moves);
+    try {
+      await recordLedgerMove(order, moves);
+    } catch (err) {
+      if (err?.code === "23505") {
+        throw new Error("This return was already resolved — the refund moved once.");
+      }
+      throw err;
+    }
     note =
       `Buyer fault: the buyer gets the item price back only (${itemPrice} naira). ` +
       `The seller keeps the shipping advance${advance > 0 ? ` (${advance} naira)` : ""} and the rest of the shipping fee, and the buyer pays the return shipping.`;

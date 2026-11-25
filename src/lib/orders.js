@@ -104,6 +104,28 @@ async function advanceAlreadyReleased(orderId) {
   return (data || []).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
 }
 
+// Has a money move of this kind already been written for the order?
+// The database also enforces it (one-per-order unique indexes in
+// supabase/milestone-14.sql), but checking first gives the buyer a
+// plain-English error instead of a database error, and stops a
+// double-click from ever reaching the ledger.
+async function ledgerMoveExists(orderId, kind, bucket) {
+  if (!supabase || !orderId) return false;
+  let query = supabase
+    .from("wallet_ledger")
+    .select("id")
+    .eq("order_id", orderId)
+    .eq("kind", kind)
+    .limit(1);
+  if (bucket) query = query.eq("bucket", bucket);
+  const { data, error } = await query;
+  if (error) {
+    dbError(error, "check ledger move");
+    return false;
+  }
+  return (data || []).length > 0;
+}
+
 async function updateOrder(id, patch) {
   const { data, error } = await supabase
     .from("orders")
@@ -267,15 +289,28 @@ export async function confirmReceipt(orderId, user) {
   if (order.status !== "paid") {
     throw new Error(`This order is ${order.status} — there is no transfer to confirm.`);
   }
-  await recordLedgerMove(order, [
-    {
-      userId: order.seller_id,
-      bucket: "held",
-      kind: "hold",
-      amount: order.total,
-      note: `Held for order ${order.code}`,
-    },
-  ]);
+  // Double-confirm guard: the money must enter hold exactly once.
+  // The database refuses a second hold row too (unique index in
+  // supabase/milestone-14.sql); this check gives the plain error.
+  if (await ledgerMoveExists(order.id, "hold", "held")) {
+    throw new Error("This transfer was already confirmed — the money is already held.");
+  }
+  try {
+    await recordLedgerMove(order, [
+      {
+        userId: order.seller_id,
+        bucket: "held",
+        kind: "hold",
+        amount: order.total,
+        note: `Held for order ${order.code}`,
+      },
+    ]);
+  } catch (err) {
+    if (err?.code === "23505") {
+      throw new Error("This transfer was already confirmed — the money is already held.");
+    }
+    throw err;
+  }
   const updated = await updateOrder(orderId, { status: "held", held_at: new Date().toISOString() });
   notifyUser(order.buyer_id, {
     kind: "order",
@@ -348,6 +383,11 @@ export async function confirmDelivery(orderId, userId) {
   if (userId && order.buyer_id !== userId) {
     throw new Error("Only the buyer can confirm delivery.");
   }
+  // A frozen order (open dispute) cannot be confirmed delivered
+  // until the PulseMarket team resolves it — same rule as release.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   const now = new Date().toISOString();
   if (order.payment_method === "cash") {
     // Cash was settled face to face, so there is no held money to
@@ -415,22 +455,36 @@ export async function releaseOrder(orderId, user) {
     0,
     order.item_price + ((order.shipping_fee || 0) - advance)
   );
-  await recordLedgerMove(order, [
-    {
-      userId: order.seller_id,
-      bucket: "held",
-      kind: "release",
-      amount: heldAmount,
-      note: `Released from hold for order ${order.code}`,
-    },
-    {
-      userId: order.seller_id,
-      bucket: "available",
-      kind: "release",
-      amount: availableAmount,
-      note: `Released to seller for order ${order.code}`,
-    },
-  ]);
+  // Double-release guard: the money must leave hold exactly once.
+  // The database refuses a second release pair too (unique indexes
+  // in supabase/milestone-14.sql); this check gives the plain error
+  // and stops a double-click or two racing devices from paying twice.
+  if (await ledgerMoveExists(order.id, "release", "held")) {
+    throw new Error("This order was already released — the money moved once.");
+  }
+  try {
+    await recordLedgerMove(order, [
+      {
+        userId: order.seller_id,
+        bucket: "held",
+        kind: "release",
+        amount: heldAmount,
+        note: `Released from hold for order ${order.code}`,
+      },
+      {
+        userId: order.seller_id,
+        bucket: "available",
+        kind: "release",
+        amount: availableAmount,
+        note: `Released to seller for order ${order.code}`,
+      },
+    ]);
+  } catch (err) {
+    if (err?.code === "23505") {
+      throw new Error("This order was already released — the money moved once.");
+    }
+    throw err;
+  }
   const updated = await updateOrder(orderId, {
     status: "released",
     released_at: new Date().toISOString(),
@@ -462,6 +516,9 @@ export async function cancelOrder(orderId, userId) {
   if (!order) throw new Error("Order not found.");
   if (userId && order.buyer_id !== userId) {
     throw new Error("Only the buyer can cancel this order.");
+  }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
   if (!["reserved", "paid"].includes(order.status)) {
     throw new Error(`This order is ${order.status} — it can no longer be cancelled.`);

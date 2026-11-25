@@ -74,7 +74,16 @@ export default function ChatThread() {
     if (!user || !id) return;
     let cancelled = false;
     async function load() {
-      const conv = await fetchConversation(id);
+      let conv;
+      try {
+        conv = await fetchConversation(id);
+      } catch {
+        if (!cancelled) {
+          setNotFound(true);
+          setLoading(false);
+        }
+        return;
+      }
       if (cancelled) return;
       if (!conv) {
         setNotFound(true);
@@ -134,6 +143,11 @@ export default function ChatThread() {
       setError("Enter an offer amount above ₦0.");
       return;
     }
+    // No upper bound before: an offer of ₦999,999,999 went through.
+    if (amount > 10000000) {
+      setError("Offer is too high — keep it under ₦10,000,000.");
+      return;
+    }
     setSending(true);
     setError("");
     const sent = await sendOffer(id, amount);
@@ -162,6 +176,22 @@ export default function ChatThread() {
     e.preventDefault();
     if (!spot || !date || !time) {
       setError("Pick a spot, a date and a time for the meetup.");
+      return;
+    }
+    // A meetup in the past used to save without complaint.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const picked = new Date(`${date}T00:00:00`);
+    if (Number.isNaN(picked.getTime())) {
+      setError("Pick a valid date for the meetup.");
+      return;
+    }
+    if (picked < today) {
+      setError("That date is in the past — pick a date from today onwards.");
+      return;
+    }
+    if (picked.getTime() - today.getTime() > 90 * 24 * 60 * 60 * 1000) {
+      setError("Pick a date within the next 90 days.");
       return;
     }
     setError("");
@@ -370,8 +400,9 @@ export default function ChatThread() {
         <input
           className={inputCls}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => setDraft(e.target.value.slice(0, MAX_MESSAGE_LENGTH))}
           placeholder="Write a message…"
+          maxLength={MAX_MESSAGE_LENGTH}
           disabled={isBlocked}
         />
         <PrimaryButton type="submit" disabled={sending || !draft.trim() || isBlocked}>

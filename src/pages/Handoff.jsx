@@ -70,32 +70,37 @@ export default function Handoff() {
   const role = isBuyer ? "buyer" : isSeller ? "seller" : null;
 
   const load = useCallback(async () => {
-    const row = await fetchOrder(orderId);
-    setOrder(row);
-    if (row) {
-      const item = await fetchListing(row.listing_id);
-      setListing(item);
-      // Seller opening the handoff creates the one-time code.
-      let current = row;
-      if (user && row.seller_id === user.id && row.delivery_method === "meetup" && !row.seller_code && !row.handoff_locked) {
-        try {
-          current = await ensureSellerCode(row.id);
-          setOrder(current);
-        } catch (err) {
-          setError(err?.message || "Could not create the seller code.");
+    try {
+      const row = await fetchOrder(orderId);
+      setOrder(row);
+      if (row) {
+        const item = await fetchListing(row.listing_id);
+        setListing(item);
+        // Seller opening the handoff creates the one-time code.
+        let current = row;
+        if (user && row.seller_id === user.id && row.delivery_method === "meetup" && !row.seller_code && !row.handoff_locked) {
+          try {
+            current = await ensureSellerCode(row.id);
+            setOrder(current);
+          } catch (err) {
+            setError(err?.message || "Could not create the seller code.");
+          }
+        }
+        const st = await getHandoffStatus(current.id);
+        setStatus(st);
+        if (current.seller_code) {
+          try {
+            setQrUrl(await QRCode.toDataURL(current.seller_code, { width: 240, margin: 1 }));
+          } catch {
+            setQrUrl("");
+          }
         }
       }
-      const st = await getHandoffStatus(current.id);
-      setStatus(st);
-      if (current.seller_code) {
-        try {
-          setQrUrl(await QRCode.toDataURL(current.seller_code, { width: 240, margin: 1 }));
-        } catch {
-          setQrUrl("");
-        }
-      }
+    } catch (err) {
+      setError(err?.message || "Could not load this handoff. Try again.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, [orderId, user]);
 
   useEffect(() => {
@@ -128,6 +133,12 @@ export default function Handoff() {
 
   async function onPhotoFile(file) {
     if (!file || !role) return;
+    // A multi-megabyte photo becomes a giant data URL and a giant
+    // upload — refuse it plainly instead of hanging the save.
+    if (file.size > 10 * 1024 * 1024) {
+      setError("That photo is too big — keep handover photos under 10MB.");
+      return;
+    }
     setError("");
     setNotice("");
     setBusy("photo");
@@ -147,6 +158,10 @@ export default function Handoff() {
 
   async function onScanFile(file) {
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setError("That photo is too big — take a smaller one (under 10MB).");
+      return;
+    }
     try {
       setScanPhoto(await fileToDataUrl(file));
       setNotice("Photo taken — read the code on the seller's phone and type it below.");

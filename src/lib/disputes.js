@@ -114,7 +114,13 @@ export async function fileDispute(orderId, { category, explanation, email }) {
   if (cleanExplanation.length < 20) {
     throw new Error("Explain what happened in at least 20 characters.");
   }
+  if (cleanExplanation.length > 2000) {
+    throw new Error("Keep your explanation under 2,000 characters.");
+  }
   const cleanEmail = String(email || "").trim();
+  if (cleanEmail.length > 120) {
+    throw new Error("That email address is too long.");
+  }
   if (!EMAIL_RE.test(cleanEmail)) {
     throw new Error("Enter a valid email address so the team can reach you.");
   }

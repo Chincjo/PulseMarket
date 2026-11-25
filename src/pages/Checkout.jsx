@@ -33,19 +33,26 @@ export default function Checkout() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    fetchListing(listingId).then((row) => {
-      if (cancelled) return;
-      setListing(row);
-      setLoading(false);
-      if (row) {
-        setMeetupSpot(row.meetup_spot || SAFE_MEETUP_SPOTS[0]);
-        setCourier(row.courier || COURIERS[0]);
-        const methods = row.delivery_methods || [];
-        if (!methods.includes("meetup") && methods.includes("shipping")) {
-          setDeliveryMethod("shipping");
+    fetchListing(listingId)
+      .then((row) => {
+        if (cancelled) return;
+        setListing(row);
+        setLoading(false);
+        if (row) {
+          setMeetupSpot(row.meetup_spot || SAFE_MEETUP_SPOTS[0]);
+          setCourier(row.courier || COURIERS[0]);
+          const methods = row.delivery_methods || [];
+          if (!methods.includes("meetup") && methods.includes("shipping")) {
+            setDeliveryMethod("shipping");
+          }
         }
-      }
-    });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setListing(null);
+          setLoading(false);
+        }
+      });
     if (user) {
       fetchVerificationRow(user.id).then((row) => {
         if (!cancelled && row?.university) setBuyerState(universityState(row.university));
@@ -78,6 +85,17 @@ export default function Checkout() {
   async function reserve() {
     if (!listing || !user) return;
     setError("");
+    // Shipping with no destination state used to sail through and
+    // silently fall back to the buyer's state (or none at all) —
+    // the order then had nowhere to ship to.
+    if (deliveryMethod === "shipping" && !shipToState && !buyerState) {
+      setError("Choose the state to ship to.");
+      return;
+    }
+    if (deliveryMethod === "meetup" && !meetupSpot) {
+      setError("Choose a safe meetup spot.");
+      return;
+    }
     setReserving(true);
     try {
       const order = await createOrder({
@@ -273,11 +291,21 @@ export default function Checkout() {
             <dd className="font-semibold">{formatNaira(fees.price)}</dd>
           </div>
           <div className="flex justify-between">
-            <dt>Service fee {paymentMethod === "cash" ? "(cash — no fee)" : "5%"}</dt>
+            <dt>
+              Service fee{" "}
+              {paymentMethod === "cash"
+                ? "(cash — no fee)"
+                : listing.price < 5000
+                  ? "(flat ₦150 under ₦5,000)"
+                  : "(5%, capped at ₦2,000)"}
+            </dt>
             <dd className="font-semibold">{formatNaira(fees.serviceFee)}</dd>
           </div>
           <div className="flex justify-between">
-            <dt>Secure payment fee</dt>
+            <dt>
+              Secure payment fee{" "}
+              {paymentMethod === "cash" ? "(cash — no fee)" : "(1.5% + ₦100)"}
+            </dt>
             <dd className="font-semibold">{formatNaira(fees.secureFee)}</dd>
           </div>
           <div className="flex justify-between">

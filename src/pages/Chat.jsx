@@ -25,10 +25,17 @@ export default function Chat() {
     if (!user) return;
     let cancelled = false;
     async function load() {
-      const rows = await fetchConversations(user.id);
-      if (!cancelled) {
-        setConversations(rows);
-        setLoading(false);
+      try {
+        const rows = await fetchConversations(user.id);
+        if (!cancelled) {
+          setConversations(rows);
+          setLoading(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setConversations([]);
+          setLoading(false);
+        }
       }
     }
     load();

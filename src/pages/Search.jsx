@@ -27,12 +27,19 @@ export default function Search() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchActiveListings().then((rows) => {
-      if (!cancelled) {
-        setAll(rows);
-        setLoading(false);
-      }
-    });
+    fetchActiveListings()
+      .then((rows) => {
+        if (!cancelled) {
+          setAll(rows);
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAll([]);
+          setLoading(false);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -46,6 +53,12 @@ export default function Search() {
     setQ(query);
   }, [params]);
 
+  // Price bounds are sanitised: empty, negative or non-numeric input
+  // is ignored instead of silently filtering everything out.
+  const minNum = min === "" ? null : Math.max(0, Math.floor(Number(min) || 0));
+  const maxNum = max === "" ? null : Math.max(0, Math.floor(Number(max) || 0));
+  const priceRangeBad = minNum !== null && maxNum !== null && minNum > maxNum;
+
   const results = useMemo(() => {
     let list = all.filter((d) => visibleTo(d, myState));
     if (q) list = list.filter((d) => `${d.title} ${d.description || ""}`.toLowerCase().includes(q.toLowerCase()));
@@ -53,20 +66,21 @@ export default function Search() {
     if (condition) list = list.filter((d) => d.condition === condition);
     if (university) list = list.filter((d) => d.university === university);
     if (state) list = list.filter((d) => d.state === state);
-    if (min) list = list.filter((d) => d.price >= Number(min));
-    if (max) list = list.filter((d) => d.price <= Number(max));
+    if (minNum !== null) list = list.filter((d) => d.price >= minNum);
+    if (maxNum !== null) list = list.filter((d) => d.price <= maxNum);
     if (sort === "price-low") return [...list].sort((a, b) => a.price - b.price);
     if (sort === "price-high") return [...list].sort((a, b) => b.price - a.price);
     return sortListings(list);
-  }, [all, q, category, condition, university, state, min, max, sort, myState]);
+  }, [all, q, category, condition, university, state, minNum, maxNum, sort, myState]);
 
   return (
     <div className="space-y-5">
       <h1 className="text-2xl font-bold">Search</h1>
       <input
         value={q}
-        onChange={(e) => setQ(e.target.value)}
+        onChange={(e) => setQ(e.target.value.slice(0, 200))}
         placeholder="Search items"
+        maxLength={200}
         className="w-full rounded-full border border-neutral-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-brown dark:border-neutral-700 dark:bg-black"
       />
       <div className="flex flex-wrap gap-2">
@@ -119,6 +133,11 @@ export default function Search() {
             ? "Loading listings…"
             : `${results.length} result${results.length === 1 ? "" : "s"}`}
         </p>
+        {priceRangeBad ? (
+          <p className="text-sm font-semibold text-red-700">
+            Min price is above max price — no item can match both.
+          </p>
+        ) : null}
       </div>
       {!loading && results.length === 0 ? (
         <EmptyState

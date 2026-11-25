@@ -370,6 +370,15 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob, dur
   }
 
   const blob = await toBlob(fileOrBlob);
+  // A giant file stalls the upload and the storage bill — refuse it
+  // plainly instead of uploading for minutes and failing.
+  if (blob && blob.size > (mediaType === "photo" ? 10 : 100) * 1024 * 1024) {
+    throw new Error(
+      mediaType === "photo"
+        ? "That photo is too big — keep evidence photos under 10MB."
+        : "That video is too big — keep evidence videos under 100MB."
+    );
+  }
   const ext = extensionFor(fileOrBlob, mediaType);
   const path = `${user.id}/evidence-${orderId}-${kind}-${Date.now()}.${ext}`;
   const { error: uploadError } = await supabase.storage
