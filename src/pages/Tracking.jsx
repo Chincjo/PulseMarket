@@ -30,6 +30,7 @@ import {
   resolveReturn,
   retryShippingAdvance,
   submitShippingProof,
+  updateRiderDetails,
 } from "../lib/shipping";
 
 // The 15–30s packing video is Milestone 9's Evidence Locker work. It
@@ -111,6 +112,10 @@ export default function Tracking() {
   const [cpNote, setCpNote] = useState("");
   const [cpPhoto, setCpPhoto] = useState(null);
 
+  // Rider details form (seller, Chowdeck Relay only — Milestone 19)
+  const [riderName, setRiderName] = useState("");
+  const [riderPhone, setRiderPhone] = useState("");
+
   // PIN + return forms (buyer)
   const [pinInput, setPinInput] = useState("");
   const [returnReason, setReturnReason] = useState(RETURN_REASONS[0]);
@@ -148,6 +153,17 @@ export default function Tracking() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Pre-fill the rider form with whatever is already saved, so the
+  // seller corrects the details instead of retyping them. Only runs
+  // when a different order loads, never while the seller is typing.
+  useEffect(() => {
+    if (order) {
+      setRiderName(order.rider_name || "");
+      setRiderPhone(order.rider_phone || "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [order?.id]);
 
   async function run(action, fn, onDone) {
     setError("");
@@ -277,6 +293,11 @@ export default function Tracking() {
 
   const showProofForm = isSeller && order.status === "held" && order.delivery_method === "shipping";
   const showCheckpointForm = isSeller && ["shipped", "delivered"].includes(order.status);
+  // Milestone 19, Decision 6: the seller enters the rider's name
+  // and phone for a same-city Chowdeck Relay order, only while the
+  // money is held or the order has shipped. Any other courier or
+  // status keeps rider details team-only (see the database rule).
+  const showRiderForm = isSeller && isSameCity && ["held", "shipped"].includes(order.status);
 
   return (
     <div className="space-y-5">
@@ -343,10 +364,56 @@ export default function Tracking() {
               </>
             ) : (
               <p className="mt-1 text-sm text-neutral-500">
-                No rider assigned yet — rider details cannot be added in the app yet. Ask the seller in chat for the rider's name and phone number.
+                {isSeller
+                  ? showRiderForm
+                    ? "No rider details saved yet — add them below."
+                    : "Rider details can be added once the money is held."
+                  : "No rider assigned yet — the seller has not added the rider's name and phone number. Ask the seller in chat if you need them."}
               </p>
             )}
           </div>
+          {/* Milestone 19, Decision 6 — seller enters the rider */}
+          {showRiderForm && (
+            <div className="space-y-2 rounded-xl border border-neutral-200 p-3 dark:border-neutral-800">
+              <h3 className="text-sm font-bold">Rider details</h3>
+              <p className="text-xs text-neutral-500">
+                Add the Chowdeck rider's name and phone number so the buyer can
+                call them directly. You can correct them here any time while
+                the order is held or shipped.
+              </p>
+              <label className="block text-sm font-semibold">
+                Rider name
+                <input
+                  className={`${inputCls} mt-1`}
+                  placeholder="e.g. Chinedu Okoro"
+                  maxLength={120}
+                  value={riderName}
+                  onChange={(e) => setRiderName(e.target.value)}
+                />
+              </label>
+              <label className="block text-sm font-semibold">
+                Rider phone
+                <input
+                  className={`${inputCls} mt-1`}
+                  inputMode="tel"
+                  placeholder="Rider's phone number"
+                  value={riderPhone}
+                  onChange={(e) => setRiderPhone(e.target.value)}
+                />
+              </label>
+              <PrimaryButton
+                className="w-full py-3"
+                disabled={busy !== "" || !riderName.trim() || !riderPhone.trim()}
+                onClick={() =>
+                  run("rider", () =>
+                    updateRiderDetails(order.id, { riderName: riderName.trim(), riderPhone: riderPhone.trim() })
+                  )
+                }
+              >
+                {busy === "rider" ? "Saving…" : order.rider_name ? "Update rider details" : "Save rider details"}
+              </PrimaryButton>
+            </div>
+          )}
           <p className="text-xs text-neutral-500">
             Live rider map arrives when a rider app is connected. For now you follow the
             steps above, the rider card and the delivery PIN below.

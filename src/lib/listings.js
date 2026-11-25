@@ -32,7 +32,7 @@ export const MAX_VERIFICATION_PHOTO_MB = 10;
 // createListingRow() are callable from anywhere — without the cap
 // here a price of ₦999,999,999 sailed through (the database only
 // checks price > 0).
-export const MAX_LISTING_PRICE = 10000000;
+export const MAX_LISTING_PRICE = 50000000;
 
 // Canonical courier names — keep in sync with COURIERS in
 // src/lib/shipping.js and the courier list in src/pages/Sell.jsx.
@@ -205,6 +205,10 @@ export async function fetchVerificationRow(userId) {
     // file — e.g. a student who verified before Milestone 17.
     idFrontUrl: data.id_front_url || null,
     idBackUrl: data.id_back_url || null,
+    // Milestone 19: why the team rejected this student (fixed list)
+    // and their optional short note — null unless rejected.
+    rejectionReason: data.rejection_reason || null,
+    rejectionNote: data.rejection_note || null,
   };
 }
 
@@ -375,6 +379,51 @@ export async function removeVerificationIdPhotos(paths) {
   await supabase.storage.from(VERIFICATION_IDS_BUCKET).remove(clean);
 }
 
+// Milestone 19 — the fixed list of rejection reasons. A rejection
+// must carry one of these (the review_verification RPC refuses a
+// reject without one); the free-text note is separate and optional.
+export const VERIFICATION_REJECTION_REASONS = [
+  "blurry",
+  "wrong document",
+  "name mismatch",
+  "expired",
+  "other",
+];
+
+// Milestone 19 (Decision 2) — a student whose verification is still
+// 'pending review' replaces their own ID photos while waiting.
+// Uploads FIRST, then calls the replace_verification_photos RPC;
+// if the RPC fails, the new photos are removed again so no row
+// change happens and nothing is left orphaned in the bucket —
+// exactly the upload-then-RPC pattern resubmitVerification uses.
+// Status stays 'pending review'; the row's updated_at moves, so
+// the student goes to the back of the review queue (the team
+// reviews the newest photos). Throws a plain Error on failure.
+export async function replaceVerificationPhotos(userId, frontFile, backFile) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!userId) throw new Error("Sign in first to replace your ID photos.");
+  let photoPaths;
+  try {
+    photoPaths = await uploadVerificationIdPhotos(userId, frontFile, backFile);
+  } catch {
+    throw new Error("Your ID photos could not be uploaded. Please check your connection and try again.");
+  }
+  try {
+    const { error } = await supabase.rpc("replace_verification_photos", {
+      p_front_url: photoPaths.frontPath,
+      p_back_url: photoPaths.backPath,
+    });
+    if (error) throw error;
+  } catch (err) {
+    await removeVerificationIdPhotos([photoPaths.frontPath, photoPaths.backPath]);
+    throw new Error(
+      err?.message ||
+        "Could not replace your ID photos. Please check your connection and try again."
+    );
+  }
+  return photoPaths;
+}
+
 // Rejected student submits new ID photos: the SECURITY DEFINER RPC
 // (milestone-17.sql) puts their row back to 'pending review' with
 // the new photo paths. It — not the app — decides who may re-submit,
@@ -392,35 +441,75 @@ export async function resubmitVerification(frontPath, backPath) {
   return true;
 }
 
-// All verifications waiting for the team, oldest first so the
-// longest-waiting student is reviewed first. Owner only.
+// All verifications waiting for the team, longest-waiting first.
+// Milestone 19: ordered by updated_at, not created_at — a student
+// who replaces their photos while waiting (or resubmits after a
+// rejection) gets a fresh updated_at, so they go to the back of the
+// queue and the team reviews the newest photos. Falls back to the
+// old created_at order when the Milestone 19 SQL has not run yet
+// (no updated_at column), so the queue keeps working during the
+// deploy window instead of erroring.
 export async function fetchPendingVerifications() {
   if (!supabase) return [];
   await requireOwner();
+  const selectCols =
+    "user_id, university, student_id, student_email, status, id_front_url, id_back_url, created_at, updated_at, rejection_reason, rejection_note";
   const { data, error } = await supabase
     .from("verifications")
-    .select(
-      "user_id, university, student_id, student_email, status, id_front_url, id_back_url, created_at"
-    )
+    .select(selectCols)
     .eq("status", "pending review")
+    .order("updated_at", { ascending: true })
     .order("created_at", { ascending: true });
-  if (error) throw error;
-  return data || [];
+  if (!error) return data || [];
+  if (/updated_at/i.test(error.message || "")) {
+    const retry = await supabase
+      .from("verifications")
+      .select(
+        "user_id, university, student_id, student_email, status, id_front_url, id_back_url, created_at"
+      )
+      .eq("status", "pending review")
+      .order("created_at", { ascending: true });
+    if (retry.error) throw retry.error;
+    return retry.data || [];
+  }
+  throw error;
 }
 
 // Team decision on one student. The SECURITY DEFINER RPC
-// (milestone-17.sql) is the only thing that may change a status —
-// the app never updates verifications.status directly.
-export async function reviewVerification(userId, status) {
+// (milestone-17.sql, extended in milestone-19) is the only thing
+// that may change a status — the app never updates
+// verifications.status directly.
+// Milestone 19: rejecting NEEDS a reason from
+// VERIFICATION_REJECTION_REASONS, plus an optional short note
+// (280 characters max) for the student. Approving clears any
+// earlier reason and note. The reason/note arguments are optional
+// here only so an approval call stays a two-argument call; a
+// reject without a reason is refused — by this helper and by the
+// RPC — with a plain error.
+export async function reviewVerification(userId, status, reason = null, note = null) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!userId) throw new Error("Missing student.");
   if (status !== "approved" && status !== "rejected") {
     throw new Error("Choose approve or reject.");
   }
+  const cleanReason = reason == null ? null : String(reason).trim();
+  const cleanNote = note == null ? null : String(note).trim();
+  if (status === "rejected") {
+    if (!VERIFICATION_REJECTION_REASONS.includes(cleanReason)) {
+      throw new Error("Choose a reason for the rejection.");
+    }
+    if (cleanNote !== null && cleanNote.length > 280) {
+      throw new Error("Keep the note to the student under 280 characters.");
+    }
+  }
   await requireOwner();
   const { error } = await supabase.rpc("review_verification", {
     p_user_id: userId,
     p_status: status,
+    // An approval never carries a reason or a note — the RPC clears
+    // any earlier ones, so send null either way.
+    p_reason: status === "rejected" ? cleanReason : null,
+    p_note: status === "rejected" ? cleanNote || null : null,
   });
   if (error) throw error;
   return true;
@@ -490,19 +579,24 @@ export async function fetchListing(id) {
   return data;
 }
 
-export async function fetchMyListings(userId) {
+export async function fetchMyListings(userId, { before } = {}) {
   if (!supabase || !userId) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from("listings")
     .select("*")
     .eq("seller_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(200); // A seller's own list is bounded like every other list fetch.
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(200); // A seller's own list is bounded like every other list fetch.
   if (error) {
     dbError(error, "fetch my listings");
     return [];
   }
-  return data || [];
+  const rows = data || [];
+  // Cursor for the Dashboard "Load more": true when a full page came
+  // back, so another page may exist.
+  rows.hasMore = rows.length === 200;
+  return rows;
 }
 
 export async function createListingRow(row) {

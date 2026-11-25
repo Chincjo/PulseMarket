@@ -564,7 +564,35 @@ export async function confirmDelivery(orderId, userId) {
   return updateOrder(orderId, { status: "delivered", delivered_at: now });
 }
 
+// True when a Supabase RPC call failed only because the function does
+// not exist yet (the Milestone 19 SQL has not been run). PostgREST
+// reports it as PGRST202; Postgres itself as 42883. Any other error
+// — including a gate the RPC refused — is NOT a missing function and
+// must never fall back to the legacy path below.
+function isMissingRpc(err) {
+  if (!err) return false;
+  if (err.code === "PGRST202" || err.code === "42883") return true;
+  const message = String(err.message || "");
+  return (
+    /could not find the function/i.test(message) ||
+    /function .* does not exist/i.test(message)
+  );
+}
+
 // Buyer confirming, or the owner: release the held money to the seller.
+// Milestone 19: the money move is now one server-side transaction —
+// release_order() (supabase/m19/04-notifications-release.sql) writes
+// both ledger legs AND the order status update together, so the
+// half-move window the old two-step path left open (money moved,
+// status update lost) is gone. Every gate below is re-checked
+// explicitly inside the RPC; the app-side checks here only give a
+// faster, plain-English error (and log a blocked handoff attempt)
+// before the call. finishRelease() runs after the RPC returns: it
+// flips the listing to sold (best effort) and tells both parties.
+// The old two-step path survives as legacyReleaseOrder() below and
+// runs ONLY when the Milestone 19 SQL has not been run yet (the RPC
+// does not exist) — once the SQL is live, the RPC path is the only
+// one used.
 // Milestone 17: only from 'delivered' — a held order cannot release,
 // so money never moves before the buyer confirms delivery.
 // Two ledger entries: the full total leaves "held", and the item price +
@@ -572,6 +600,102 @@ export async function confirmDelivery(orderId, userId) {
 // PulseMarket and never enter the seller's available balance.
 export async function releaseOrder(orderId, user) {
   const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.payment_method === "cash") {
+    throw new Error("Cash orders are settled face to face — there is no held money to release.");
+  }
+  const allowed =
+    (user && order.buyer_id === user.id) || isOwner(user);
+  if (!allowed) {
+    throw new Error("Only the buyer or the PulseMarket team can release this order.");
+  }
+  // Plain-English gates before the call. The RPC re-checks every one
+  // of these server-side — it is the real gate. A 'released' order
+  // passes through: the RPC returns it as-is, so a retry after a
+  // completed release finishes quietly instead of throwing.
+  if (order.status === "held") {
+    throw new Error(
+      "The money is still held — release opens once delivery is confirmed. Confirm delivery first, then release the money to the seller."
+    );
+  }
+  if (order.status !== "delivered" && order.status !== "released") {
+    throw new Error(`This order is ${order.status} — there is no held money to release.`);
+  }
+  // Milestone 12 gate: a frozen order (open dispute) cannot release
+  // until the PulseMarket team resolves it.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  // A return that is open stops any release: the money must stay
+  // put until the team resolves the return.
+  if (order.return_status === "opened") {
+    throw new Error("A return is open for this order — the PulseMarket team resolves it first.");
+  }
+  // Milestone 7 gate: a meet-in-person order releases only after the
+  // handoff is complete — code scanned, both photos, both confirmations.
+  if (order.delivery_method === "meetup" && !handoffComplete(order)) {
+    await logSecurityEvent(orderId, user?.id, "release_blocked", `Release blocked — handoff not complete for order ${order.code}.`);
+    throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
+  }
+  // Primary path: the server-side release RPC (Milestone 19) moves
+  // the money and the status in one transaction.
+  try {
+    if (!supabase) throw new Error("Supabase is not configured.");
+    const { data, error } = await supabase.rpc("release_order", {
+      p_order_id: orderId,
+    });
+    if (error) throw error;
+    const released = Array.isArray(data) ? data[0] : data;
+    return finishRelease(released && released.id ? released : order);
+  } catch (err) {
+    if (isMissingRpc(err)) {
+      console.warn(
+        "[PulseMarket] release_order RPC is not live yet — using the app-side release. Run supabase/m19/04-notifications-release.sql to switch on the server-side release."
+      );
+      return legacyReleaseOrder(order, user);
+    }
+    throw err;
+  }
+
+  // Runs after the RPC moved the money and the status in one
+  // transaction. Flips the listing to sold (best effort) and tells
+  // both parties — the same tail the old two-step path had. When the
+  // order was already 'released' before this call (a retry), no
+  // notifications are sent again.
+  async function finishRelease(releasedOrder) {
+    const wasDelivered = order.status === "delivered";
+    try {
+      await updateListing(order.listing_id, { status: "sold" });
+    } catch (err) {
+      console.error("[PulseMarket] release: could not mark listing sold:", err?.message || err);
+    }
+    if (wasDelivered) {
+      notifyUser(order.buyer_id, {
+        kind: "release",
+        title: "Money released",
+        body: `The held money for order ${order.code} was released to the seller.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+      notifyUser(order.seller_id, {
+        kind: "release",
+        title: "Money released",
+        body: `The held money for order ${order.code} is now in your available balance.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+    }
+    return releasedOrder;
+  }
+}
+
+// Legacy two-step release — runs ONLY when the Milestone 19 SQL has
+// not been run yet (no release_order RPC). Ledger first, status
+// second, exactly as releaseOrder did before Milestone 19, with the
+// same half-move recovery in its finishRelease(). Once the SQL is
+// live this is never called. Kept (not deleted) so a release still
+// works in the window between the code push and the SQL run.
+async function legacyReleaseOrder(order, user) {
   if (!order) throw new Error("Order not found.");
   if (order.payment_method === "cash") {
     throw new Error("Cash orders are settled face to face — there is no held money to release.");
@@ -617,7 +741,7 @@ export async function releaseOrder(orderId, user) {
   // Milestone 7 gate: a meet-in-person order releases only after the
   // handoff is complete — code scanned, both photos, both confirmations.
   if (order.delivery_method === "meetup" && !handoffComplete(order)) {
-    await logSecurityEvent(orderId, user?.id, "release_blocked", `Release blocked — handoff not complete for order ${order.code}.`);
+    await logSecurityEvent(order.id, user?.id, "release_blocked", `Release blocked — handoff not complete for order ${order.code}.`);
     throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
   }
   // Milestone 8 advance: part of the shipping fee may already sit in
@@ -683,7 +807,7 @@ export async function releaseOrder(orderId, user) {
     if (order.status !== "delivered") {
       throw new Error("This order was already released — the money moved once.");
     }
-    const updated = await updateOrder(orderId, {
+    const updated = await updateOrder(order.id, {
       status: "released",
       released_at: new Date().toISOString(),
     });
@@ -727,7 +851,7 @@ export async function releaseOrder(orderId, user) {
     }
     throw err;
   }
-  const updated = await updateOrder(orderId, {
+  const updated = await updateOrder(order.id, {
     status: "released",
     released_at: new Date().toISOString(),
   });

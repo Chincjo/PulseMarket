@@ -690,6 +690,63 @@ export async function fetchTracking(orderId) {
 }
 
 // ---------------------------------------------------------------------------
+// Rider details — seller-entered, Chowdeck Relay only (Milestone 19,
+// Decision 6). The seller types the rider's name and phone for a
+// same-city Chowdeck Relay order while it is held or shipped, so the
+// buyer can call the rider instead of asking in chat. The database
+// (supabase/m19/03-admin-rider-caps.sql) allows exactly this case —
+// seller, own order, courier Chowdeck Relay, status held/shipped —
+// and keeps rider details team-only for every other courier/state.
+// This writes through the normal order-update path; it moves no
+// money and changes no status.
+// ---------------------------------------------------------------------------
+
+export async function updateRiderDetails(orderId, { riderName, riderPhone }) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const user = await currentUser();
+  if (!user) throw new Error("Sign in first.");
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.seller_id !== user.id) {
+    throw new Error("Only the seller can add rider details for this order.");
+  }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  if (order.courier !== "Chowdeck Relay") {
+    throw new Error("Rider details are only for same-city Chowdeck Relay orders.");
+  }
+  if (!["held", "shipped"].includes(order.status)) {
+    throw new Error(
+      `This order is ${order.status} — rider details can only be added while the money is held or the order has shipped.`
+    );
+  }
+  const name = String(riderName || "").trim();
+  const phone = String(riderPhone || "").trim();
+  if (!name) {
+    throw new Error("Enter the rider's name.");
+  }
+  if (name.length > 120) {
+    throw new Error("Keep the rider's name under 120 characters.");
+  }
+  if (!phone) {
+    throw new Error("Enter the rider's phone number.");
+  }
+  if (!/^\+?[0-9][0-9 ()-]{6,14}$/.test(phone)) {
+    throw new Error("That rider phone number does not look right.");
+  }
+  const updated = await updateOrder(orderId, { rider_name: name, rider_phone: phone });
+  notifyUser(order.buyer_id, {
+    kind: "order",
+    title: "Rider assigned",
+    body: `The rider for order ${order.code} is ${name} — ${phone}.`,
+    link: `/tracking/${order.id}`,
+    orderId: order.id,
+  });
+  return { order: withoutDeliveryPin(updated) };
+}
+
+// ---------------------------------------------------------------------------
 // Delivery PIN — buyer only. A wrong PIN throws and marks nothing.
 // ---------------------------------------------------------------------------
 

@@ -396,15 +396,23 @@ export default function OrderDetail() {
             {busy === "released" ? "Saving…" : "Release to seller"}
           </PrimaryButton>
         )}
-        {isBuyer && ["reserved", "paid"].includes(order.status) && (
+        {/* Cancel — Milestone 18 §8: the database already allows
+            seller-cancel from 'reserved' and team-cancel from
+            'reserved'/'paid', so the button is the missing piece.
+            Pass the whole user object: cancelOrder() needs the
+            email to recognise the team. The seller can only cancel
+            while nothing has been paid — once the buyer has marked
+            the order paid, only the team can cancel it. */}
+        {((isBuyer || isOwner) && ["reserved", "paid"].includes(order.status)) ||
+        (isSeller && order.status === "reserved") ? (
           <GhostButton
             className="w-full py-3"
             disabled={busy !== ""}
-            onClick={() => run("cancelled", () => cancelOrder(order.id, user.id))}
+            onClick={() => run("cancelled", () => cancelOrder(order.id, user))}
           >
             {busy === "cancelled" ? "Cancelling…" : "Cancel order"}
           </GhostButton>
-        )}
+        ) : null}
         {!isBuyer && !isSeller && !isOwner && (
           <p className="text-sm text-neutral-500">You are not part of this order.</p>
         )}

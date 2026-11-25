@@ -85,6 +85,8 @@ export default function Notifications() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [items, setItems] = useState([]);
+  const [itemsHasMore, setItemsHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [orders, setOrders] = useState([]);
   const [listings, setListings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -106,6 +108,7 @@ export default function Notifications() {
         fetchMyListings(user.id),
       ]);
       setItems(notes || []);
+      setItemsHasMore(notes?.hasMore === true);
       setOrders(myOrders || []);
       setListings(myListings || []);
     } catch (err) {
@@ -137,6 +140,23 @@ export default function Notifications() {
     setBusy(false);
     if (ok) setItems((prev) => prev.map((n) => ({ ...n, is_read: true })));
     else setError("Could not mark all as read. Try again.");
+  }
+
+  // Next page of stored notifications, from the last row's created_at.
+  async function loadMoreItems() {
+    if (!user || loadingMore || !itemsHasMore || items.length === 0) return;
+    setLoadingMore(true);
+    try {
+      const rows = await fetchNotifications(user.id, {
+        before: items[items.length - 1].created_at,
+      });
+      setItems((prev) => [...prev, ...(rows || [])]);
+      setItemsHasMore(rows.hasMore === true);
+    } catch {
+      setError("Could not load older notifications. Try again.");
+    } finally {
+      setLoadingMore(false);
+    }
   }
 
   if (loading) {
@@ -325,8 +345,13 @@ export default function Notifications() {
           }
         />
       ) : (
-        <ul className="space-y-2">
-          {items.map((item) => (
+        <>
+          <p className="text-sm text-neutral-500">
+            Showing the first {items.length} {items.length === 1 ? "notification" : "notifications"}
+            {itemsHasMore ? " — older notifications are below." : "."}
+          </p>
+          <ul className="space-y-2">
+            {items.map((item) => (
             <li key={item.id}>
               <button
                 type="button"
@@ -367,7 +392,13 @@ export default function Notifications() {
               </button>
             </li>
           ))}
-        </ul>
+          </ul>
+          {itemsHasMore && (
+            <GhostButton className="w-full py-3" disabled={loadingMore} onClick={loadMoreItems}>
+              {loadingMore ? "Loading…" : "Load more"}
+            </GhostButton>
+          )}
+        </>
       )}
 
       <p className="text-xs text-neutral-400">

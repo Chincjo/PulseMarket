@@ -20,6 +20,8 @@ export default function Dashboard() {
   const { user } = useAuth();
   const [listings, setListings] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [hasMoreListings, setHasMoreListings] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState(null);
@@ -31,11 +33,34 @@ export default function Dashboard() {
     if (!user) return;
     try {
       const rows = await fetchMyListings(user.id);
-      if (mounted.current) setListings(rows);
+      if (mounted.current) {
+        setListings(rows);
+        setHasMoreListings(rows.hasMore === true);
+      }
     } catch (err) {
       if (mounted.current) setError(err?.message || "Could not load your listings. Try again.");
     } finally {
       if (mounted.current) setLoading(false);
+    }
+  }
+
+  // "Load more" for sellers with more than 200 listings: the list
+  // fetch pages by created_at, newest first.
+  async function loadMoreListings() {
+    if (!user || loadingMore || !hasMoreListings || listings.length === 0) return;
+    setLoadingMore(true);
+    setError("");
+    try {
+      const last = listings[listings.length - 1];
+      const rows = await fetchMyListings(user.id, { before: last.created_at });
+      if (mounted.current) {
+        setListings((prev) => [...prev, ...rows]);
+        setHasMoreListings(rows.hasMore === true);
+      }
+    } catch (err) {
+      if (mounted.current) setError(err?.message || "Could not load more listings. Try again.");
+    } finally {
+      if (mounted.current) setLoadingMore(false);
     }
   }
 
@@ -212,6 +237,14 @@ export default function Dashboard() {
               ) : null}
             </div>
           ))}
+          {hasMoreListings ? (
+            <div className="pt-1 text-center">
+              <p className="text-xs text-neutral-500">Showing the first {listings.length} listings.</p>
+              <GhostButton onClick={loadMoreListings} disabled={loadingMore}>
+                {loadingMore ? "Loading…" : "Load more"}
+              </GhostButton>
+            </div>
+          ) : null}
         </div>
       )}
     </div>

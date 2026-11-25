@@ -18,6 +18,7 @@ import { getVerification, saveVerification } from "../lib/store";
 import {
   fetchVerificationRow,
   removeVerificationIdPhotos,
+  replaceVerificationPhotos,
   resubmitVerification,
   saveVerificationRow,
   uploadVerificationIdPhotos,
@@ -45,6 +46,27 @@ function friendlyError(err) {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_FILE_MB = 10;
+
+// Milestone 19 (Decision 3): what the team said, in plain words,
+// for each fixed rejection reason — shown to the rejected student
+// so they know exactly what to fix before submitting again. A
+// student rejected before reasons existed has no reason stored and
+// gets the plain fallback below.
+const REJECTION_MESSAGES = {
+  blurry: "The team said: blurry photo — please upload a clearer photo of your ID.",
+  "wrong document":
+    "The team said: wrong document — please upload a photo of your student ID, not another document.",
+  "name mismatch":
+    "The team said: name mismatch — the name on your ID does not match your account details. Please check your details and upload the correct student ID.",
+  expired:
+    "The team said: expired ID — your student ID has expired. Please upload a current, valid student ID.",
+  other:
+    "The team said: please check your details and upload clear photos of both sides of your student ID.",
+};
+
+function rejectionMessage(reason) {
+  return REJECTION_MESSAGES[reason] || "Your verification was not approved. Check your details and take clear photos of both sides of your student ID, then submit again.";
+}
 
 export default function Verify({ onVerified }) {
   const { user, configured, signUpEmail, signInGoogle, signOut } = useAuth();
@@ -77,6 +99,18 @@ export default function Verify({ onVerified }) {
   const [submitting, setSubmitting] = useState(false);
   const [checking, setChecking] = useState(false);
 
+  // Milestone 19 (Decision 2): replacing ID photos while still
+  // under review. Separate files from the submit form above — the
+  // pending screen below is a different view, and a half-picked
+  // replacement must never leak into a re-submit.
+  const [replaceFront, setReplaceFront] = useState(null);
+  const [replaceBack, setReplaceBack] = useState(null);
+  const [replaceFrontFile, setReplaceFrontFile] = useState(null);
+  const [replaceBackFile, setReplaceBackFile] = useState(null);
+  const [replaceError, setReplaceError] = useState("");
+  const [replaceDone, setReplaceDone] = useState("");
+  const [replacing, setReplacing] = useState(false);
+
   // Milestone 17: the device copy can be stale — the team may have
   // approved or rejected this student since it was saved. When the
   // student is signed in, the server row wins, so a rejected student
@@ -99,6 +133,11 @@ export default function Verify({ onVerified }) {
         submittedAt: row.submittedAt,
         idFrontUrl: row.idFrontUrl || null,
         idBackUrl: row.idBackUrl || null,
+        // Milestone 19: why the team rejected this student, if they
+        // did, and their note — carried on the device copy so the
+        // form below can show it without another server round trip.
+        rejectionReason: row.rejectionReason || null,
+        rejectionNote: row.rejectionNote || null,
         // The server row carries no referrer — keep the device copy's.
         referredBy: saved?.referredBy ?? null,
       };
@@ -249,6 +288,8 @@ export default function Verify({ onVerified }) {
           submittedAt: serverRow.submittedAt,
           idFrontUrl: serverRow.idFrontUrl || null,
           idBackUrl: serverRow.idBackUrl || null,
+          rejectionReason: null,
+          rejectionNote: null,
         };
         saveVerification(rec);
         setSaved(rec);
@@ -271,6 +312,8 @@ export default function Verify({ onVerified }) {
           submittedAt: serverRow.submittedAt,
           idFrontUrl: serverRow.idFrontUrl || null,
           idBackUrl: serverRow.idBackUrl || null,
+          rejectionReason: null,
+          rejectionNote: null,
         };
         saveVerification(rec);
         setSaved(rec);
@@ -335,6 +378,9 @@ export default function Verify({ onVerified }) {
         submittedAt: new Date().toISOString(),
         idFrontUrl: photoPaths.frontPath,
         idBackUrl: photoPaths.backPath,
+        // Back under review — any earlier rejection reason is spent.
+        rejectionReason: null,
+        rejectionNote: null,
       };
       if (isResubmit) {
         // Back to 'pending review' through the RPC — the app never
@@ -405,6 +451,8 @@ export default function Verify({ onVerified }) {
         submittedAt: row.submittedAt,
         idFrontUrl: row.idFrontUrl || null,
         idBackUrl: row.idBackUrl || null,
+        rejectionReason: row.rejectionReason || null,
+        rejectionNote: row.rejectionNote || null,
       };
       saveVerification(rec);
       setSaved(rec);
@@ -412,6 +460,78 @@ export default function Verify({ onVerified }) {
       if (row.status === "approved") navigate("/");
     } finally {
       setChecking(false);
+    }
+  }
+
+  // Milestone 19 (Decision 2): pick one replacement photo while
+  // under review. Same checks as the submit form: a photo, under
+  // the size limit. A bad pick clears that side only.
+  function pickReplacePhoto(e, setPreview, setFile) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.type && !f.type.startsWith("image/")) {
+      setReplaceError("That file is not a photo — take a photo of your student ID.");
+      e.target.value = "";
+      setFile(null);
+      return;
+    }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) {
+      setReplaceError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
+      e.target.value = "";
+      setFile(null);
+      return;
+    }
+    setReplaceError("");
+    setReplaceDone("");
+    setFile(f);
+    const r = new FileReader();
+    r.onload = () => setPreview(r.result);
+    r.readAsDataURL(f);
+  }
+
+  // Milestone 19 (Decision 2): replace both ID photos while still
+  // under review. The helper uploads first and only then calls the
+  // server — if anything fails, the row is untouched and the old
+  // photos stay the ones under review. Status stays 'pending
+  // review'; the team reviews the new photos.
+  async function replacePhotos() {
+    if (replacing) return;
+    setReplaceError("");
+    setReplaceDone("");
+    if (!replaceFrontFile || !replaceBackFile) {
+      setReplaceError("Add a photo of the front and back of your student ID.");
+      return;
+    }
+    if (!user?.id) {
+      setReplaceError("Sign in first, then replace your photos.");
+      return;
+    }
+    setReplacing(true);
+    try {
+      const photoPaths = await replaceVerificationPhotos(
+        user.id,
+        replaceFrontFile,
+        replaceBackFile
+      );
+      const rec = {
+        ...saved,
+        status: "pending review",
+        idFrontUrl: photoPaths.frontPath,
+        idBackUrl: photoPaths.backPath,
+      };
+      saveVerification(rec);
+      setSaved(rec);
+      setReplaceFront(null);
+      setReplaceBack(null);
+      setReplaceFrontFile(null);
+      setReplaceBackFile(null);
+      setReplaceDone("Photos replaced — the team will review your new photos. You are still in the queue.");
+    } catch (err) {
+      setReplaceError(
+        err?.message || "Could not replace your ID photos. Please check your connection and try again."
+      );
+    } finally {
+      setReplacing(false);
     }
   }
 
@@ -456,6 +576,10 @@ export default function Verify({ onVerified }) {
     // plain waiting state, no way into the app from here, and no
     // second submit — the team already has this one. "Check again"
     // asks the server in case they have approved it since.
+    // Milestone 19 (Decision 2): a student still waiting CAN
+    // replace their ID photos — e.g. they realised the first ones
+    // were blurry. The new photos go up first and the server swaps
+    // them in; status stays 'pending review'.
     // A rejected student does NOT land here: they fall through to
     // the form below and submit again with new photos.
     if (saved.status !== "rejected") {
@@ -474,6 +598,42 @@ export default function Verify({ onVerified }) {
           <PrimaryButton className="w-full" disabled={checking} onClick={checkStatus}>
             {checking ? "Checking…" : "Check again — I may be approved now"}
           </PrimaryButton>
+          <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+            <p className="font-semibold">Photos not clear?</p>
+            <p className="mt-1 text-neutral-500">
+              You can replace your ID photos while you wait — the team
+              will review the new ones.
+            </p>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+                ID front
+                <input type="file" accept="image/*" onChange={(e) => pickReplacePhoto(e, setReplaceFront, setReplaceFrontFile)} className="mt-2 block w-full text-xs" />
+                {replaceFront ? <img src={replaceFront} alt="New ID front" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+              </label>
+              <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+                ID back
+                <input type="file" accept="image/*" onChange={(e) => pickReplacePhoto(e, setReplaceBack, setReplaceBackFile)} className="mt-2 block w-full text-xs" />
+                {replaceBack ? <img src={replaceBack} alt="New ID back" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+              </label>
+            </div>
+            {replaceError ? (
+              <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+                {replaceError}
+              </p>
+            ) : null}
+            {replaceDone ? (
+              <p className="mt-3 rounded-xl bg-neutral-100 p-3 text-sm text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+                {replaceDone}
+              </p>
+            ) : null}
+            <button
+              className="mt-3 w-full rounded-xl border border-neutral-300 px-4 py-2 text-sm font-semibold dark:border-neutral-700"
+              disabled={!replaceFrontFile || !replaceBackFile || replacing}
+              onClick={replacePhotos}
+            >
+              {replacing ? "Replacing…" : "Replace photos"}
+            </button>
+          </div>
           <button
             className="w-full text-center text-sm text-neutral-500 underline"
             onClick={() => signOut()}
@@ -496,9 +656,17 @@ export default function Verify({ onVerified }) {
         </h1>
         {isResubmitForm ? (
           <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
-            Your verification was not approved. Check your details and take
-            clear photos of both sides of your student ID, then submit again.
-            Your university, student ID and invite code stay the same.
+            {rejectionMessage(saved?.rejectionReason)}
+            {saved?.rejectionNote ? (
+              <>
+                <br />
+                Note from the team: &ldquo;{saved.rejectionNote}&rdquo;
+              </>
+            ) : null}
+            <br />
+            Check your details and take clear photos of both sides of
+            your student ID, then submit again. Your university,
+            student ID and invite code stay the same.
           </p>
         ) : (
           <p className="text-neutral-500">

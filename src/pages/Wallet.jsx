@@ -25,6 +25,8 @@ export default function Wallet() {
   const { user } = useAuth();
   const [balances, setBalances] = useState({ held: 0, available: 0 });
   const [ledger, setLedger] = useState([]);
+  const [ledgerHasMore, setLedgerHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showWithdraw, setShowWithdraw] = useState(false);
   const [copied, setCopied] = useState("");
@@ -41,6 +43,7 @@ export default function Wallet() {
         if (cancelled) return;
         setBalances(b);
         setLedger(rows);
+        setLedgerHasMore(rows.hasMore === true);
         setLoading(false);
       })
       .catch(() => {
@@ -52,6 +55,21 @@ export default function Wallet() {
   }, [user]);
 
   const total = balances.held + balances.available;
+
+  // Next page of the ledger, from the last row's created_at.
+  async function loadMoreLedger() {
+    if (!user || loadingMore || !ledgerHasMore || ledger.length === 0) return;
+    setLoadingMore(true);
+    try {
+      const rows = await fetchLedger(user.id, {
+        before: ledger[ledger.length - 1].createdAt,
+      });
+      setLedger((prev) => [...prev, ...(rows || [])]);
+      setLedgerHasMore(rows.hasMore === true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   function copyEmail() {
     if (navigator.clipboard?.writeText) {
@@ -128,8 +146,13 @@ export default function Wallet() {
           body="Held payments, releases and refunds will show here, computed from the ledger — never from a stored balance."
         />
       ) : (
-        <ul className="space-y-2">
-          {ledger.map((entry) => (
+        <>
+          <p className="text-sm text-neutral-500">
+            Showing the first {ledger.length} {ledger.length === 1 ? "entry" : "entries"}
+            {ledgerHasMore ? " — older entries are below." : "."}
+          </p>
+          <ul className="space-y-2">
+            {ledger.map((entry) => (
             <li
               key={entry.id}
               className="rounded-2xl border border-neutral-200 p-3 dark:border-neutral-800"
@@ -160,7 +183,13 @@ export default function Wallet() {
               {entry.note && <p className="mt-1 text-xs text-neutral-500">{entry.note}</p>}
             </li>
           ))}
-        </ul>
+          </ul>
+          {ledgerHasMore && (
+            <GhostButton className="w-full py-3" disabled={loadingMore} onClick={loadMoreLedger}>
+              {loadingMore ? "Loading…" : "Load more"}
+            </GhostButton>
+          )}
+        </>
       )}
     </div>
   );

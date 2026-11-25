@@ -19,7 +19,9 @@ import {
   fetchBlockedIds,
   fetchConversation,
   fetchMessages,
+  fetchParticipantsVerified,
   fetchPickupTickets,
+  getLastChatError,
   markRead,
   respondOffer,
   schedulePickup,
@@ -47,6 +49,12 @@ export default function ChatThread() {
   const [messages, setMessages] = useState([]);
   const [tickets, setTickets] = useState([]);
   const [blockedIds, setBlockedIds] = useState([]);
+  // Milestone 19: true when the OTHER party is the seller and the
+  // seller is no longer a verified student (rejected later, or
+  // flagged). The note below shows only for the buyer, never for
+  // the seller's own view of a buyer — and never while the seller
+  // is still approved.
+  const [sellerNoLongerVerified, setSellerNoLongerVerified] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [draft, setDraft] = useState("");
@@ -115,6 +123,22 @@ export default function ChatThread() {
         setMessages(msgs);
         setTickets(tks);
         setBlockedIds(blocked);
+        // Milestone 19: when the viewer is the BUYER, ask whether
+        // the seller is still verified. The check is skipped for
+        // the seller's own view (the note is buyer-only) and an
+        // unknown answer (RPC not run yet, or no row back) leaves
+        // the note off — the send/offer/pickup gates still refuse
+        // the write, and the database triggers are the backstop.
+        if (conv.buyer_id === user.id && conv.seller_id) {
+          const verified = await fetchParticipantsVerified([conv.seller_id]);
+          if (!cancelled) {
+            setSellerNoLongerVerified(
+              conv.seller_id in verified && verified[conv.seller_id] !== true
+            );
+          }
+        } else if (!cancelled) {
+          setSellerNoLongerVerified(false);
+        }
         const newestId = msgs.length ? msgs[msgs.length - 1].id : null;
         if (newestId !== lastMarkedId.current) {
           lastMarkedId.current = newestId;
@@ -151,7 +175,10 @@ export default function ChatThread() {
     const sent = await sendMessage(id, draft);
     setSending(false);
     if (!sent) {
-      setError("Could not send the message. Try again.");
+      // Milestone 19: the lib keeps the plain reason a send was
+      // refused (e.g. the other student is no longer verified) —
+      // show that instead of a generic failure.
+      setError(getLastChatError() || "Could not send the message. Try again.");
       return;
     }
     setDraft("");
@@ -175,7 +202,7 @@ export default function ChatThread() {
     const sent = await sendOffer(id, amount);
     setSending(false);
     if (!sent) {
-      setError("Could not send the offer. Try again.");
+      setError(getLastChatError() || "Could not send the offer. Try again.");
       return;
     }
     setOfferAmount("");
@@ -194,7 +221,7 @@ export default function ChatThread() {
     try {
       const ok = await respondOffer(messageId, decision);
       if (!ok) {
-        setError("Could not update the offer. Try again.");
+        setError(getLastChatError() || "Could not update the offer. Try again.");
         return;
       }
       const conv = await fetchConversation(id);
@@ -235,7 +262,7 @@ export default function ChatThread() {
     try {
       const ticket = await schedulePickup(id, { spot, date, time });
       if (!ticket) {
-        setError("Could not save the pickup. Try again.");
+        setError(getLastChatError() || "Could not save the pickup. Try again.");
         return;
       }
       setTickets((t) => [ticket, ...t]);
@@ -364,6 +391,22 @@ export default function ChatThread() {
         </div>
       ) : null}
 
+      {/* Milestone 19: buyer-only. Shown only when the other party
+          is the seller and that seller is no longer a verified
+          student (rejected later, or flagged). Never shown for a
+          buyer, and never while the seller is still approved. New
+          messages, offers and meetups are paused for this chat;
+          any order already placed still runs to completion. */}
+      {sellerNoLongerVerified ? (
+        <div className="rounded-2xl border border-neutral-300 bg-neutral-100 p-4 text-sm dark:border-neutral-700 dark:bg-neutral-900">
+          <p className="font-bold">This seller is no longer verified</p>
+          <p className="mt-1 text-neutral-500">
+            New messages, offers and meetups are paused for this chat. Any order you already
+            placed will still run to completion.
+          </p>
+        </div>
+      ) : null}
+
       {error ? <p className="text-sm font-semibold text-red-700">{error}</p> : null}
 
       {/* Messages */}
@@ -376,7 +419,10 @@ export default function ChatThread() {
           messages.map((m) => {
             const mine = m.sender_id === user.id;
             if (m.kind === "offer") {
-              const canRespond = !mine && m.offer_status === "pending";
+              // Milestone 19: a pending offer cannot be answered
+              // once either side is no longer verified — the
+              // buttons hide instead of failing on tap.
+              const canRespond = !mine && m.offer_status === "pending" && !sellerNoLongerVerified;
               return (
                 <div
                   key={m.id}
@@ -454,9 +500,9 @@ export default function ChatThread() {
           onChange={(e) => setDraft(e.target.value.slice(0, MAX_MESSAGE_LENGTH))}
           placeholder="Write a message…"
           maxLength={MAX_MESSAGE_LENGTH}
-          disabled={isBlocked}
+          disabled={isBlocked || sellerNoLongerVerified}
         />
-        <PrimaryButton type="submit" disabled={sending || !draft.trim() || isBlocked}>
+        <PrimaryButton type="submit" disabled={sending || !draft.trim() || isBlocked || sellerNoLongerVerified}>
           Send
         </PrimaryButton>
       </form>
@@ -479,7 +525,7 @@ export default function ChatThread() {
                 placeholder="e.g. 45000"
               />
             </label>
-            <PrimaryButton type="submit" disabled={sending || isBlocked}>
+            <PrimaryButton type="submit" disabled={sending || isBlocked || sellerNoLongerVerified}>
               Send offer
             </PrimaryButton>
             <GhostButton type="button" onClick={() => setShowOffer(false)}>
@@ -487,7 +533,7 @@ export default function ChatThread() {
             </GhostButton>
           </form>
         ) : (
-          <GhostButton onClick={() => setShowOffer(true)} disabled={isBlocked}>Make an offer</GhostButton>
+          <GhostButton onClick={() => setShowOffer(true)} disabled={isBlocked || sellerNoLongerVerified}>Make an offer</GhostButton>
         )}
       </div>
 
@@ -495,7 +541,7 @@ export default function ChatThread() {
       <div className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
         <div className="flex items-center justify-between gap-2">
           <h2 className="font-bold">Schedule pickup</h2>
-          <GhostButton onClick={() => setShowPickup((s) => !s)} disabled={isBlocked}>
+          <GhostButton onClick={() => setShowPickup((s) => !s)} disabled={isBlocked || sellerNoLongerVerified}>
             {showPickup ? "Close" : "Plan a meetup"}
           </GhostButton>
         </div>
@@ -525,7 +571,7 @@ export default function ChatThread() {
                 <input className={inputCls} type="time" value={time} onChange={(e) => setTime(e.target.value)} />
               </label>
             </div>
-            <PrimaryButton type="submit" disabled={savingPickup || isBlocked}>
+            <PrimaryButton type="submit" disabled={savingPickup || isBlocked || sellerNoLongerVerified}>
               {savingPickup ? "Saving…" : "Save pickup"}
             </PrimaryButton>
           </form>

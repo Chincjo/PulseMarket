@@ -11,6 +11,31 @@ function dbError(err, where) {
 
 export async function getBalances(userId) {
   if (!supabase || !userId) return { held: 0, available: 0 };
+  // Milestone 19: server-side sums via the get_wallet_balances RPC
+  // (supabase/milestone-18.sql §11) instead of fetching every ledger
+  // row and summing client-side. The RPC returns one row per bucket:
+  // [{ bucket: "held", balance: 123 }, ...]. If the RPC call fails
+  // (for example the milestone-18 SQL has not been run yet, so the
+  // function does not exist), fall back to the old client-side sum
+  // below so the wallet still shows a balance.
+  try {
+    const { data, error } = await supabase.rpc("get_wallet_balances", {
+      p_user_id: userId,
+    });
+    if (error) throw error;
+    const balances = { held: 0, available: 0 };
+    for (const row of data || []) {
+      if (row.bucket === "held" || row.bucket === "available") {
+        balances[row.bucket] = Number(row.balance) || 0;
+      }
+    }
+    return balances;
+  } catch (err) {
+    console.warn(
+      "[PulseMarket] get_wallet_balances RPC failed — using client-side sum:",
+      err?.message || err
+    );
+  }
   const { data, error } = await supabase
     .from("wallet_ledger")
     .select("bucket, amount")

@@ -73,27 +73,28 @@
 // participant of the order/conversation the event belongs to, or the
 // team account — so pass orderId (for order events) or
 // conversationId (for chat events) in the options, or the insert is
-// refused and notifyUser() returns null. If the milestone-10.sql
+// refused and notifyUser() returns null. Milestone 19 adds the
+// recipient's server-side prefs (notification_prefs) as a second
+// gate inside the same function: when the recipient turned that
+// kind off, the insert is silently dropped and notifyUser()
+// returns null. If the milestone-10.sql
 // migration has not been run yet, the RPC does not exist and
 // notifyUser() returns null — the action that triggered it is never
 // affected.
-// SETTINGS TOGGLES — notifyUser() reads the CURRENT DEVICE's settings
-// (src/lib/store.js getSettings().notifications). That is the acting
-// user's device, not necessarily the recipient's: a buyer messaging
-// from their phone cannot see the seller's toggles. So the toggle
-// check here is best-effort on the acting device; true per-recipient
-// preferences need the settings stored server-side (future work).
-// Mapping (only these kinds have a toggle; the rest always send):
-//   'checkpoint' -> settings.notifications.checkpoints
-//   'dispute'    -> settings.notifications.disputes
-//   'rating'     -> settings.notifications.ratings
-//   'order' / 'message' / 'release' / 'boost' / 'system' -> always.
-// There is no toggle for price drops used by any notification kind
-// here (priceDrops covers a future price-drop notification only).
-// If the notifications table is missing, notifyUser() still returns
-// normally (null) instead of throwing.
+// SETTINGS TOGGLES — Milestone 19: the RECIPIENT's server-side
+// prefs (notification_prefs, read through get_notification_prefs()
+// below and written from Settings) are the real gate, enforced
+// inside insert_notification() itself. The device toggles in
+// src/lib/store.js getSettings().notifications are only a display
+// fallback now: Settings keeps a device copy in sync so the
+// Notifications page hint still reads correctly, but notifyUser()
+// NO LONGER checks the acting device's settings — a buyer
+// messaging from their phone must never be able to silence the
+// seller's notifications, and the old check did exactly that (it
+// read the sender's device, not the recipient's). Kinds with no
+// server row default to on, so a student who never touched
+// Settings gets every notification, exactly as before.
 import { supabase } from "./supabase";
-import { getSettings } from "./store";
 
 export const NOTIFICATION_KINDS = [
   "order",
@@ -117,38 +118,64 @@ export const KIND_LABELS = {
   system: "PulseMarket",
 };
 
-// Which settings toggle gates each kind, if any. Kinds not listed here
-// always send.
-const KIND_TOGGLES = {
-  checkpoint: "checkpoints",
-  dispute: "disputes",
-  rating: "ratings",
-};
-
 function dbError(err, where) {
   console.error(`[PulseMarket] ${where}:`, err?.message || err);
   return null;
 }
 
-// True when the current device's settings allow this kind. Reads the
-// acting device's settings (see the header note) and defaults to
-// allowed when settings cannot be read.
-function kindAllowed(kind) {
-  const toggle = KIND_TOGGLES[kind];
-  if (!toggle) return true;
-  try {
-    const settings = getSettings();
-    const value = settings?.notifications?.[toggle];
-    return value !== false;
-  } catch {
-    return true;
+// Server-side notification prefs (Milestone 19, table
+// notification_prefs + RPCs in supabase/m19/04-notifications-release.sql).
+// The RPCs take no user id: they always read/write the CALLER's own
+// row, so a caller can never touch another student's prefs. A prefs
+// object is { <kind>: boolean } for the 8 kinds in NOTIFICATION_KINDS.
+// The server row stores <kind>_enabled columns; convert both ways
+// here so the rest of the app only ever sees kind -> boolean.
+// Both helpers return null (never throw) when the Milestone 19 SQL
+// has not been run yet, so Settings falls back to the device
+// toggles until then.
+function prefsRowToMap(row) {
+  if (!row) return null;
+  const map = {};
+  for (const kind of NOTIFICATION_KINDS) {
+    map[kind] = row[`${kind}_enabled`] !== false;
   }
+  return map;
+}
+
+export async function getNotificationPrefs() {
+  if (!supabase) return null;
+  const { data, error } = await supabase.rpc("get_notification_prefs");
+  if (error) {
+    dbError(error, "fetch notification prefs");
+    return null;
+  }
+  return prefsRowToMap(data);
+}
+
+export async function setNotificationPrefs(patch) {
+  if (!supabase || !patch) return null;
+  const args = {};
+  for (const kind of NOTIFICATION_KINDS) {
+    if (Object.prototype.hasOwnProperty.call(patch, kind)) {
+      args[`p_${kind}`] = patch[kind] !== false;
+    }
+  }
+  if (Object.keys(args).length === 0) return null;
+  const { data, error } = await supabase.rpc("set_notification_prefs", args);
+  if (error) {
+    dbError(error, "save notification prefs");
+    return null;
+  }
+  return prefsRowToMap(data);
 }
 
 // Insert one notification for userId, through the insert_notification
 // RPC (see the header note). Returns the inserted row id, or null when
-// it was skipped (toggle off), not configured, or refused (including
-// by the RPC's participant check). Never throws.
+// it was skipped (the recipient turned this kind off in their server
+// prefs — the RPC returns null silently), not configured, or refused
+// (including by the RPC's participant check). Never throws.
+// The recipient's prefs are enforced server-side inside the RPC;
+// this function no longer checks any device toggle (see header).
 // Options: kind, title, body, link, plus orderId (order events) or
 // conversationId (chat events) so the RPC can check the caller is a
 // participant of that order/conversation.
@@ -159,7 +186,6 @@ export async function notifyUser(userId, { kind, title, body, link, orderId, con
     return null;
   }
   if (!title || !String(title).trim()) return null;
-  if (!kindAllowed(kind)) return null;
   // Clamp to the insert_notification RPC's caps (title 200, body 500,
   // link 500) instead of sending an overlong payload the server
   // rejects whole — a long checkpoint location used to drop the entire

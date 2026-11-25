@@ -4,6 +4,12 @@ import { inputCls } from "../components/ui";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
 import { fetchBlockedIds } from "../lib/chat";
+import {
+  KIND_LABELS,
+  NOTIFICATION_KINDS,
+  getNotificationPrefs,
+  setNotificationPrefs,
+} from "../lib/notifications";
 
 const BACKGROUNDS = [
   { id: "system", label: "System" },
@@ -12,6 +18,16 @@ const BACKGROUNDS = [
   { id: "brown", label: "Brown" },
 ];
 
+// Server pref kind -> device settings key, for the three kinds the
+// device settings ever knew (checkpoints / disputes / ratings).
+// The device copy is a display fallback only; the server-side pref
+// is the real gate (Milestone 19).
+const DEVICE_PREF_KEYS = {
+  checkpoint: "checkpoints",
+  dispute: "disputes",
+  rating: "ratings",
+};
+
 export default function Settings({ applyAppearance }) {
   const { user } = useAuth();
   const [settings, setSettings] = useState(getSettings());
@@ -19,6 +35,12 @@ export default function Settings({ applyAppearance }) {
   const [copyFailed, setCopyFailed] = useState(false);
   const [cleared, setCleared] = useState(false);
   const [blockedCount, setBlockedCount] = useState(null);
+  // Server-side notification prefs (Milestone 19): one toggle per
+  // notification kind, stored on the account and enforced inside
+  // insert_notification(). Null until loaded — the device toggles
+  // are the display fallback until then.
+  const [serverPrefs, setServerPrefs] = useState(null);
+  const [prefsNote, setPrefsNote] = useState("");
 
   // The old line here always said "Blocked users: none", even after
   // the student blocked someone in a chat. Read the real list.
@@ -28,6 +50,37 @@ export default function Settings({ applyAppearance }) {
     fetchBlockedIds(user.id)
       .then((ids) => {
         if (alive) setBlockedCount((ids || []).length);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [user]);
+
+  // Load the server-side notification prefs. When they arrive,
+  // keep the device copy in sync for the three kinds it knows, so
+  // the Notifications page hint still reads correctly. When the
+  // Milestone 19 SQL has not been run yet the call returns null
+  // and the device toggles simply stay as they are.
+  useEffect(() => {
+    if (!user) return;
+    let alive = true;
+    getNotificationPrefs()
+      .then((prefs) => {
+        if (!alive || !prefs) return;
+        setServerPrefs(prefs);
+        const current = getSettings();
+        const next = {
+          ...current,
+          notifications: {
+            ...current.notifications,
+            checkpoints: prefs.checkpoint !== false,
+            disputes: prefs.dispute !== false,
+            ratings: prefs.rating !== false,
+          },
+        };
+        saveSettings(next);
+        setSettings(next);
       })
       .catch(() => {});
     return () => {
@@ -77,6 +130,48 @@ export default function Settings({ applyAppearance }) {
     update({ notifications: { ...settings.notifications, [key]: !settings.notifications[key] } });
   }
 
+  // The value a server-pref checkbox shows: the server value when
+  // loaded, otherwise the device value for the three kinds it
+  // knows, otherwise on.
+  function serverPrefValue(kind) {
+    if (serverPrefs && typeof serverPrefs[kind] === "boolean") return serverPrefs[kind];
+    const deviceKey = DEVICE_PREF_KEYS[kind];
+    if (deviceKey) return settings.notifications?.[deviceKey] !== false;
+    return true;
+  }
+
+  // Keep the device copy in step for the three kinds it knows.
+  function syncDevicePref(kind, value) {
+    const deviceKey = DEVICE_PREF_KEYS[kind];
+    if (!deviceKey) return;
+    update({ notifications: { ...settings.notifications, [deviceKey]: value } });
+  }
+
+  // Flip one server-side toggle. The checkbox updates at once and
+  // the device copy follows; the server save runs behind it. If
+  // the save fails (Milestone 19 SQL not run yet, or offline), the
+  // toggle rolls back and a note says so — the device value stays
+  // as the fallback, and the server remains the real gate once it
+  // is live.
+  async function toggleServerPref(kind) {
+    const current = serverPrefValue(kind);
+    const next = !current;
+    const prevPrefs = serverPrefs;
+    setServerPrefs({ ...(serverPrefs || {}), [kind]: next });
+    syncDevicePref(kind, next);
+    setPrefsNote("");
+    const saved = await setNotificationPrefs({ [kind]: next });
+    if (!saved) {
+      setServerPrefs(prevPrefs);
+      syncDevicePref(kind, current);
+      setPrefsNote(
+        "That setting could not be saved on the server yet — it is saved on this device for now. It will sync once the next PulseMarket update is live."
+      );
+    } else {
+      setServerPrefs(saved);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold">Settings</h1>
@@ -106,26 +201,34 @@ export default function Settings({ applyAppearance }) {
 
       <section className="space-y-3">
         <h2 className="font-bold">Notifications</h2>
-        {[
-          ["priceDrops", "Price drops on saved items", true],
-          ["checkpoints", "Shipping checkpoints", false],
-          ["disputes", "Dispute updates", false],
-          ["ratings", "Rating reminders", false],
-        ].map(([key, label, comingSoon]) => (
-          <label key={key} className="flex items-center justify-between text-sm">
-            <span>
-              {label}
-              {comingSoon ? <span className="text-neutral-400"> — coming soon</span> : null}
-            </span>
+        <p className="text-sm text-neutral-500">
+          Choose which notifications you get. These are saved to your account, so they follow you to any phone.
+        </p>
+        {NOTIFICATION_KINDS.map((kind) => (
+          <label key={kind} className="flex items-center justify-between text-sm">
+            <span>{KIND_LABELS[kind]}</span>
             <input
               type="checkbox"
-              checked={settings.notifications[key]}
-              onChange={() => toggleNotif(key)}
-              disabled={comingSoon}
-              className="h-5 w-5 accent-[#7d5027] disabled:opacity-40"
+              checked={serverPrefValue(kind)}
+              onChange={() => toggleServerPref(kind)}
+              className="h-5 w-5 accent-[#7d5027]"
             />
           </label>
         ))}
+        <label className="flex items-center justify-between text-sm">
+          <span>
+            Price drops on saved items
+            <span className="text-neutral-400"> — coming soon</span>
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.notifications?.priceDrops !== false}
+            onChange={() => toggleNotif("priceDrops")}
+            disabled
+            className="h-5 w-5 accent-[#7d5027] disabled:opacity-40"
+          />
+        </label>
+        {prefsNote ? <p className="text-sm text-neutral-500">{prefsNote}</p> : null}
       </section>
 
       <section className="space-y-3">

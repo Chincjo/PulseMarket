@@ -24,15 +24,15 @@ export default function ListingEditForm({ listing, onSave, onCancel }) {
       return;
     }
     // Price must be a whole number above ₦0 (the database refuses ₦0
-    // too) and below ₦10,000,000 — before this fix a negative price
+    // too) and below ₦50,000,000 — before this fix a negative price
     // silently became ₦0 and ₦999,999,999 sailed through.
     const n = Math.round(Number(price));
     if (!price || price.toString().trim() === "" || !Number.isFinite(n) || n < 1) {
       setError("Enter a price above ₦0.");
       return;
     }
-    if (n > 10000000) {
-      setError("Price is too high — keep it under ₦10,000,000.");
+    if (n > 50000000) {
+      setError("Price is too high — keep it under ₦50,000,000.");
       return;
     }
     if (!CONDITIONS.includes(condition)) {

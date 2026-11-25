@@ -19,6 +19,7 @@ import { useNavigate } from "react-router-dom";
 import { CATEGORIES, CONDITIONS, SAFE_MEETUP_SPOTS, universityState } from "../lib/data";
 import { feeBreakdown, formatNaira, suggestPrice } from "../lib/fees";
 import { createListingRow, uploadListingPhotos } from "../lib/listings";
+import { assertSellerClearOfDebt } from "../lib/shipping";
 import { isSupabaseConfigured } from "../lib/supabase";
 import { GhostButton, PrimaryButton, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -93,7 +94,7 @@ export default function Sell({ verification }) {
       case 1: {
         const n = Math.round(Number(price) || 0);
         if (!price || n <= 0) return ["Your price (above ₦0)"];
-        if (n > 10000000) return ["Your price (under ₦10,000,000)"];
+        if (n > 50000000) return ["Your price (under ₦50,000,000)"];
         return [];
       }
       case 2: {
@@ -194,6 +195,12 @@ export default function Sell({ verification }) {
     }
     setPublishing(true);
     try {
+      // Debt gate (Milestone 19): a seller who still owes money
+      // from an earlier order must settle it with the team before
+      // listing again. This throws a plain message naming the amount
+      // owed, which publish's catch shows as the error. It runs
+      // before any photo upload, so a blocked seller uploads nothing.
+      await assertSellerClearOfDebt(user.id);
       const photoUrls = photos.length
         ? await uploadListingPhotos(user.id, photos)
         : [];

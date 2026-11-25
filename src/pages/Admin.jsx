@@ -18,7 +18,16 @@
 // also check the signed-in email before querying.
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../lib/auth";
-import { fetchHeldOrders, fetchOrder, refundHeldOrder } from "../lib/orders";
+import {
+  fetchHeldOrders,
+  fetchOrder,
+  fetchStaleShippedOrders,
+  fetchStuckMoneyOrders,
+  reconcileOrder,
+  refundHeldOrder,
+} from "../lib/orders";
+import { sellerDebtAmount } from "../lib/shipping";
+import { notifyUser } from "../lib/notifications";
 import { fetchLockedHandoffs, unlockHandoff } from "../lib/handoff";
 import { fetchEvidenceForOrder } from "../lib/evidence";
 import {
@@ -54,6 +63,18 @@ function formatMoney(naira) {
   return `₦${n.toLocaleString("en-NG")}`;
 }
 
+// Milestone 19, Decision 3 — fixed rejection reasons for the
+// Pending verifications picker. The reason is required; the note
+// is optional (max 280 chars). Values are the exact strings the
+// review_verification RPC expects (Team B owns the RPC).
+const REJECT_REASONS = [
+  { value: "blurry", label: "Blurry photo" },
+  { value: "wrong document", label: "Wrong document" },
+  { value: "name mismatch", label: "Name doesn't match the ID" },
+  { value: "expired", label: "Expired ID" },
+  { value: "other", label: "Other" },
+];
+
 export default function Admin() {
   const { user, loading: authLoading } = useAuth();
   const [disputes, setDisputes] = useState([]);
@@ -65,6 +86,19 @@ export default function Admin() {
   const [pendingError, setPendingError] = useState("");
   const [photoUrls, setPhotoUrls] = useState({});
   const [viewingPhotos, setViewingPhotos] = useState(null);
+  // Milestone 19 — Decision 5 (stuck shipped) + stuck money lists.
+  const [staleShipped, setStaleShipped] = useState([]);
+  const [staleError, setStaleError] = useState("");
+  const [stuckMoney, setStuckMoney] = useState([]);
+  const [stuckError, setStuckError] = useState("");
+  // Milestone 19 — Decision 3 reject picker (row being rejected,
+  // chosen reason, optional note).
+  const [rejectFor, setRejectFor] = useState(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejectNote, setRejectNote] = useState("");
+  // Milestone 19 — withdrawal debt check (seller user id -> amount owed).
+  const [debtSellerId, setDebtSellerId] = useState("");
+  const [debtResult, setDebtResult] = useState(null);
   const [busyAction, setBusyAction] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [selectedOrder, setSelectedOrder] = useState(null);
@@ -113,6 +147,26 @@ export default function Admin() {
     } catch (err) {
       setPendingError(err?.message || "Could not load pending verifications.");
       setPendingVerifications([]);
+    }
+    // Milestone 19, Decision 5: stuck shipped orders load
+    // separately too, for the same reason — a problem here must
+    // not blank the rest of the panel.
+    try {
+      const stale = await fetchStaleShippedOrders(user);
+      setStaleShipped(stale || []);
+      setStaleError("");
+    } catch (err) {
+      setStaleError(err?.message || "Could not load stuck shipped orders.");
+      setStaleShipped([]);
+    }
+    // Milestone 19 follow-up: stuck money orders, same pattern.
+    try {
+      const stuck = await fetchStuckMoneyOrders(user);
+      setStuckMoney(stuck || []);
+      setStuckError("");
+    } catch (err) {
+      setStuckError(err?.message || "Could not load stuck money orders.");
+      setStuckMoney([]);
     }
   }, [isOwner, user]);
 
@@ -239,33 +293,143 @@ export default function Admin() {
     }
   }
 
-  // Milestone 17: team decision on one student. Approving lets them
-  // post and chat at once; rejecting sends them back to submit again
-  // with new photos — nothing about them is deleted. The list
-  // refreshes after the action, so a decided student leaves the queue.
-  async function handleReviewVerification(row, status) {
-    if (
-      status === "rejected" &&
-      !window.confirm(
-        `Reject the verification for ${row.student_id} (${row.university})? They will need to submit again with new ID photos.`
-      )
-    ) {
-      return;
-    }
+  // Milestone 17: team decision on one student — APPROVE only.
+  // Approving lets them post and chat at once. Rejecting goes
+  // through the reason picker below (Decision 3), never through
+  // this path, so a rejection always carries a reason.
+  async function handleApproveVerification(row) {
     setError("");
     setNotice("");
-    setBusyAction(`${status}-${row.user_id}`);
+    setBusyAction(`approved-${row.user_id}`);
     try {
-      await reviewVerification(row.user_id, status);
-      setNotice(
-        status === "approved"
-          ? `Verification approved for ${row.student_id} (${row.university}). They can now post and chat.`
-          : `Verification rejected for ${row.student_id}. They can submit again with new photos.`
-      );
+      await reviewVerification(row.user_id, "approved");
+      setNotice(`Verification approved for ${row.student_id} (${row.university}). They can now post and chat.`);
       setViewingPhotos(null);
       await load();
     } catch (err) {
       setError(err?.message || "Could not update this verification.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Milestone 19, Decision 3: reject with a REQUIRED reason from
+  // the fixed list plus an optional short note (max 280 chars).
+  // reviewVerification() (src/lib/listings.js) passes them to
+  // review_verification(p_user_id, p_status, p_reason, p_note) —
+  // Team B's RPC in supabase/m19/02-verification.sql, which also
+  // refuses a rejection without a reason server-side. This page
+  // does not re-implement the RPC. If the Milestone 19 SQL has not
+  // been run yet, the call fails with a plain message and NOTHING
+  // is rejected — the page never falls back to a reason-less
+  // reject, or the reason the student is owed would be lost.
+  async function handleConfirmReject() {
+    if (!rejectFor || !rejectReason) return;
+    setError("");
+    setNotice("");
+    setBusyAction(`rejected-${rejectFor.user_id}`);
+    try {
+      await reviewVerification(
+        rejectFor.user_id,
+        "rejected",
+        rejectReason,
+        rejectNote.trim() ? rejectNote.trim() : null
+      );
+      const reasonLabel =
+        REJECT_REASONS.find((r) => r.value === rejectReason)?.label || rejectReason;
+      setNotice(
+        `Verification rejected for ${rejectFor.student_id} (${reasonLabel}). They can submit again with new photos.`
+      );
+      setRejectFor(null);
+      setRejectReason("");
+      setRejectNote("");
+      setViewingPhotos(null);
+      await load();
+    } catch (err) {
+      const message = String(err?.message || "");
+      const rpcMissing =
+        err?.code === "PGRST202" ||
+        /could not find the function/i.test(message) ||
+        /function .*review_verification.* does not exist/i.test(message);
+      setError(
+        rpcMissing
+          ? "Rejection reasons are not switched on yet — the 4-argument review_verification RPC (Team B's Milestone 19 SQL) has not been run. Nothing was rejected. Run that SQL first, then reject again."
+          : err?.message || "Could not update this verification."
+      );
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Milestone 19, Decision 5: nudge the buyer of a stuck shipped
+  // order — a plain notification, nothing more. There is NO
+  // auto-confirm anywhere on this page: a shipped order the buyer
+  // has not confirmed never releases money by itself. After the
+  // nudge, either the buyer confirms delivery, or the team resolves
+  // it by hand (open dispute above, or the buyer opens a return
+  // and the team resolves it on the tracking page).
+  async function handleNudgeBuyer(order) {
+    setError("");
+    setNotice("");
+    setBusyAction(`nudge-${order.id}`);
+    try {
+      const sent = await notifyUser(order.buyer_id, {
+        kind: "order",
+        title: "Delivery check — did your parcel arrive?",
+        body: `Order ${order.code} shipped ${order.daysWaiting ?? "several"} days ago and delivery is still not confirmed. If the item arrived, confirm delivery on the order page; if it did not arrive, open a return or tell the PulseMarket team.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+      if (!sent) {
+        throw new Error("The nudge could not be sent — the notification was refused. Try again.");
+      }
+      setNotice(`Nudge sent to the buyer of order ${order.code}. No money moved — the order still waits for the buyer to confirm delivery.`);
+    } catch (err) {
+      setError(err?.message || "Could not send the nudge.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Milestone 19 follow-up: finish one stuck order's half-written
+  // money move. reconcileOrder() re-runs the matching idempotent
+  // action — the money is never moved twice.
+  async function handleReconcile(order) {
+    setError("");
+    setNotice("");
+    setBusyAction(`reconcile-${order.id}`);
+    try {
+      const { note } = await reconcileOrder(order.id, user);
+      setNotice(note || "Order reconciled.");
+      await load();
+    } catch (err) {
+      setError(err?.message || "Could not reconcile this order.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Milestone 19 follow-up: check a seller's outstanding debt
+  // BEFORE paying a manual withdrawal by hand. Withdrawals are paid
+  // outside the app (Wallet.jsx: the seller emails the team), so
+  // this check refuses the payout in plain words while debt is
+  // owed — it does not pay anything itself.
+  async function handleDebtCheck(e) {
+    e.preventDefault();
+    const sellerId = debtSellerId.trim();
+    if (!sellerId) {
+      setError("Enter the seller's user ID first — it is shown on their pending verification row and on their orders.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    setBusyAction("debt-check");
+    try {
+      const amount = await sellerDebtAmount(sellerId);
+      setDebtResult({ sellerId, amount });
+    } catch (err) {
+      setError(err?.message || "Could not check that seller's debt.");
+      setDebtResult(null);
     } finally {
       setBusyAction("");
     }
@@ -351,18 +515,82 @@ export default function Admin() {
                       <GhostButton
                         type="button"
                         disabled={busyAction !== ""}
-                        onClick={() => handleReviewVerification(v, "approved")}
+                        onClick={() => handleApproveVerification(v)}
                       >
                         {busyAction === `approved-${v.user_id}` ? "Approving…" : "Approve"}
                       </GhostButton>
                       <GhostButton
                         type="button"
                         disabled={busyAction !== ""}
-                        onClick={() => handleReviewVerification(v, "rejected")}
+                        onClick={() => {
+                          setRejectFor(v);
+                          setRejectReason("");
+                          setRejectNote("");
+                          setError("");
+                        }}
                       >
-                        {busyAction === `rejected-${v.user_id}` ? "Rejecting…" : "Reject"}
+                        Reject
                       </GhostButton>
                     </div>
+                    {/* Milestone 19, Decision 3 — rejection reason picker.
+                        A reason is required before the Reject call goes
+                        through; the note is optional (max 280 chars). */}
+                    {rejectFor?.user_id === v.user_id ? (
+                      <div className="mt-3 rounded-xl border border-neutral-200 p-3 dark:border-neutral-800">
+                        <p className="text-sm font-bold">Why are you rejecting this student?</p>
+                        <p className="mt-1 text-xs text-neutral-500">
+                          The student sees this reason, so pick the one that
+                          matches — they resubmit with new photos.
+                        </p>
+                        <div className="mt-2 space-y-1">
+                          {REJECT_REASONS.map((r) => (
+                            <label key={r.value} className="flex items-center gap-2 text-sm">
+                              <input
+                                type="radio"
+                                name={`reject-reason-${v.user_id}`}
+                                checked={rejectReason === r.value}
+                                onChange={() => setRejectReason(r.value)}
+                              />
+                              {r.label}
+                            </label>
+                          ))}
+                        </div>
+                        <label className="mt-2 block text-sm font-semibold">
+                          Note for the student (optional)
+                          <textarea
+                            className={`${inputCls} mt-1 min-h-16`}
+                            value={rejectNote}
+                            onChange={(e) => setRejectNote(e.target.value.slice(0, 280))}
+                            placeholder="One short line, e.g. which photo was blurry."
+                            maxLength={280}
+                          />
+                        </label>
+                        <p className="mt-1 text-xs text-neutral-500">{rejectNote.length}/280</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <GhostButton
+                            type="button"
+                            disabled={busyAction !== "" || !rejectReason}
+                            onClick={handleConfirmReject}
+                          >
+                            {busyAction === `rejected-${v.user_id}` ? "Rejecting…" : "Confirm reject"}
+                          </GhostButton>
+                          <GhostButton
+                            type="button"
+                            disabled={busyAction !== ""}
+                            onClick={() => {
+                              setRejectFor(null);
+                              setRejectReason("");
+                              setRejectNote("");
+                            }}
+                          >
+                            Cancel
+                          </GhostButton>
+                        </div>
+                        {!rejectReason ? (
+                          <p className="mt-2 text-xs text-neutral-500">Pick a reason first — a rejection needs one.</p>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {viewingPhotos === v.user_id && photoUrls[v.user_id] ? (
                       <div className="mt-3 grid grid-cols-2 gap-2">
                         <div>
@@ -557,6 +785,144 @@ export default function Admin() {
                 ))}
               </ul>
             )}
+          </section>
+
+          {/* Milestone 19, Decision 5 — shipped orders stuck with no
+              auto-exit. NO auto-confirm: a shipped order never
+              releases money by itself, because the buyer may never
+              have received the parcel. The team nudges the buyer;
+              then either the buyer confirms delivery, or the team
+              resolves it by hand — an open dispute in "Open disputes"
+              above, or a return the buyer opened, resolved on the
+              tracking page. */}
+          <section className="mt-8">
+            <h2 className="font-semibold">Shipped orders waiting for the buyer ({staleShipped.length})</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Held orders that shipped more than 7 days ago and the buyer still
+              has not confirmed delivery. Nothing here confirms or releases
+              anything on its own — nudge the buyer, then resolve by hand.
+            </p>
+            {staleError ? <p className="mt-2 text-sm text-red-600">{staleError}</p> : null}
+            {staleShipped.length === 0 ? (
+              <p className="mt-2 text-sm text-neutral-500">No shipped orders stuck waiting.</p>
+            ) : (
+              <ul className="mt-2 space-y-2">
+                {staleShipped.map((o) => (
+                  <li
+                    key={o.id}
+                    className="rounded-xl border border-neutral-200 bg-white p-3 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+                  >
+                    <span className="font-bold">{o.code}</span> · {formatMoney(o.total)} ·{" "}
+                    {o.delivery_method} via {o.courier || "courier to be agreed"} · shipped{" "}
+                    {o.daysWaiting} day{o.daysWaiting === 1 ? "" : "s"} ago · {timeAgo(o.shipping_proof_at || o.updated_at)}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <GhostButton
+                        disabled={busyAction !== ""}
+                        onClick={() => handleNudgeBuyer(o)}
+                      >
+                        {busyAction === `nudge-${o.id}` ? "Nudging…" : "Nudge buyer"}
+                      </GhostButton>
+                      <a
+                        href={`/order/${o.id}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-full border border-neutral-300 px-3 py-1 text-sm font-semibold dark:border-neutral-700"
+                      >
+                        Open order
+                      </a>
+                    </div>
+                    <p className="mt-2 text-xs text-neutral-500">
+                      Hand-resolve only: if the buyer opens a dispute, resolve it in
+                      Open disputes above; if the buyer opens a return, resolve it
+                      on the tracking page. Never release money for a shipped order
+                      the buyer has not confirmed.
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {/* Milestone 19 follow-up — stuck money: the money moved, the
+              status update never landed. Reconciling re-runs the matching
+              idempotent action and finishes the status update; the money
+              is never moved twice. */}
+          <section className="mt-8">
+            <h2 className="font-semibold">Stuck money ({stuckMoney.length})</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Orders where the ledger and the status disagree — a hold, refund
+              or release was written but the order still says paid, held or
+              delivered. Reconciling finishes the half-written move.
+            </p>
+            {stuckError ? <p className="mt-2 text-sm text-red-600">{stuckError}</p> : null}
+            {stuckMoney.length === 0 ? (
+              <p className="mt-2 text-sm text-neutral-500">No stuck money orders.</p>
+            ) : (
+              <ul className="mt-2 space-y-2">
+                {stuckMoney.map(({ order, problem, action }) => (
+                  <li
+                    key={order.id}
+                    className="rounded-xl border border-neutral-200 bg-white p-3 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+                  >
+                    <span className="font-bold">{order.code}</span> · {order.status} ·{" "}
+                    {formatMoney(order.total)} · {timeAgo(order.created_at)}
+                    <p className="mt-1">{problem}</p>
+                    <p className="text-xs text-neutral-500">Fix: {action}</p>
+                    <div className="mt-2">
+                      <GhostButton
+                        disabled={busyAction !== ""}
+                        onClick={() => handleReconcile(order)}
+                      >
+                        {busyAction === `reconcile-${order.id}` ? "Reconciling…" : "Reconcile — finish the move"}
+                      </GhostButton>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {/* Milestone 19 follow-up — debt check before a manual
+              withdrawal payout. Withdrawals are paid by hand by the team
+              (the seller emails the team), so this check is the gate:
+              while the seller owes money, the payout is refused in plain
+              words. This section pays nothing itself. */}
+          <section className="mt-8">
+            <h2 className="font-semibold">Withdrawal check — seller debt</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Before paying any withdrawal by hand, check what the seller owes
+              from earlier orders (unpaid shipping advances from seller-fault
+              returns, minus repayments). If debt is owed, do NOT pay.
+            </p>
+            <form onSubmit={handleDebtCheck} className="mt-2 space-y-2">
+              <label className="block text-sm font-semibold">
+                Seller user ID
+                <input
+                  className={`${inputCls} mt-1`}
+                  placeholder="Seller's user ID (from their verification row or an order)"
+                  value={debtSellerId}
+                  onChange={(e) => setDebtSellerId(e.target.value)}
+                />
+              </label>
+              <div>
+                <PrimaryButton type="submit" disabled={busyAction !== ""}>
+                  {busyAction === "debt-check" ? "Checking…" : "Check debt before payout"}
+                </PrimaryButton>
+              </div>
+            </form>
+            {debtResult ? (
+              debtResult.amount > 0 ? (
+                <p className="mt-2 rounded-xl bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                  Do NOT pay this withdrawal — this seller owes {formatMoney(debtResult.amount)} back to
+                  PulseMarket. Settle the debt first, then pay.
+                </p>
+              ) : (
+                <p className="mt-2 rounded-xl bg-neutral-100 px-3 py-2 text-sm dark:bg-neutral-900">
+                  No debt owed — a manual payout may go ahead. Pay by hand as usual; this page
+                  does not move any money.
+                </p>
+              )
+            ) : null}
           </section>
 
           {/* (e) Locked handoffs */}

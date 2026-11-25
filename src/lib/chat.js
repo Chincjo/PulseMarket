@@ -18,12 +18,20 @@
 // - If either side blocked the other, no new chat can start.
 // - Messages are capped at 1000 characters and a student cannot send
 //   more than one message every 2 seconds (spam throttle, client-side).
-// - Offers are capped at ₦10,000,000 (MAX_OFFER_NAIRA, enforced in
+// - Offers are capped at ₦50,000,000 (MAX_OFFER_NAIRA, enforced in
 //   sendOffer as well as in the ChatThread form).
 // - A blocked student cannot message in an existing chat either:
 //   sendMessage / sendOffer / schedulePickup refuse when either side
 //   blocked the other (startConversation only stops NEW chats).
 // - A flagged account (5 wrong handoff codes) cannot start a new chat.
+// - Milestone 19: a student whose verification is LATER rejected (or
+//   who becomes flagged) cannot start NEW activity in an EXISTING
+//   chat either — sendMessage / sendOffer / respondOffer /
+//   schedulePickup refuse when either side is no longer approved or
+//   is flagged (verificationGateRefusal, backed by the Milestone 19
+//   database triggers in supabase/m19/01-chat-gates.sql). Existing
+//   orders are never frozen or cancelled by this — an order already
+//   placed runs to completion.
 // - Only the two participants can read a conversation or its messages —
 //   that is enforced by RLS in milestone-5.sql, not here. There is no
 //   end-to-end encryption by design: the owner must be able to read chats
@@ -39,12 +47,28 @@ export const MAX_MESSAGE_LENGTH = 1000;
 // Highest offer the app will send (₦). ChatThread enforces the same cap
 // in the UI, but sendOffer() is also callable from anywhere else, so the
 // cap lives here too — an offer above this used to sail through the lib
-// (the database only checks offer_amount >= 0).
-export const MAX_OFFER_NAIRA = 10000000;
+// (the database only checks offer_amount >= 0). Milestone 19, Decision 7:
+// raised from ₦10,000,000 to ₦50,000,000. The cap stays — it is not
+// removed — and the database check (messages_offer_amount_max) was
+// raised to match in supabase/m19/01-chat-gates.sql.
+export const MAX_OFFER_NAIRA = 50000000;
 
 // Minimum gap between two sends from the same device (spam throttle).
 const SEND_THROTTLE_MS = 2000;
 let lastSendAt = 0;
+
+// The plain reason the last chat write was refused by the
+// verification gate (Milestone 19), if any. ChatThread reads it
+// with getLastChatError() so the student sees WHY the send failed
+// instead of a generic "could not send". Cleared on read and on
+// every successful send; never holds a secret, only a sentence.
+let lastGateError = "";
+
+export function getLastChatError() {
+  const msg = lastGateError;
+  lastGateError = "";
+  return msg;
+}
 
 export const QUICK_REPLIES = [
   "Still available?",
@@ -99,6 +123,73 @@ async function isBlockedBetween(a, b, { failClosed = false } = {}) {
     return failClosed;
   }
   return (data || []).length > 0;
+}
+
+// Whether each listed student is still a verified student
+// (approved, unflagged verifications row), from the Milestone 19
+// RPC pm_chat_participant_verified. Returns a plain object
+// { userId: true/false }; a user the caller shares no conversation
+// with simply has no entry. This is the ONLY way to learn the
+// OTHER side's status: the verifications SELECT policy only lets
+// a student read their own row, so fetchVerification(otherId)
+// always comes back empty (see startConversation). Fails OPEN
+// ({}): if the RPC is missing (SQL not run yet) or errors, the
+// caller carries on and the database triggers refuse the write
+// instead — chats keep working through a blip, and a refused
+// write still shows its plain server reason.
+export async function fetchParticipantsVerified(userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!supabase || ids.length === 0) return {};
+  const { data, error } = await supabase.rpc("pm_chat_participant_verified", {
+    p_user_ids: ids,
+  });
+  if (error) {
+    dbError(error, "fetch participant verification");
+    return {};
+  }
+  const out = {};
+  for (const row of data || []) {
+    if (row?.user_id) out[row.user_id] = row.is_verified === true;
+  }
+  return out;
+}
+
+// Milestone 19 gate: the plain reason new activity in this
+// conversation must stop, or null when it may go ahead. Refuses
+// when EITHER participant's verification is not status='approved'
+// or is flagged — including a student whose verification was
+// rejected AFTER the chat started. The sender's own row is read
+// directly (fetchVerification works for your own row); the other
+// side goes through fetchParticipantsVerified (RLS hides their
+// row). A side the RPC cannot answer (missing row, RPC not run
+// yet) does NOT refuse here — the database triggers are the
+// backstop for that side, and refusing on "unknown" would block
+// every chat until the Milestone 19 SQL runs.
+async function verificationGateRefusal(conversationId, userId) {
+  if (!conversationId || !userId) return null;
+  const conv = await fetchConversation(conversationId);
+  if (!conv) return null;
+  const otherId =
+    conv.buyer_id === userId ? conv.seller_id : conv.buyer_id;
+  if (!otherId || otherId === userId) return null;
+  const mine = await fetchVerification(userId);
+  if (!mine) {
+    return "Only verified students can chat. Get verified first.";
+  }
+  if (mine.status === "rejected") {
+    return "Your verification was not approved — submit it again with clear ID photos to chat.";
+  }
+  if (mine.status !== "approved") {
+    return "Your verification is under review — you can chat once the team approves it.";
+  }
+  if (mine.flagged) {
+    return "Your account is under review — contact support before starting a new chat.";
+  }
+  const others = await fetchParticipantsVerified([otherId]);
+  if (otherId in others && others[otherId] !== true) {
+    return "This student is no longer verified — new messages, offers and meetups are paused for this chat.";
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +480,18 @@ async function insertMessage(conversationId, row) {
       return null;
     }
   }
+  // Milestone 19: a student whose verification was rejected AFTER
+  // the chat started (or who became flagged) cannot send new
+  // messages — and neither can the other side in that chat. The
+  // plain reason is kept for ChatThread (getLastChatError) and
+  // logged, matching the blocked refusal above. The 1000-char cap
+  // and the 2s throttle below are untouched. This is the shared
+  // choke point for sendMessage AND sendOffer (both insert here).
+  const gateRefusal = await verificationGateRefusal(conversationId, senderId);
+  if (gateRefusal) {
+    lastGateError = gateRefusal;
+    return dbError(gateRefusal, "send message");
+  }
   // Spam throttle: one send per device every 2 seconds. The clock only
   // moves after a send succeeds, so a failed send never blocks a retry.
   if (Date.now() - lastSendAt < SEND_THROTTLE_MS) {
@@ -405,6 +508,7 @@ async function insertMessage(conversationId, row) {
     return null;
   }
   lastSendAt = Date.now();
+  lastGateError = "";
   // Keep the conversation list ordered by the latest message.
   await supabase
     .from("conversations")
@@ -471,14 +575,13 @@ export async function sendOffer(conversationId, amount) {
   if (!supabase || !conversationId) return null;
   const n = Math.round(Number(amount) || 0);
   if (n <= 0) return null;
-  if (n > 10000000) {
-    console.error("[PulseMarket] send offer: offer is too high — keep it under ₦10,000,000.");
-    return null;
-  }
   // The ChatThread form caps offers at this amount, but sendOffer()
   // is callable from anywhere — without the cap here an offer of
   // ₦999,999,999 went straight through (the database only checks
   // offer_amount >= 0), and accepting it set that agreed price.
+  // (The old hardcoded ₦10,000,000 check that used to sit here is
+  // gone: it would have silently re-imposed the old cap after
+  // Decision 7 raised it to ₦50,000,000.)
   if (n > MAX_OFFER_NAIRA) {
     return dbError(
       `Offer is too high — keep it under ₦${MAX_OFFER_NAIRA.toLocaleString("en-NG")}.`,
@@ -547,6 +650,18 @@ export async function respondOffer(messageId, decision) {
     dbError("You cannot message this student.", "respond to offer");
     return false;
   }
+  // Milestone 19: an offer cannot be answered in a chat where
+  // either side is no longer an approved, unflagged student — a
+  // later-rejected seller's pending offer must not become the
+  // agreed price. (The database refuses the message update too,
+  // but answering also sets conversations.agreed_price, so refuse
+  // here first — same reasoning as the blocked check above.)
+  const gateRefusal = await verificationGateRefusal(msg.conversation_id, me);
+  if (gateRefusal) {
+    lastGateError = gateRefusal;
+    dbError(gateRefusal, "respond to offer");
+    return false;
+  }
   const { error } = await supabase
     .from("messages")
     .update({ offer_status: decision })
@@ -575,6 +690,7 @@ export async function respondOffer(messageId, decision) {
       conversationId: msg.conversation_id,
     });
   }
+  lastGateError = "";
   return true;
 }
 
@@ -641,6 +757,16 @@ export async function schedulePickup(conversationId, { spot, date, time }) {
   if (await blockedWithOther(conversationId, me)) {
     return dbError("You cannot message this student.", "schedule pickup");
   }
+  // Milestone 19: a meetup cannot be planned in a chat where
+  // either side is no longer an approved, unflagged student.
+  // (There is no app-side update path for pickup tickets — only
+  // this insert — so the update half of the gate lives in the
+  // database trigger, pm_validate_pickup_update.)
+  const gateRefusal = await verificationGateRefusal(conversationId, me);
+  if (gateRefusal) {
+    lastGateError = gateRefusal;
+    return dbError(gateRefusal, "schedule pickup");
+  }
   const { data, error } = await supabase
     .from("pickup_tickets")
     .insert({
@@ -656,6 +782,7 @@ export async function schedulePickup(conversationId, { spot, date, time }) {
     dbError(error, "schedule pickup");
     return null;
   }
+  lastGateError = "";
   return data;
 }
 

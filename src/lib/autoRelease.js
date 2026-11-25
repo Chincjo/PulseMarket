@@ -94,9 +94,24 @@ export async function runAutoReleaseCheck(user) {
   }
   if (!currentUser?.id) return result;
 
+  // Loop every page of the user's orders (fetchMyOrders pages at
+  // 200 rows with a { before } cursor + hasMore) instead of only
+  // seeing the newest 200 — a delivered order past page 1 used to
+  // never auto-release. Capped at 50 pages so a broken cursor can
+  // never loop for ever.
   let orders = [];
   try {
-    orders = await fetchMyOrders(currentUser.id);
+    let before = null;
+    for (let page = 0; page < 50; page++) {
+      const rows = await fetchMyOrders(
+        currentUser.id,
+        before ? { before } : {}
+      );
+      orders = orders.concat(rows || []);
+      if (rows?.hasMore !== true || rows.length === 0) break;
+      before = rows[rows.length - 1]?.created_at || null;
+      if (!before) break;
+    }
   } catch (err) {
     console.error("[PulseMarket] auto-release check:", err?.message || err);
     return result;
