@@ -107,14 +107,23 @@ export default function Settings({ applyAppearance }) {
       <section className="space-y-3">
         <h2 className="font-bold">Notifications</h2>
         {[
-          ["priceDrops", "Price drops on saved items"],
-          ["checkpoints", "Shipping checkpoints"],
-          ["disputes", "Dispute updates"],
-          ["ratings", "Rating reminders"],
-        ].map(([key, label]) => (
+          ["priceDrops", "Price drops on saved items", true],
+          ["checkpoints", "Shipping checkpoints", false],
+          ["disputes", "Dispute updates", false],
+          ["ratings", "Rating reminders", false],
+        ].map(([key, label, comingSoon]) => (
           <label key={key} className="flex items-center justify-between text-sm">
-            {label}
-            <input type="checkbox" checked={settings.notifications[key]} onChange={() => toggleNotif(key)} className="h-5 w-5 accent-[#7d5027]" />
+            <span>
+              {label}
+              {comingSoon ? <span className="text-neutral-400"> — coming soon</span> : null}
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.notifications[key]}
+              onChange={() => toggleNotif(key)}
+              disabled={comingSoon}
+              className="h-5 w-5 accent-[#7d5027] disabled:opacity-40"
+            />
           </label>
         ))}
       </section>

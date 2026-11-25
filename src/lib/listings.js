@@ -426,11 +426,17 @@ export async function reviewVerification(userId, status) {
   return true;
 }
 
-// Signed URL for one ID photo in the private bucket. The link works
-// for `expiresInSeconds` (default 1 hour) and then stops working —
-// the photo is never public. Returns null when there is no photo.
+// Signed URL for one ID photo in the private bucket. Team only —
+// the only caller is the /admin photo viewer. Storage RLS also
+// refuses a non-team caller, but never mint a signed URL for a
+// photo the caller was not allowed to ask for: a signed URL, once
+// minted, is a bearer link that works for anyone who holds it
+// until it expires. The link works for `expiresInSeconds`
+// (default 1 hour) and then stops working — the photo is never
+// public. Returns null when there is no photo.
 export async function verificationIdPhotoUrl(path, expiresInSeconds = 3600) {
   if (!supabase || !path) return null;
+  await requireOwner();
   const { data, error } = await supabase.storage
     .from(VERIFICATION_IDS_BUCKET)
     .createSignedUrl(path, expiresInSeconds);
@@ -513,7 +519,7 @@ export async function createListingRow(row) {
   // unchecked.
   const { data: verification, error: verificationError } = await supabase
     .from("verifications")
-    .select("user_id, status")
+    .select("user_id, status, flagged")
     .eq("user_id", row.seller_id)
     .maybeSingle();
   if (verificationError) {
@@ -530,6 +536,17 @@ export async function createListingRow(row) {
   if (verification.status !== "approved") {
     throw new Error(
       "Your verification is under review — you can sell once the team approves it."
+    );
+  }
+  // A flagged account (5 wrong handoff codes) is under team review:
+  // no new listings until the team clears it — the same rule as
+  // startConversation in chat.js, and the same as the buyer side
+  // of the order rules. (The database listing trigger does not
+  // check flagged yet — see the Milestone 18 notes — so the app
+  // enforces it here and the trigger is the backstop to add.)
+  if (verification.flagged) {
+    throw new Error(
+      "Your account is under review — contact support before posting a new listing."
     );
   }
   validateListingKeys(

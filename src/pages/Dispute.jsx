@@ -255,6 +255,46 @@ export default function Dispute() {
     );
   }
 
+  // A report freezes money, so there has to be money in play: a
+  // 'reserved' order has not started (cancel it instead) and a
+  // closed order's money has already moved. Say so here instead of
+  // showing a form that can only fail on submit.
+  const DISPUTABLE_STATUSES = ["paid", "held", "shipped", "delivered"];
+  if (!DISPUTABLE_STATUSES.includes(order.status)) {
+    return (
+      <main className="mx-auto max-w-2xl px-4 py-6">
+        <h1 className="text-xl font-bold">Report a problem</h1>
+        <p className="mt-4 text-sm text-neutral-500">
+          {order.status === "reserved"
+            ? "This order has not started yet — cancel it from the order page if you no longer want it."
+            : "This order is already closed — email pulsemarketsupport@gmail.com with the order code and the team will look into it."}
+        </p>
+        <div className="mt-4">
+          <Link to={`/order/${order.id}`}>
+            <GhostButton>Back to order</GhostButton>
+          </Link>
+        </div>
+      </main>
+    );
+  }
+
+  // What the form needs before it can send — shown plainly next to
+  // the button, so the student is not left tapping "Send report"
+  // only to be refused. The server-side checks in fileDispute stay
+  // as the backstop: a packing or unboxing video does NOT count
+  // here, only a verified dispute video does.
+  const hasVerifiedDisputeVideo = evidence.some(
+    (r) => r.kind === "dispute" && r.verified === true
+  );
+  const explanationOk = explanation.trim().length >= 20;
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+  const canSend = explanationOk && emailValid && hasVerifiedDisputeVideo;
+  const sendBlockers = [
+    !explanationOk ? "explain what happened (at least 20 characters)" : null,
+    !emailValid ? "enter a valid email for the reply" : null,
+    !hasVerifiedDisputeVideo ? "record a verified dispute video below (10–20 seconds)" : null,
+  ].filter(Boolean);
+
   return (
     <main className="mx-auto max-w-2xl px-4 py-6">
       <h1 className="text-xl font-bold">Report a problem</h1>
@@ -322,6 +362,15 @@ export default function Dispute() {
             A report needs at least one piece of evidence recorded in the app.{" "}
             {DISPUTE_RULE.ruleText}
           </p>
+          {hasVerifiedDisputeVideo ? (
+            <p className="mt-2 text-sm font-semibold text-brown-dark">
+              ✓ Verified dispute video ready — your report can be sent.
+            </p>
+          ) : (
+            <p className="mt-2 text-sm text-neutral-500">
+              No verified dispute video yet — record one below (10–20 seconds). Other videos or photos on this order do not count for a report.
+            </p>
+          )}
 
           {evidence.length === 0 ? (
             <p className="mt-2 text-sm text-neutral-500">
@@ -407,7 +456,15 @@ export default function Dispute() {
                     : "ready to save."}
                 </p>
                 <div className="mt-2 flex justify-center gap-2">
-                  <PrimaryButton type="button" onClick={uploadClip} disabled={clipBusy}>
+                  <PrimaryButton
+                    type="button"
+                    onClick={uploadClip}
+                    disabled={
+                      clipBusy ||
+                      clip.durationSeconds < DISPUTE_RULE.minSeconds ||
+                      clip.durationSeconds > DISPUTE_RULE.maxSeconds
+                    }
+                  >
                     {clipBusy ? "Saving…" : "Save this video"}
                   </PrimaryButton>
                   <GhostButton type="button" onClick={resetClip} disabled={clipBusy}>
@@ -429,9 +486,14 @@ export default function Dispute() {
 
         {error ? <p className="text-sm text-red-600">{error}</p> : null}
 
-        <PrimaryButton type="submit" disabled={submitting}>
+        <PrimaryButton type="submit" disabled={submitting || !canSend}>
           {submitting ? "Sending…" : "Send report"}
         </PrimaryButton>
+        {!canSend && !submitting ? (
+          <p className="text-sm text-neutral-500">
+            To send this report, {sendBlockers.join("; ")}.
+          </p>
+        ) : null}
       </form>
 
       <p className="mt-8 text-center text-xs text-neutral-500">

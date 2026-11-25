@@ -84,12 +84,15 @@ export default function Dashboard() {
   }
 
   async function remove(listing) {
+    // Busy check first: asking "are you sure?" and then doing
+    // nothing (because another action was already running) is a
+    // confusing dead end.
+    if (busyId) return;
     // Deleting is permanent — ask first. (The listing detail page
     // already asks with a two-tap confirm; this page had none.)
     if (!window.confirm(`Delete "${listing.title}"? This cannot be undone.`)) return;
     // No busy guard before: a double-click deleted twice, and the
     // second call's "not found" error replaced the success.
-    if (busyId) return;
     setBusyId(listing.id);
     setError("");
     try {

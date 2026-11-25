@@ -103,7 +103,7 @@ export default function Wallet() {
 
       {showWithdraw && (
         <div className="rounded-2xl border border-brown bg-brown-soft p-4">
-          <h2 className="text-lg font-bold">Withdraw {formatNaira(balances.available)}</h2>
+          <h2 className="text-lg font-bold">Request a withdrawal — {formatNaira(balances.available)}</h2>
           <p className="mt-1 text-sm">
             Withdrawals are paid manually by the PulseMarket team. Email{" "}
             <span className="font-semibold underline">{OWNER_EMAIL}</span> with the

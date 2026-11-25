@@ -28,21 +28,25 @@ export async function getBalances(userId) {
   return balances;
 }
 
-// Newest first, at most 200 rows. The wallet page renders every row,
-// so an unbounded fetch grows with every order the student ever has.
-export async function fetchLedger(userId) {
+// Newest first, at most 200 rows per page. Pass `before` (a
+// created_at value from the last row) to fetch the next page —
+// without it a student with more than 200 ledger rows silently
+// sees only the newest 200. The returned array carries `hasMore`
+// (true when a full page came back, so another page may exist).
+export async function fetchLedger(userId, { before } = {}) {
   if (!supabase || !userId) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from("wallet_ledger")
     .select("*, orders(code)")
     .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(200);
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(200);
   if (error) {
     dbError(error, "fetch wallet ledger");
     return [];
   }
-  return (data || []).map((row) => ({
+  const rows = (data || []).map((row) => ({
     id: row.id,
     orderId: row.order_id,
     orderCode: row.orders?.code || null,
@@ -53,4 +57,6 @@ export async function fetchLedger(userId) {
     note: row.note,
     createdAt: row.created_at,
   }));
+  rows.hasMore = (data || []).length === 200;
+  return rows;
 }

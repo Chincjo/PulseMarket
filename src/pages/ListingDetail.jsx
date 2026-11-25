@@ -357,7 +357,7 @@ export default function ListingDetail() {
           <span>{formatNaira(held.secureFee)}</span>
         </p>
         <p className="mt-1 flex justify-between font-bold">
-          <span>Pay through the app (held)</span>
+          <span>Pay through the app (held, before shipping)</span>
           <span>{formatNaira(held.total)}</span>
         </p>
         <p className="mt-1 text-neutral-500">

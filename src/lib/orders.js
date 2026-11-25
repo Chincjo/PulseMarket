@@ -145,6 +145,30 @@ async function updateOrder(id, patch) {
   return data;
 }
 
+async function currentUserId() {
+  if (!supabase) return null;
+  const { data } = await supabase.auth.getUser();
+  return data?.user?.id || null;
+}
+
+// The delivery PIN belongs to the buyer only (they share it with the
+// courier at handover). Page-facing reads strip it from any order
+// the signed-in user did not buy — the PIN never sits in a seller's
+// or the team's page state. Internal money functions keep using
+// readOrder() (full row); only the buyer-only PIN check
+// (confirmDeliveryWithPin, in shipping.js) ever reads the PIN, and
+// it reads it through its own readOrder(). A direct API call still
+// returns the full row (see the coordinator's report: hiding it
+// from a determined caller needs a server-side fetch), and the
+// order-update trigger already refuses any delivery confirmation
+// that is not the buyer's.
+function withoutPin(order, viewerId) {
+  if (!order || !("delivery_pin" in order)) return order;
+  if (viewerId && order.buyer_id === viewerId) return order;
+  const { delivery_pin: _delivery_pin, ...rest } = order;
+  return rest;
+}
+
 // ---------------------------------------------------------------------------
 // Create + read
 // ---------------------------------------------------------------------------
@@ -295,22 +319,32 @@ export async function createOrder({
 }
 
 export async function fetchOrder(id) {
-  return readOrder(id);
+  const order = await readOrder(id);
+  if (!order) return null;
+  return withoutPin(order, await currentUserId());
 }
 
-export async function fetchMyOrders(userId) {
+// Newest first, at most 200 rows per page. Pass `before` (a
+// created_at value from the last row) to fetch the next page —
+// without it a student with more than 200 orders silently sees
+// only the newest 200. The returned array carries `hasMore`
+// (true when a full page came back, so another page may exist).
+export async function fetchMyOrders(userId, { before } = {}) {
   if (!supabase || !userId) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from("orders")
     .select("*")
     .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
-    .order("created_at", { ascending: false })
-    .limit(200);
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(200);
   if (error) {
     dbError(error, "fetch my orders");
     return [];
   }
-  return data || [];
+  const rows = (data || []).map((o) => withoutPin(o, userId));
+  rows.hasMore = (data || []).length === 200;
+  return rows;
 }
 
 export async function fetchOrdersForListing(listingId) {
@@ -325,7 +359,8 @@ export async function fetchOrdersForListing(listingId) {
     dbError(error, "fetch orders for listing");
     return [];
   }
-  return data || [];
+  const viewerId = await currentUserId();
+  return (data || []).map((o) => withoutPin(o, viewerId));
 }
 
 // ---------------------------------------------------------------------------
@@ -838,20 +873,237 @@ export async function fetchHeldOrders(user) {
   return data || [];
 }
 
-// Buyer only, while the order is still 'reserved' or 'paid'. The listing
-// goes back to 'active'. In manual mode a 'paid' order has no hold entry
-// yet, so cancelling it just cancels — but if a hold entry ever exists
-// for this order it is reversed with a matching negative entry.
-export async function cancelOrder(orderId, userId) {
+// Team-only read: held orders that shipped more than `olderThanDays`
+// ago and whose buyer still has not confirmed delivery — the
+// shipped-with-no-exit case. Nothing auto-releases or auto-refunds
+// them: auto_release_overdue_orders() and runAutoReleaseCheck()
+// only ever touch 'delivered' orders, and a shipped order has no
+// auto-exit by design (auto-confirming would pay the seller for a
+// parcel the buyer may never have received; auto-refunding would
+// pay the buyer for a parcel the seller did ship). The team sees
+// the list, nudges the buyer, and then either the buyer confirms
+// or the team resolves it by hand. The buyer can already force an
+// exit themselves by opening a return once the order has shipped.
+// Wiring for the coordinator: render this in /admin next to
+// fetchHeldOrders, and the owner decides the nudge-then-what rule
+// (see the report). Each row carries `daysWaiting`.
+export const STALE_SHIPPED_DAYS = 7;
+
+export async function fetchStaleShippedOrders(user, olderThanDays = STALE_SHIPPED_DAYS) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!isOwner(user)) {
+    throw new Error("This page is not available.");
+  }
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("status", "shipped")
+    .eq("payment_method", "held")
+    .order("shipping_proof_at", { ascending: true })
+    .limit(200);
+  if (error) throw error;
+  const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+  const rows = [];
+  for (const order of data || []) {
+    const shippedAt = new Date(
+      order.shipping_proof_at || order.updated_at || order.created_at
+    ).getTime();
+    if (Number.isNaN(shippedAt) || shippedAt > cutoff) continue;
+    rows.push({
+      ...withoutPin(order, null),
+      daysWaiting: Math.floor((Date.now() - shippedAt) / (24 * 60 * 60 * 1000)),
+    });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Stuck money — app-side reconcile for the two-step money moves.
+// Every money action writes the ledger first and updates the order
+// status second, so a crash (or a dropped network) between the two
+// leaves the money moved and the status behind. Each action already
+// recovers when it is retried — confirmReceipt / releaseOrder /
+// refundHeldOrder / resolveReturn all check for the half-written
+// move first and finish it instead of moving money twice — but
+// nobody went looking for stuck orders. These two helpers do:
+// fetchStuckMoneyOrders lists them for the team; reconcileOrder
+// finishes the one half-move it finds by re-running the same
+// idempotent action. The full close is a server-side release RPC
+// that writes both legs and the status in one transaction (see the
+// coordinator's report) — this bounds the window to "until the
+// team reconciles", it does not remove it.
+// ---------------------------------------------------------------------------
+
+// Team-only: orders whose ledger and status disagree — the money
+// moved, the status update never landed. Three shapes, all
+// recoverable by re-running the matching action:
+//   paid + hold row     -> the transfer was confirmed, the order
+//                          still says 'paid' (confirmReceipt);
+//   held + refund row   -> the refund moved, the order still says
+//                          'held' (refundHeldOrder);
+//   delivered + release -> the release moved, the order still says
+//                          'delivered' (releaseOrder — the app-side
+//                          auto-release check already closes these
+//                          on any participant's app open).
+// Returns [{ order, problem, action }] with `problem` in plain words.
+export async function fetchStuckMoneyOrders(user) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!isOwner(user)) {
+    throw new Error("This page is not available.");
+  }
+  const { data: orders, error } = await supabase
+    .from("orders")
+    .select("*")
+    .in("status", ["paid", "held", "delivered"])
+    .eq("payment_method", "held")
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  const list = orders || [];
+  if (list.length === 0) return [];
+  const ids = list.map((o) => o.id);
+  const { data: legs } = await supabase
+    .from("wallet_ledger")
+    .select("order_id, kind, bucket")
+    .in("order_id", ids)
+    .in("kind", ["hold", "release", "refund"]);
+  const kindsByOrder = new Map();
+  for (const row of legs || []) {
+    if (!kindsByOrder.has(row.order_id)) kindsByOrder.set(row.order_id, new Set());
+    kindsByOrder.get(row.order_id).add(`${row.kind}:${row.bucket}`);
+  }
+  const stuck = [];
+  for (const order of list) {
+    const kinds = kindsByOrder.get(order.id) || new Set();
+    if (order.status === "paid" && kinds.has("hold:held")) {
+      stuck.push({
+        order: withoutPin(order, null),
+        problem: "The transfer was confirmed and the money is held, but the order still says 'paid'.",
+        action: "confirm-receipt",
+      });
+    } else if (order.status === "held" && kinds.has("refund:held")) {
+      stuck.push({
+        order: withoutPin(order, null),
+        problem: "The refund was already paid, but the order still says 'held'.",
+        action: "refund-held",
+      });
+    } else if (order.status === "delivered" && kinds.has("release:held")) {
+      stuck.push({
+        order: withoutPin(order, null),
+        problem: "The money was already released to the seller, but the order still says 'delivered'.",
+        action: "release",
+      });
+    }
+  }
+  return stuck;
+}
+
+// Team-only: finish one stuck order's half-written money move by
+// re-running the matching action, which is already idempotent —
+// the money is never moved twice. Returns { order, action, note };
+// action is 'none' when the order has no half-finished move.
+// A stuck order behind an open return or a frozen dispute is
+// refused in plain words: the team resolves that first.
+export async function reconcileOrder(orderId, user) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!isOwner(user)) {
+    throw new Error("Only the PulseMarket team can reconcile an order.");
+  }
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
-  if (userId && order.buyer_id !== userId) {
-    throw new Error("Only the buyer can cancel this order.");
+  if (order.payment_method !== "held") {
+    return {
+      order: withoutPin(order, user?.id),
+      action: "none",
+      note: "Cash orders hold no money — there is nothing to reconcile.",
+    };
+  }
+  const { data: legs } = await supabase
+    .from("wallet_ledger")
+    .select("kind, bucket")
+    .eq("order_id", order.id)
+    .in("kind", ["hold", "release", "refund"]);
+  const has = (kind, bucket) =>
+    (legs || []).some((r) => r.kind === kind && r.bucket === bucket);
+  if (order.status === "paid" && has("hold", "held")) {
+    const done = await confirmReceipt(orderId, user);
+    return {
+      order: withoutPin(done, user?.id),
+      action: "confirm-receipt",
+      note: "The hold was already written — this just finished the status update. No money moved twice.",
+    };
+  }
+  if (order.status === "held" && has("refund", "held")) {
+    const done = await refundHeldOrder(orderId, user);
+    return {
+      order: withoutPin(done.order || done, user?.id),
+      action: "refund-held",
+      note: "The refund was already paid — this just closed the order out. No money moved twice.",
+    };
+  }
+  if (order.status === "delivered" && has("release", "held")) {
+    const done = await releaseOrder(orderId, user);
+    return {
+      order: withoutPin(done, user?.id),
+      action: "release",
+      note: "The release was already paid — this just closed the order out. No money moved twice.",
+    };
+  }
+  return {
+    order: withoutPin(order, user?.id),
+    action: "none",
+    note: "No half-finished money move found for this order.",
+  };
+}
+
+// Cancel an order and put the listing back up for sale.
+// Who may cancel, and from where:
+//   - the BUYER, from 'reserved' or 'paid' (as before — the buyer
+//     can change their mind before the money is held);
+//   - the SELLER, from 'reserved' only. A reserved order is the
+//     bricked-listing case: the buyer reserved the item and then
+//     went quiet, and until now only the buyer could cancel, so the
+//     listing sat reserved for ever. A seller must NOT cancel from
+//     'paid' — the buyer may already have transferred the money,
+//     and only the team can unwind a transfer;
+//   - the PulseMarket TEAM (owner), from 'reserved' or 'paid' —
+//     the team holds any transfer, so the team can cancel and
+//     return it by hand. The buyer is told so in the notification.
+// Pass the signed-in user object; a plain user id still works for
+// the buyer-only legacy call (OrderDetail passes user.id today).
+// The database trigger must allow the new moves too — until
+// milestone-18 adds the seller / owner branches to
+// pm_validate_order_update, the database refuses them (see the
+// coordinator's report for the exact SQL). A frozen order (open
+// dispute) still cannot be cancelled by anyone. In manual mode a
+// 'paid' order has no hold entry yet, so cancelling it just
+// cancels — but if a hold entry ever exists for this order it is
+// reversed with a matching negative entry.
+export async function cancelOrder(orderId, user) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  const userId = typeof user === "string" ? user : user?.id;
+  const userEmail = typeof user === "object" && user ? user.email : null;
+  const isBuyer = Boolean(userId) && order.buyer_id === userId;
+  const isSeller = Boolean(userId) && order.seller_id === userId;
+  const isTeam = userEmail === OWNER_EMAIL;
+  if (!isBuyer && !isSeller && !isTeam) {
+    throw new Error("Only the buyer, the seller or the PulseMarket team can cancel this order.");
   }
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
-  if (!["reserved", "paid"].includes(order.status)) {
+  // The seller can only cancel while nothing has been paid: once
+  // the buyer has marked the order paid, only the team can cancel
+  // (the team holds the transfer and returns it by hand).
+  const allowedStatuses =
+    isBuyer || isTeam ? ["reserved", "paid"] : ["reserved"];
+  if (!allowedStatuses.includes(order.status)) {
+    if (isSeller) {
+      throw new Error(
+        `This order is ${order.status} — the seller can only cancel while it is still reserved. The buyer has already paid, so only the PulseMarket team can cancel it now.`
+      );
+    }
     throw new Error(`This order is ${order.status} — it can no longer be cancelled.`);
   }
   if (supabase) {
@@ -897,5 +1149,28 @@ export async function cancelOrder(orderId, userId) {
   } catch (err) {
     console.error("[PulseMarket] cancel: could not put listing back to active:", err?.message || err);
   }
-  return updated;
+  // Tell the other side, in plain words. A team cancel of a paid
+  // order must say the transfer is coming back — the buyer paid
+  // real money and the team returns it by hand.
+  if (isBuyer) {
+    notifyUser(order.seller_id, {
+      kind: "order",
+      title: "Order cancelled",
+      body: `The buyer cancelled order ${order.code} — the item is listed again.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+  } else {
+    notifyUser(order.buyer_id, {
+      kind: "order",
+      title: "Order cancelled",
+      body:
+        order.status === "paid" && isTeam
+          ? `The PulseMarket team cancelled order ${order.code} — if you already transferred the money, the team will return it to you. Email ${OWNER_EMAIL} if it does not arrive.`
+          : `The ${isTeam ? "PulseMarket team" : "seller"} cancelled order ${order.code} — the item is listed again.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+  }
+  return withoutPin(updated, userId);
 }

@@ -139,6 +139,14 @@ export default function Search() {
           </p>
         ) : null}
       </div>
+      {/* A state filter on another state hides that state's
+          same-state-only listings (they cannot reach a buyer in a
+          different state) — say so, or the search looks broken. */}
+      {state && myState && state !== myState ? (
+        <p className="text-sm text-neutral-500">
+          Listings that only sell in {state} are hidden — you are in {myState}, so only listings from {state} that ship nationwide can reach you.
+        </p>
+      ) : null}
       {!loading && results.length === 0 ? (
         <EmptyState
           title="No listings match yet"

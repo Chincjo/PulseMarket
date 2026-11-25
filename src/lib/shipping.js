@@ -165,7 +165,7 @@ export function courierTiers(itemPrice) {
   if (price < 10000) {
     return {
       tier: 2,
-      label: "Tier 2 — Peace or ABC",
+      label: "Tier 2 — Peace or ABC (cheapest); GIG, GUO and DHL also allowed",
       allowedCouriers: [
         "Peace Logistics",
         "ABC Transport",
@@ -240,6 +240,75 @@ export async function uploadEvidencePhoto(userId, orderId, fileOrDataUrl, label)
   return data.publicUrl;
 }
 
+// The delivery PIN belongs to the buyer only (they share it with the
+// courier at handover). Seller-facing reads strip it from the order
+// object so the PIN never sits in the seller's page state — the
+// database still returns the full row to a direct API call (see the
+// coordinator's report: hiding it from a determined caller needs a
+// server-side fetch), and the trigger already refuses any delivery
+// confirmation that is not the buyer's. Buyer-only functions
+// (confirmDeliveryWithPin) read the order through readOrder() and
+// are untouched by this.
+function withoutDeliveryPin(order) {
+  if (!order || !("delivery_pin" in order)) return order;
+  const { delivery_pin: _delivery_pin, ...rest } = order;
+  return rest;
+}
+
+// ---------------------------------------------------------------------------
+// Waybill Snap photo checks — cheap app-side friction against a fake
+// shipping advance (no OCR anywhere in this flow, so these checks
+// cannot prove the parcel exists; they only make the easy fakes fail).
+//   1. The file must actually be a photo: JPEG / PNG / GIF / WebP /
+//      HEIC magic bytes. A renamed video, PDF or text file uploaded
+//      as "image/jpeg" used to sail through.
+//   2. The waybill photo and the receipt photo must not be the same
+//      file uploaded twice.
+//   3. A waybill number may only ever be used for one order (checked
+//      again below, before the proof is saved).
+// ---------------------------------------------------------------------------
+async function assertRealPhoto(blob, label) {
+  if (!blob || blob.size < 512) {
+    throw new Error(
+      `That ${label} photo does not look like a photo — take it again with the camera.`
+    );
+  }
+  const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+  const isJpeg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;
+  const isPng =
+    head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47;
+  const isGif =
+    head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38;
+  const isWebp =
+    head[0] === 0x52 &&
+    head[1] === 0x49 &&
+    head[2] === 0x46 &&
+    head[3] === 0x46 &&
+    head[8] === 0x57 &&
+    head[9] === 0x45 &&
+    head[10] === 0x42 &&
+    head[11] === 0x50;
+  // HEIC / HEIF (iPhone photos): bytes 4-7 are the "ftyp" box marker.
+  const isHeic =
+    head[4] === 0x66 && head[5] === 0x74 && head[6] === 0x79 && head[7] === 0x70;
+  if (!isJpeg && !isPng && !isGif && !isWebp && !isHeic) {
+    throw new Error(
+      `That ${label} file does not look like a photo — take it again with the camera instead of uploading another kind of file.`
+    );
+  }
+}
+
+async function sameBytes(a, b) {
+  if (!a || !b || a.size !== b.size) return false;
+  const [x, y] = await Promise.all([a.arrayBuffer(), b.arrayBuffer()]);
+  const xa = new Uint8Array(x);
+  const ya = new Uint8Array(y);
+  for (let i = 0; i < xa.length; i++) {
+    if (xa[i] !== ya[i]) return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Shipping proof — seller only, order must be 'held'.
 // ---------------------------------------------------------------------------
@@ -287,8 +356,33 @@ export async function submitShippingProof(
   if (!waybill) {
     throw new Error("Type in the waybill number from the paper waybill.");
   }
+  if (waybill.length < 4) {
+    throw new Error("That waybill number looks too short — type the full number from the paper waybill.");
+  }
   if (waybill.length > 64) {
     throw new Error("Keep the waybill number under 64 characters.");
+  }
+  // One waybill number, one order: a number already used for another
+  // order of this seller is either a typo or the same parcel being
+  // "shipped" twice to take two advances. (Best effort in the app —
+  // a direct API call skips it, so the hard backstop is the partial
+  // unique index on orders.waybill_number proposed for milestone-18.)
+  if (supabase) {
+    const { data: reuse, error: reuseError } = await supabase
+      .from("orders")
+      .select("id, code")
+      .eq("seller_id", user.id)
+      .eq("waybill_number", waybill)
+      .neq("id", order.id)
+      .limit(1);
+    if (!reuseError && reuse && reuse.length > 0) {
+      throw new Error(
+        `That waybill number was already used for order ${reuse[0].code} — check the number on the paper waybill.`
+      );
+    }
+    if (reuseError) {
+      console.error("[PulseMarket] shipping proof: could not check waybill reuse:", reuseError.message || reuseError);
+    }
   }
   const cleanDriverPhone = driverPhone ? String(driverPhone).trim() : "";
   if (cleanDriverPhone && !/^\+?[0-9][0-9 ()-]{6,14}$/.test(cleanDriverPhone)) {
@@ -297,10 +391,22 @@ export async function submitShippingProof(
   if (!waybillPhoto) {
     throw new Error("Take a photo of the waybill — hold the paper steady, good light, all four corners visible.");
   }
+  // The photos must really be photos, and the receipt must not be
+  // the waybill photo uploaded a second time. Convert once here so
+  // the checks and the uploads all see the same bytes.
+  const waybillBlob = await toBlob(waybillPhoto);
+  await assertRealPhoto(waybillBlob, "waybill");
+  const receiptBlob = receiptPhoto ? await toBlob(receiptPhoto) : null;
+  if (receiptBlob) {
+    await assertRealPhoto(receiptBlob, "receipt");
+    if (await sameBytes(waybillBlob, receiptBlob)) {
+      throw new Error("The receipt photo looks identical to the waybill photo — take a photo of the receipt itself, not the waybill again.");
+    }
+  }
 
-  const waybillUrl = await uploadEvidencePhoto(user.id, order.id, waybillPhoto, "waybill");
-  const receiptUrl = receiptPhoto
-    ? await uploadEvidencePhoto(user.id, order.id, receiptPhoto, "receipt")
+  const waybillUrl = await uploadEvidencePhoto(user.id, order.id, waybillBlob, "waybill");
+  const receiptUrl = receiptBlob
+    ? await uploadEvidencePhoto(user.id, order.id, receiptBlob, "receipt")
     : null;
 
   // The advance is earned only with a complete proof: a tracked courier
@@ -336,7 +442,7 @@ export async function submitShippingProof(
     const fresh = await readOrder(orderId);
     if (fresh && ["shipped", "delivered"].includes(fresh.status) && fresh.waybill_number) {
       return {
-        order: fresh,
+        order: withoutDeliveryPin(fresh),
         advanceReleased: Boolean(fresh.shipping_advance_released),
         reason: "Shipping proof was already submitted for this order — the order is shipped.",
       };
@@ -417,7 +523,9 @@ export async function submitShippingProof(
     }
   }
   const fresh = (await readOrder(orderId)) || shipped;
-  return { order: fresh, advanceReleased, advancePending, reason };
+  // Seller-facing return: the buyer-only delivery PIN is stripped
+  // (see withoutDeliveryPin above).
+  return { order: withoutDeliveryPin(fresh), advanceReleased, advancePending, reason };
 }
 
 // Release a shipping advance that is still owed after the proof was
@@ -444,7 +552,7 @@ export async function retryShippingAdvance(orderId) {
   }
   if (order.shipping_advance_released) {
     return {
-      order,
+      order: withoutDeliveryPin(order),
       advanceReleased: true,
       reason: "The 50% shipping advance was already released to your available balance.",
     };
@@ -489,13 +597,13 @@ export async function retryShippingAdvance(orderId) {
     // The flag-only update needs supabase/milestone-15.sql. The
     // money has still moved — say so plainly instead of failing.
     return {
-      order: (await readOrder(orderId)) || order,
+      order: withoutDeliveryPin((await readOrder(orderId)) || order),
       advanceReleased: true,
       reason: `The 50% shipping advance (${advanceAmount.toLocaleString("en-NG")} naira) is in your available balance. The tracking page will show it once the database update is run.`,
     };
   }
   return {
-    order: (await readOrder(orderId)) || order,
+    order: withoutDeliveryPin((await readOrder(orderId)) || order),
     advanceReleased: true,
     reason: `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`,
   };
@@ -569,12 +677,16 @@ export async function fetchCheckpoints(orderId) {
   return data || [];
 }
 
-// Order + checkpoints together, for the tracking page.
+// Order + checkpoints together, for the tracking page. The buyer
+// sees the delivery PIN; anyone else gets the order without it.
 export async function fetchTracking(orderId) {
   const order = await readOrder(orderId);
   if (!order) return null;
   const checkpoints = await fetchCheckpoints(orderId);
-  return { order, checkpoints };
+  const viewer = await currentUser();
+  const safeOrder =
+    viewer && order.buyer_id === viewer.id ? order : withoutDeliveryPin(order);
+  return { order: safeOrder, checkpoints };
 }
 
 // ---------------------------------------------------------------------------
@@ -929,4 +1041,34 @@ export async function sellerDebtAmount(sellerId) {
     if (row.kind === "repayment") owed -= Number(row.amount) || 0;
   }
   return Math.max(0, owed);
+}
+
+// Debt gate — ready to wire, not yet wired (see the coordinator's
+// report). Call sites the coordinator owns:
+//   1. Sell.jsx, before createListingRow(): a seller who still owes
+//      money from an earlier order must not list a new item until
+//      the team settles the debt.
+//      `await assertSellerClearOfDebt(user.id);`
+//   2. The manual withdrawal step (Wallet.jsx): withdrawals are paid
+//      by hand by the team, so there is no in-app withdraw function
+//      to gate — the team checks sellerDebtAmount() before paying
+//      any withdrawal, and holds the payout while debt is outstanding.
+//   The wallet math already nets debt: a debt row is a negative
+//   'available' entry, so getBalances() already subtracts what is
+//   owed — a seller cannot withdraw more than the net available
+//   balance. What the gate adds is stopping NEW earnings while a
+//   debt is unpaid, not fixing a double-spend.
+export async function sellerDebtGate(sellerId) {
+  const amount = await sellerDebtAmount(sellerId);
+  return { hasDebt: amount > 0, amount };
+}
+
+export async function assertSellerClearOfDebt(sellerId) {
+  const { hasDebt, amount } = await sellerDebtGate(sellerId);
+  if (hasDebt) {
+    throw new Error(
+      `You owe ${amount.toLocaleString("en-NG")} naira back to PulseMarket from an earlier order — settle it with the PulseMarket team first, then list again.`
+    );
+  }
+  return true;
 }

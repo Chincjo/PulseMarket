@@ -185,20 +185,26 @@ export async function notifyUser(userId, { kind, title, body, link, orderId, con
   return data ? { id: data } : null;
 }
 
-// Newest first, at most 100 rows.
-export async function fetchNotifications(userId) {
+// Newest first, at most 100 rows per page. Pass `before` (a
+// created_at value from the last row) to fetch the next page —
+// without it a student with more than 100 notifications silently
+// sees only the newest 100. The returned array carries `hasMore`.
+export async function fetchNotifications(userId, { before } = {}) {
   if (!supabase || !userId) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from("notifications")
     .select("*")
     .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(100);
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(100);
   if (error) {
     dbError(error, "fetch notifications");
     return [];
   }
-  return data || [];
+  const rows = data || [];
+  rows.hasMore = rows.length === 100;
+  return rows;
 }
 
 export async function fetchUnreadCount(userId) {

@@ -199,6 +199,19 @@ export default function Handoff() {
       />
     );
   }
+  if (["cancelled", "refunded"].includes(order.status)) {
+    return (
+      <div className="space-y-5">
+        <Link to={`/order/${order.id}`} className="text-sm font-semibold text-brown">
+          ← Back to order
+        </Link>
+        <EmptyState
+          title="This order is closed"
+          body={`This order is ${order.status}, so there is no handoff left to do.`}
+        />
+      </div>
+    );
+  }
   if (order.delivery_method !== "meetup") {
     return (
       <div className="space-y-5">
@@ -334,9 +347,12 @@ export default function Handoff() {
                   disabled={locked || busy !== ""}
                   onClick={() => scanInputRef.current?.click()}
                 >
-                  Scan with camera
+                  Photograph the QR code
                 </GhostButton>
               </div>
+              <p className="mt-2 text-xs text-neutral-500">
+                The photo is not decoded — read the code on the seller's phone and type it in the box above.
+              </p>
               <input
                 ref={scanInputRef}
                 type="file"
@@ -368,7 +384,7 @@ export default function Handoff() {
         <h2 className="text-lg font-bold">Handover photo</h2>
         <p className="mt-1 text-sm text-neutral-500">
           Take a photo of the handover with your camera — the item changing
-          hands. Photos from your gallery are not accepted; use the camera.
+          hands.
         </p>
         {(myPhotoPreview || myPhotoUrl) && (
           <img
@@ -379,10 +395,16 @@ export default function Handoff() {
         )}
         <div className="mt-3">
           <GhostButton
-            disabled={busy !== "" || locked}
+            disabled={busy !== "" || locked || myConfirmed}
             onClick={() => photoInputRef.current?.click()}
           >
-            {busy === "photo" ? "Saving photo…" : myPhotoDone ? "Retake photo" : "Take photo with camera"}
+            {busy === "photo"
+              ? "Saving photo…"
+              : myConfirmed
+                ? "Photo locked — you already confirmed"
+                : myPhotoDone
+                  ? "Retake photo"
+                  : "Take photo with camera"}
           </GhostButton>
         </div>
         <input

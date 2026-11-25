@@ -62,7 +62,9 @@ export default function Profile({ user }) {
               </div>
               <div className="flex justify-between rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
                 <span className="text-neutral-500">Invite code</span>
-                <span className="font-semibold">{verification.inviteCode || "—"}</span>
+                <Link to="/invite" className="font-semibold text-brown underline">
+                  {verification.inviteCode || "Get your invite code"}
+                </Link>
               </div>
             </>
           ) : null}

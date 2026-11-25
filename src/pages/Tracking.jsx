@@ -343,7 +343,7 @@ export default function Tracking() {
               </>
             ) : (
               <p className="mt-1 text-sm text-neutral-500">
-                No rider assigned yet — the seller adds the rider's name and phone when the rider picks up.
+                No rider assigned yet — rider details cannot be added in the app yet. Ask the seller in chat for the rider's name and phone number.
               </p>
             )}
           </div>

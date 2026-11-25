@@ -206,10 +206,21 @@ export function recordVideo({ onData, onTick, maxSeconds } = {}) {
   let recorder = null;
   let timer = null;
   let stopped = false;
-  const startedAt = Date.now();
+  // The clock starts when the recording itself starts, not when the
+  // camera is asked for: the permission dialog can sit open for
+  // seconds, and counting that time made a short clip look long
+  // enough to pass (or a good clip look too long) before the real
+  // length was measured.
+  let startedAt = null;
+  // Stop pressed while the camera permission dialog is still open:
+  // there is no recorder yet to stop, so remember the request and
+  // act on it as soon as the camera opens instead of recording to
+  // the maximum with no way out.
+  let stopRequested = false;
   const chunks = [];
 
   function elapsedSeconds() {
+    if (!startedAt) return 0;
     return Math.floor((Date.now() - startedAt) / 1000);
   }
 
@@ -263,6 +274,10 @@ export function recordVideo({ onData, onTick, maxSeconds } = {}) {
         "Camera not available — allow camera access or use the photo option."
       );
     }
+    if (stopRequested) {
+      cleanup();
+      throw new Error("Recording stopped before it started.");
+    }
     if (onData) onData(stream);
     const mimeType = pickMimeType();
     try {
@@ -287,6 +302,7 @@ export function recordVideo({ onData, onTick, maxSeconds } = {}) {
     const done = new Promise((resolve) => {
       recorder.onstop = () => finish(resolve);
     });
+    startedAt = Date.now();
     recorder.start(250);
     return done;
   })();
@@ -294,6 +310,7 @@ export function recordVideo({ onData, onTick, maxSeconds } = {}) {
   // Stop early from a Stop button: .stop() ends the recording and the
   // promise resolves with the clip recorded so far.
   promise.stop = () => {
+    stopRequested = true;
     if (recorder && recorder.state !== "inactive") {
       try {
         recorder.stop();
@@ -378,9 +395,19 @@ async function measureVideoDuration(blob) {
         // MediaRecorder webm files often report Infinity until the
         // player seeks: jump to the end and read the real duration.
         if (d === Infinity) {
+          // MediaRecorder webm files often report Infinity until the
+          // player seeks. Only settle once the duration is a real
+          // number: the seek / duration events can fire while the
+          // duration is still Infinity, and settling then refused a
+          // good clip as "could not be measured".
           const onSeek = () => {
-            clearTimeout(timer);
-            done(Number.isFinite(video.duration) && video.duration > 0 ? Math.floor(video.duration) : null);
+            if (Number.isFinite(video.duration) && video.duration > 0) {
+              clearTimeout(timer);
+              done(Math.floor(video.duration));
+            }
+            // Otherwise wait for the next event — the 5s timeout
+            // above still settles this as unmeasurable if it never
+            // resolves.
           };
           video.onseeked = onSeek;
           video.ondurationchange = onSeek;

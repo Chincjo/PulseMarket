@@ -209,15 +209,20 @@ export default function Admin() {
   // Milestone 17: open a student's ID photos. The bucket is private,
   // so the photos are fetched with short-lived signed URLs (one hour)
   // made from the storage paths on the verification row — never a
-  // public link. Already-opened links are reused until the list
-  // refreshes. A student with no photos on file has nothing to open.
+  // public link. Fresh links are reused for 50 minutes, then re-minted.
+  // A student with no photos on file has nothing to open.
   async function handleViewPhotos(row) {
     if (viewingPhotos === row.user_id) {
       setViewingPhotos(null);
       return;
     }
     setViewingPhotos(row.user_id);
-    if (photoUrls[row.user_id]) return;
+    // Signed URLs live for an hour: reuse a cached one only while
+    // it is fresh (50 minutes), otherwise mint a new pair — reusing
+    // an expired link used to show a broken image with no way to
+    // refresh it except reloading the whole list.
+    const cached = photoUrls[row.user_id];
+    if (cached && Date.now() - (cached.mintedAt || 0) < 50 * 60 * 1000) return;
     setError("");
     setBusyAction(`photos-${row.user_id}`);
     try {
@@ -225,7 +230,7 @@ export default function Admin() {
         verificationIdPhotoUrl(row.id_front_url),
         verificationIdPhotoUrl(row.id_back_url),
       ]);
-      setPhotoUrls((prev) => ({ ...prev, [row.user_id]: { front, back } }));
+      setPhotoUrls((prev) => ({ ...prev, [row.user_id]: { front, back, mintedAt: Date.now() } }));
     } catch (err) {
       setError(err?.message || "Could not open the ID photos. Try again.");
       setViewingPhotos(null);

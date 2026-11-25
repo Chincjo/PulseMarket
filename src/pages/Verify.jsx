@@ -318,9 +318,17 @@ export default function Verify({ onVerified }) {
       const rec = {
         userId: user.id,
         email: user.email,
-        university,
-        studentEmail: cleanStudentEmail,
-        studentId: cleanStudentId,
+        // On a re-submit the university, student email and student
+        // ID are locked server-side (the resubmit RPC only moves
+        // status + photos), so the local record must carry the
+        // server's values, not whatever was typed in the form —
+        // otherwise the device copy claims a university the server
+        // never recorded.
+        university: isResubmit ? serverRow?.university || university : university,
+        studentEmail: isResubmit
+          ? serverRow?.studentEmail || cleanStudentEmail
+          : cleanStudentEmail,
+        studentId: isResubmit ? serverRow?.studentId || cleanStudentId : cleanStudentId,
         status: "pending review",
         inviteCode,
         referredBy,
@@ -348,21 +356,28 @@ export default function Verify({ onVerified }) {
         navigate("/");
         return;
       }
+      // First submit: save to the server FIRST. The device copy
+      // must never claim a verification the server does not have,
+      // and a failed save used to leave the photos orphaned in the
+      // bucket with a local record saying "pending review". If the
+      // save fails, remove the photos just uploaded and say so
+      // plainly — the student can try again. (The old code set the
+      // local record and navigated on before saving, and swallowed
+      // the server error.)
+      let savedToServer = false;
+      try {
+        savedToServer = await saveVerificationRow(user.id, rec);
+      } catch {
+        savedToServer = false;
+      }
+      if (!savedToServer) {
+        await removeVerificationIdPhotos([photoPaths.frontPath, photoPaths.backPath]);
+        setFormError("Could not save your verification. Please check your connection and try again.");
+        return;
+      }
       saveVerification(rec);
       setSaved(rec);
       onVerified?.(rec);
-      // Also save to the server so the record follows the student to any
-      // phone. If the tables are not set up yet, the device copy above is
-      // still the fallback — the app keeps working either way. (The
-      // photos are already in the private bucket, and their paths are
-      // on the device copy, so the next app load retries this save
-      // with the same paths instead of uploading again.)
-      try {
-        await saveVerificationRow(user.id, rec);
-      } catch {
-        // Server save failed (tables not run yet, or offline) — local
-        // record still unlocks the app; the next app load retries the sync.
-      }
       navigate("/");
     } finally {
       setSubmitting(false);
@@ -494,17 +509,17 @@ export default function Verify({ onVerified }) {
 
         <label className="block text-sm font-semibold">
           University
-          <select value={university} onChange={(e) => setUniversity(e.target.value)} className={`${inputCls} mt-1`}>
+          <select value={university} onChange={(e) => setUniversity(e.target.value)} disabled={isResubmitForm} className={`${inputCls} mt-1`}>
             {UNIVERSITY_NAMES.map((u) => <option key={u}>{u}</option>)}
           </select>
         </label>
         <label className="block text-sm font-semibold">
           Student email (optional)
-          <input value={studentEmail} onChange={(e) => setStudentEmail(e.target.value)} type="email" placeholder="you@university.edu.ng" className={`${inputCls} mt-1`} />
+          <input value={studentEmail} onChange={(e) => setStudentEmail(e.target.value)} type="email" placeholder="you@university.edu.ng" disabled={isResubmitForm} className={`${inputCls} mt-1`} />
         </label>
         <label className="block text-sm font-semibold">
           Student ID / matric number
-          <input value={studentId} onChange={(e) => setStudentId(e.target.value)} maxLength={50} placeholder="e.g. U2026/04115" className={`${inputCls} mt-1`} />
+          <input value={studentId} onChange={(e) => setStudentId(e.target.value)} maxLength={50} placeholder="e.g. U2026/04115" disabled={isResubmitForm} className={`${inputCls} mt-1`} />
         </label>
         <label className="block text-sm font-semibold">
           Invite code (optional) — if a friend invited you

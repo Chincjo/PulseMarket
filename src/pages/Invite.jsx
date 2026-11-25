@@ -85,14 +85,20 @@ export default function Invite() {
   }
 
   if (noVerification || !code) {
+    // A null code means either "no verification row yet" or "the
+    // code could not be created just now" — the old page blamed
+    // verification for both and offered no way back but /verify.
     return (
       <EmptyState
-        title="Verify as a student first"
-        body="Your invite code is created with your student verification. Finish verification and your code will show here."
+        title="No invite code yet"
+        body="Your invite code is created with your student verification. Finish verification and your code will show here — or try loading it again if you are already verified."
         action={
-          <Link to="/verify">
-            <PrimaryButton>Verify as a student</PrimaryButton>
-          </Link>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Link to="/verify">
+              <PrimaryButton>Verify as a student</PrimaryButton>
+            </Link>
+            <GhostButton onClick={() => window.location.reload()}>Try again</GhostButton>
+          </div>
         }
       />
     );

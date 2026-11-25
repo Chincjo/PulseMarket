@@ -80,7 +80,7 @@ async function fetchVerification(userId) {
   return data;
 }
 
-async function isBlockedBetween(a, b) {
+async function isBlockedBetween(a, b, { failClosed = false } = {}) {
   if (!supabase || !a || !b) return false;
   const { data, error } = await supabase
     .from("blocked_users")
@@ -88,7 +88,15 @@ async function isBlockedBetween(a, b) {
     .or(`and(blocker_id.eq.${a},blocked_id.eq.${b}),and(blocker_id.eq.${b},blocked_id.eq.${a})`);
   if (error) {
     dbError(error, "check blocked users");
-    return false;
+    // Fail OPEN by default: the database triggers refuse the write
+    // anyway (pm_validate_message_insert, pm_validate_pickup_insert
+    // and pm_validate_conversation_insert all re-check the block
+    // list), so a failed check here only costs a refused write and
+    // a plain error — chats keep working through a blip in this
+    // one table. The ONE path with no database backstop is
+    // answering an offer (pm_validate_message_update never checks
+    // the block list), so respondOffer() calls this fail-CLOSED.
+    return failClosed;
   }
   return (data || []).length > 0;
 }
@@ -214,6 +222,15 @@ export async function startConversation(listing) {
         .maybeSingle();
       if (raced) return { conversation: raced, error: null };
     }
+    // The database is the real verification gate for the SELLER's
+    // side: the app cannot read another student's row (RLS returns
+    // only your own verification), so a pending or rejected seller
+    // is refused by the conversation trigger, not by the checks
+    // above. Surface its plain reason instead of a generic failure
+    // that leaves the buyer wondering why chat never opens.
+    if (/approved|verification|under review/i.test(error.message || "")) {
+      return { conversation: null, error: error.message };
+    }
     dbError(error, "start conversation");
     return { conversation: null, error: "Could not open the chat. Try again." };
   }
@@ -238,14 +255,19 @@ export async function fetchConversation(id) {
 // which made the chat list crawl with many conversations. For a
 // conversation whose newest messages fall outside the batched fetch
 // (a very long chat history), the last message is read on its own.
-export async function fetchConversations(userId) {
+export async function fetchConversations(userId, { before } = {}) {
   if (!supabase || !userId) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from("conversations")
     .select("*")
     .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
-    .order("last_message_at", { ascending: false, nullsFirst: false })
-    .limit(100); // Bound: the chat list was the last unbounded list fetch.
+    .order("last_message_at", { ascending: false, nullsFirst: false });
+  // Pass `before` (a last_message_at value from the last row) to
+  // fetch the next page — without it a student with more than 100
+  // conversations silently sees only the newest 100. The returned
+  // array carries `hasMore` (true when a full page came back).
+  if (before) query = query.lt("last_message_at", before);
+  const { data, error } = await query.limit(100); // Bound: the chat list was the last unbounded list fetch.
   if (error) {
     dbError(error, "fetch conversations");
     return [];
@@ -305,6 +327,7 @@ export async function fetchConversations(userId) {
       return { ...c, lastMessage: lastMsg, unreadCount: unread };
     })
   );
+  enriched.hasMore = list.length === 100;
   return enriched;
 }
 
@@ -329,22 +352,27 @@ export async function fetchConversationForListing(listingId, userId) {
 // Messages
 // ---------------------------------------------------------------------------
 
-export async function fetchMessages(conversationId) {
+export async function fetchMessages(conversationId, { before } = {}) {
   if (!supabase || !conversationId) return [];
   // Newest 500, then back to oldest-first for the thread. Fetching
   // every message ever sent in a long chat, on every 10-second poll,
-  // made old threads slower and slower.
-  const { data, error } = await supabase
+  // made old threads slower and slower. Pass `before` (a created_at
+  // value from the oldest loaded message) to page back through a
+  // very long thread; the returned array carries `hasMore`.
+  let query = supabase
     .from("messages")
     .select("*")
     .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: false })
-    .limit(500);
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(500);
   if (error) {
     dbError(error, "fetch messages");
     return [];
   }
-  return (data || []).reverse();
+  const rows = (data || []).reverse();
+  rows.hasMore = (data || []).length === 500;
+  return rows;
 }
 
 async function insertMessage(conversationId, row) {
@@ -425,14 +453,18 @@ export async function sendMessage(conversationId, body) {
 // Fails open (false) when the check itself errors, matching
 // isBlockedBetween / startConversation — the database is the real
 // enforcement for a direct API call (see the coordinator's list).
-async function blockedWithOther(conversationId, userId) {
+// Pass { failClosed: true } for the one write the database does
+// NOT back up: answering an offer (pm_validate_message_update has
+// no blocked check), where a failed check must refuse rather than
+// let a blocked student set the agreed price.
+async function blockedWithOther(conversationId, userId, opts) {
   if (!conversationId || !userId) return false;
   const conv = await fetchConversation(conversationId);
   if (!conv) return false;
   const otherId =
     conv.buyer_id === userId ? conv.seller_id : conv.buyer_id;
   if (!otherId || otherId === userId) return false;
-  return isBlockedBetween(userId, otherId);
+  return isBlockedBetween(userId, otherId, opts);
 }
 
 export async function sendOffer(conversationId, amount) {
@@ -506,8 +538,12 @@ export async function respondOffer(messageId, decision) {
   // sendMessage / sendOffer / schedulePickup all refuse when either
   // side blocked the other, and respondOffer was the one gap — the
   // database refuses the message write, but answering an offer also
-  // sets the agreed price, so refuse here first.
-  if (await blockedWithOther(msg.conversation_id, me)) {
+  // sets the agreed price, so refuse here first. Fail CLOSED here
+  // (unlike the other paths): pm_validate_message_update has no
+  // blocked check, so this app-side check is the ONLY thing
+  // stopping a blocked student from answering an offer — if the
+  // check itself errors, refuse rather than let the answer through.
+  if (await blockedWithOther(msg.conversation_id, me, { failClosed: true })) {
     dbError("You cannot message this student.", "respond to offer");
     return false;
   }

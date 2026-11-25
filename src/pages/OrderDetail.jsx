@@ -295,11 +295,18 @@ export default function OrderDetail() {
               Evidence locker — in-app photos &amp; videos for this order
             </GhostButton>
           </Link>
-          <Link to={`/dispute/${order.id}`} className="block">
-            <GhostButton className="w-full py-3">
-              Report a problem with this order
-            </GhostButton>
-          </Link>
+          {/* Only the buyer can report, and only while money is in
+              play (paid / held / shipped / delivered). A seller
+              tapping this used to land on a page that just refused
+              them, and a released order's report would fail on
+              submit — both dead ends. */}
+          {isBuyer && ["paid", "held", "shipped", "delivered"].includes(order.status) && (
+            <Link to={`/dispute/${order.id}`} className="block">
+              <GhostButton className="w-full py-3">
+                Report a problem with this order
+              </GhostButton>
+            </Link>
+          )}
         </section>
       )}
 
@@ -315,6 +322,26 @@ export default function OrderDetail() {
       )}
 
       <section className="space-y-2">
+        {/* Once money is held the order can no longer be cancelled
+            from here — say so and point at the way out, instead of
+            leaving the buyer hunting for a Cancel button that is gone. */}
+        {isBuyer && order.payment_method === "held" && ["held", "shipped", "delivered"].includes(order.status) && (
+          <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+            This order can no longer be cancelled from here — the money is held. If something is wrong, report a problem above or email the PulseMarket team.
+          </p>
+        )}
+        {isBuyer && order.delivery_method === "shipping" && ["held", "shipped"].includes(order.status) && (
+          <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+            For shipped orders, record your unboxing video (max 60 seconds) in the{" "}
+            <Link to="/evidence" className="font-semibold text-brown underline">Evidence Locker</Link>{" "}
+            first — delivery cannot be confirmed without a verified unboxing video.
+          </p>
+        )}
+        {(isBuyer || isSeller) && order.delivery_method === "meetup" && ["reserved", "paid", "held", "shipped"].includes(order.status) && (
+          <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+            Meet in person first — scan the seller code and take handover photos on the Handoff page, then confirm delivery here.
+          </p>
+        )}
         {isBuyer && order.payment_method === "held" && order.status === "reserved" && (
           <PrimaryButton
             className="w-full py-3"

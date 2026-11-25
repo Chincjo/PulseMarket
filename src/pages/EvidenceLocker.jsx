@@ -124,8 +124,8 @@ function EvidenceItem({ item, onDeleted }) {
 // Upload box for one order: kind picker, rule text, in-app camera
 // capture (MediaRecorder for video, camera input for photos), live
 // duration while recording.
-function UploadBox({ order, onUploaded }) {
-  const [kind, setKind] = useState("unboxing");
+function UploadBox({ order, defaultKind, onUploaded }) {
+  const [kind, setKind] = useState(defaultKind || "unboxing");
   const [recording, setRecording] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [clip, setClip] = useState(null);
@@ -303,7 +303,15 @@ function UploadBox({ order, onUploaded }) {
                   : "ready to save."}
               </p>
               <div className="mt-2 flex justify-center gap-2">
-                <PrimaryButton type="button" onClick={uploadClip} disabled={busy}>
+                <PrimaryButton
+                  type="button"
+                  onClick={uploadClip}
+                  disabled={
+                    busy ||
+                    (rule.minSeconds > 0 && clip.durationSeconds < rule.minSeconds) ||
+                    clip.durationSeconds > rule.maxSeconds
+                  }
+                >
                   {busy ? "Saving…" : "Save this video"}
                 </PrimaryButton>
                 <GhostButton type="button" onClick={resetClip} disabled={busy}>
@@ -491,9 +499,19 @@ export default function EvidenceLocker() {
                     </ul>
                   )}
 
-                  <div className="mt-3">
-                    <UploadBox order={order} onUploaded={load} />
-                  </div>
+                  {["cancelled", "refunded"].includes(order.status) ? (
+                    <p className="mt-3 text-sm text-neutral-500">
+                      This order is {order.status} — no more evidence is needed for it.
+                    </p>
+                  ) : (
+                    <div className="mt-3">
+                      <UploadBox
+                        order={order}
+                        defaultKind={isBuyer ? "unboxing" : "packing"}
+                        onUploaded={load}
+                      />
+                    </div>
+                  )}
                 </section>
               );
             })

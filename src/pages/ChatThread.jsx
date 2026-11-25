@@ -352,7 +352,7 @@ export default function ChatThread() {
             Agreed price: {formatNaira(conversation.agreed_price)}
           </p>
           <p className="mt-1 text-brown-dark/80">
-            You both agreed this price. Pay cash face to face (no fee) or through the app once held payments go live.
+            You both agreed this price. Pay cash face to face (no fee) or pay through the app — the money is held until you confirm delivery.
           </p>
         </div>
       ) : null}
@@ -463,6 +463,9 @@ export default function ChatThread() {
 
       {/* Offer */}
       <div className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
+        {isBlocked ? (
+          <p className="text-sm text-neutral-500">You blocked this student — unblock them below to make an offer.</p>
+        ) : null}
         {showOffer ? (
           <form onSubmit={handleOffer} className="flex flex-wrap items-end gap-2">
             <label className="flex-1 text-sm font-semibold">
@@ -476,7 +479,7 @@ export default function ChatThread() {
                 placeholder="e.g. 45000"
               />
             </label>
-            <PrimaryButton type="submit" disabled={sending}>
+            <PrimaryButton type="submit" disabled={sending || isBlocked}>
               Send offer
             </PrimaryButton>
             <GhostButton type="button" onClick={() => setShowOffer(false)}>
@@ -484,7 +487,7 @@ export default function ChatThread() {
             </GhostButton>
           </form>
         ) : (
-          <GhostButton onClick={() => setShowOffer(true)}>Make an offer</GhostButton>
+          <GhostButton onClick={() => setShowOffer(true)} disabled={isBlocked}>Make an offer</GhostButton>
         )}
       </div>
 
@@ -492,13 +495,13 @@ export default function ChatThread() {
       <div className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
         <div className="flex items-center justify-between gap-2">
           <h2 className="font-bold">Schedule pickup</h2>
-          <GhostButton onClick={() => setShowPickup((s) => !s)}>
+          <GhostButton onClick={() => setShowPickup((s) => !s)} disabled={isBlocked}>
             {showPickup ? "Close" : "Plan a meetup"}
           </GhostButton>
         </div>
         <p className="mt-1 text-sm text-neutral-500">
           Pickup tickets are for agreeing where and when to meet. The seller-code handoff that proves
-          the item changed hands arrives in a later update.
+          the item changed hands happens on the order page — the buyer scans the seller's code there.
         </p>
         {showPickup ? (
           <form onSubmit={handlePickup} className="mt-3 space-y-3">
@@ -522,7 +525,7 @@ export default function ChatThread() {
                 <input className={inputCls} type="time" value={time} onChange={(e) => setTime(e.target.value)} />
               </label>
             </div>
-            <PrimaryButton type="submit" disabled={savingPickup}>
+            <PrimaryButton type="submit" disabled={savingPickup || isBlocked}>
               {savingPickup ? "Saving…" : "Save pickup"}
             </PrimaryButton>
           </form>

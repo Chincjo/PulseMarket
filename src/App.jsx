@@ -52,7 +52,12 @@ function Shell() {
   const { user, loading, signOut } = useAuth();
   const navigate = useNavigate();
   const [verification, setVerification] = useState(() => getVerification());
-  const [verifying, setVerifying] = useState(false);
+  // Starts true: the full app must never render from the device
+  // copy alone. A student under review (or rejected) can write
+  // 'approved' into localStorage by hand, and the old code rendered
+  // the whole app from that copy before the server check came back.
+  // The loading screen holds until the first server check settles.
+  const [verifying, setVerifying] = useState(true);
   const [checking, setChecking] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   // Poll guards: the hourly auto-release must never run twice at once
@@ -77,23 +82,39 @@ function Shell() {
     if (!user) return;
     let cancelled = false;
     setVerifying(true);
-    fetchVerificationRow(user.id)
-      .then((row) => {
+    (async () => {
+      try {
+        const row = await fetchVerificationRow(user.id);
         if (cancelled) return;
         if (row) {
           const rec = { ...row, email: user.email };
           setVerification(rec);
           saveVerification(rec);
-        } else {
-          const local = getVerification();
-          if (local?.university) {
-            saveVerificationRow(user.id, local).catch(() => {});
+          return;
+        }
+        // No server row (or the read failed): push the device copy
+        // up so it follows the student to other phones, then
+        // RE-READ — the re-read is the truth. A fresh row is always
+        // 'pending review', so a device copy that claimed 'approved'
+        // must not survive this check: without the re-read a forged
+        // local record would keep the full app open for the session
+        // even though the server just created a pending row. When
+        // the read itself failed (offline), the re-read also fails
+        // and the device copy stays as the fallback, as before.
+        const local = getVerification();
+        if (local?.university) {
+          await saveVerificationRow(user.id, local).catch(() => false);
+          const fresh = await fetchVerificationRow(user.id).catch(() => null);
+          if (!cancelled && fresh) {
+            const rec = { ...fresh, email: user.email };
+            setVerification(rec);
+            saveVerification(rec);
           }
         }
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setVerifying(false);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -165,7 +186,10 @@ function Shell() {
     };
   }, [user]);
 
-  if (loading || (user && !verification && verifying)) {
+  // While the server check is in flight the loading screen holds,
+  // even when a device copy exists — the device copy is not proof
+  // of approval (see the verifying note above).
+  if (loading || (user && verifying)) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
         <Logo size={56} />
