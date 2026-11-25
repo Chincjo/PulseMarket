@@ -27,5 +27,7 @@ export const SUGGEST_PRICE = {
 
 export function suggestPrice(newPrice, condition) {
   const pct = SUGGEST_PRICE[condition] ?? 0.7;
-  return Math.round((Number(newPrice) || 0) * pct);
+  const np = Number(newPrice) || 0;
+  if (np <= 0) return 0;
+  return Math.round(np * pct);
 }

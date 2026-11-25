@@ -13,7 +13,15 @@ import { OWNER_EMAIL, shippingZone } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
 
-const COURIERS = ["GIG Logistics", "GUO Transport", "Chowdeck Relay"];
+const COURIERS = [
+  "GIG Logistics",
+  "GUO Transport",
+  "Chowdeck Relay",
+  "Peace Logistics",
+  "ABC Transport",
+  "DHL Domestic",
+  "Bus Park Waybill",
+];
 
 export default function Checkout() {
   const { listingId } = useParams();
@@ -110,6 +118,24 @@ export default function Checkout() {
     }
     setReserving(true);
     try {
+      const shipState = deliveryMethod === "shipping" ? shipToState || buyerState : null;
+      // Chowdeck Relay is same-city only. The courier list already
+      // drops it once a different state is picked, but when no
+      // state was picked the ship-to state falls back to the
+      // buyer's university state — which can be interstate — while
+      // the courier stays Chowdeck. Force a tracked interstate
+      // courier in that case instead of booking a same-city rider
+      // for an interstate parcel.
+      let finalCourier = effectiveCourier;
+      if (
+        deliveryMethod === "shipping" &&
+        shipState &&
+        listing &&
+        shipState !== listing.state &&
+        finalCourier === "Chowdeck Relay"
+      ) {
+        finalCourier = "GIG Logistics";
+      }
       const order = await createOrder({
         listing,
         buyerId: user.id,
@@ -117,7 +143,7 @@ export default function Checkout() {
         deliveryMethod,
         meetupSpot: deliveryMethod === "meetup" ? meetupSpot : null,
         shipToState: deliveryMethod === "shipping" ? shipToState || buyerState : null,
-        courier: deliveryMethod === "shipping" ? effectiveCourier : null,
+        courier: deliveryMethod === "shipping" ? finalCourier : null,
         buyerState,
       });
       navigate(`/order/${order.id}`);

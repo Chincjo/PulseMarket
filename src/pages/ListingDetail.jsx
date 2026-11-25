@@ -1,7 +1,7 @@
 // Listing detail — photos, seller card, delivery, automatic fee breakdown,
 // watchlist save, and boost (owner only). Chat and Make Offer arrive with
 // the next build, so this page says so honestly instead of a dead button.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { SHIPPING_ZONES } from "../lib/data";
 import { feeBreakdown, formatNaira } from "../lib/fees";
@@ -14,6 +14,7 @@ import {
   fetchListing,
   fetchWatchlistIds,
   isBoosted,
+  reactivateListing,
   setWatchlisted,
   updateListing,
 } from "../lib/listings";
@@ -41,7 +42,13 @@ export default function ListingDetail() {
   const [notice, setNotice] = useState("");
   const [chatting, setChatting] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
   const [sellerRating, setSellerRating] = useState(null);
+  // bumpViews used to fire once per effect run — the effect re-runs
+  // when the user object settles, so one visit counted two views, and
+  // the read-modify-write can lose a view when two people open the
+  // listing at once. One bump per listing id per mount is enough.
+  const bumpedListingId = useRef(null);
 
   // Milestone 11: the seller's rating summary for the seller card.
   useEffect(() => {
@@ -81,7 +88,10 @@ export default function ListingDetail() {
         if (cancelled) return;
         setListing(row);
         setLoading(false);
-        if (row && (!user || row.seller_id !== user.id)) bumpViews(row);
+        if (row && row.id !== bumpedListingId.current && (!user || row.seller_id !== user.id)) {
+          bumpedListingId.current = row.id;
+          bumpViews(row);
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -127,6 +137,9 @@ export default function ListingDetail() {
   }
 
   async function setStatus(status) {
+    // No busy guard before: a double-tap fired two status updates.
+    if (statusBusy) return;
+    setStatusBusy(true);
     setError("");
     try {
       const updated = await updateListing(id, { status });
@@ -140,6 +153,25 @@ export default function ListingDetail() {
       );
     } catch (err) {
       setError(err?.message || "Could not update the listing. Try again.");
+    } finally {
+      setStatusBusy(false);
+    }
+  }
+
+  async function doReactivate() {
+    // "Back to active" on a reserved listing with an open order
+    // used to flip it live mid-order (see reactivateListing).
+    if (statusBusy) return;
+    setStatusBusy(true);
+    setError("");
+    try {
+      const updated = await reactivateListing(id);
+      setListing(updated);
+      setNotice("Your listing is live again.");
+    } catch (err) {
+      setError(err?.message || "Could not update the listing. Try again.");
+    } finally {
+      setStatusBusy(false);
     }
   }
 
@@ -148,11 +180,17 @@ export default function ListingDetail() {
       setConfirmDelete(true);
       return;
     }
+    // No busy guard before: rapid taps after confirming fired delete
+    // twice, and the second call's error replaced the navigation.
+    if (statusBusy) return;
+    setStatusBusy(true);
     try {
       await deleteListing(id);
       navigate("/dashboard");
     } catch (err) {
       setError(err?.message || "Could not delete the listing. Try again.");
+    } finally {
+      setStatusBusy(false);
     }
   }
 
@@ -387,13 +425,13 @@ export default function ListingDetail() {
               </GhostButton>
               {listing.status === "active" ? (
                 <>
-                  <GhostButton onClick={() => setStatus("reserved")}>Mark reserved</GhostButton>
-                  <GhostButton onClick={() => setStatus("sold")}>Mark sold</GhostButton>
+                  <GhostButton disabled={statusBusy} onClick={() => setStatus("reserved")}>Mark reserved</GhostButton>
+                  <GhostButton disabled={statusBusy} onClick={() => setStatus("sold")}>Mark sold</GhostButton>
                 </>
               ) : (
-                <GhostButton onClick={() => setStatus("active")}>Back to active</GhostButton>
+                <GhostButton disabled={statusBusy} onClick={doReactivate}>Back to active</GhostButton>
               )}
-              <GhostButton onClick={doDelete}>
+              <GhostButton disabled={statusBusy} onClick={doDelete}>
                 {confirmDelete ? "Tap again to confirm delete" : "Delete"}
               </GhostButton>
             </div>

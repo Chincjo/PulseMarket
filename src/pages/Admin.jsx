@@ -18,7 +18,8 @@
 // also check the signed-in email before querying.
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../lib/auth";
-import { fetchOrder } from "../lib/orders";
+import { fetchHeldOrders, fetchOrder, refundHeldOrder } from "../lib/orders";
+import { fetchLockedHandoffs, unlockHandoff } from "../lib/handoff";
 import { fetchEvidenceForOrder } from "../lib/evidence";
 import {
   fetchAllDisputes,
@@ -53,6 +54,9 @@ export default function Admin() {
   const [disputes, setDisputes] = useState([]);
   const [securityLog, setSecurityLog] = useState([]);
   const [frozenOrders, setFrozenOrders] = useState([]);
+  const [heldOrders, setHeldOrders] = useState([]);
+  const [lockedHandoffs, setLockedHandoffs] = useState([]);
+  const [busyAction, setBusyAction] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [selectedEvidence, setSelectedEvidence] = useState([]);
@@ -72,20 +76,24 @@ export default function Admin() {
     setLoading(true);
     setError("");
     try {
-      const [allDisputes, log, frozen] = await Promise.all([
+      const [allDisputes, log, frozen, held, locked] = await Promise.all([
         fetchAllDisputes(),
         fetchSecurityLog(100),
         fetchFrozenOrders(),
+        fetchHeldOrders(user),
+        fetchLockedHandoffs(),
       ]);
       setDisputes(allDisputes || []);
       setSecurityLog(log || []);
       setFrozenOrders(frozen || []);
+      setHeldOrders(held || []);
+      setLockedHandoffs(locked || []);
     } catch (err) {
       setError(err?.message || "Could not load the team panel.");
     } finally {
       setLoading(false);
     }
-  }, [isOwner]);
+  }, [isOwner, user]);
 
   useEffect(() => {
     load();
@@ -128,6 +136,52 @@ export default function Admin() {
       setError(err?.message || "Could not resolve this dispute.");
     } finally {
       setResolving(false);
+    }
+  }
+
+  // Held order whose seller never ships: refund the buyer (item
+  // price + shipping) and put the listing back to active. Needs the
+  // milestone-16 database rule — until it runs this reports the
+  // database error and refunds nothing.
+  async function handleRefundHeld(order) {
+    if (
+      !window.confirm(
+        `Refund order ${order.code}? The buyer gets the item price + shipping back (${formatMoney(
+          (order.item_price || 0) + (order.shipping_fee || 0)
+        )}) and the listing goes back to active.`
+      )
+    ) {
+      return;
+    }
+    setError("");
+    setNotice("");
+    setBusyAction(`refund-${order.id}`);
+    try {
+      const { note } = await refundHeldOrder(order.id, user);
+      setNotice(note || "Order refunded.");
+      await load();
+    } catch (err) {
+      setError(err?.message || "Could not refund this order.");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  // Locked handoff: 5 wrong codes bricked the meetup, so the held
+  // money can neither be delivered nor released. Unlocking resets
+  // the attempt count; it does not unflag the buyer.
+  async function handleUnlockHandoff(order) {
+    setError("");
+    setNotice("");
+    setBusyAction(`unlock-${order.id}`);
+    try {
+      await unlockHandoff(order.id);
+      setNotice(`Handoff unlocked for order ${order.code} — the buyer can try the seller code again.`);
+      await load();
+    } catch (err) {
+      setError(err?.message || "Could not unlock this handoff.");
+    } finally {
+      setBusyAction("");
     }
   }
 
@@ -294,6 +348,73 @@ export default function Admin() {
                   >
                     <span className="font-bold">{o.code}</span> · {o.status} ·{" "}
                     {formatMoney(o.total)} · {o.payment_method} · {timeAgo(o.created_at)}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {/* (d) Held orders — seller never ships */}
+          <section className="mt-8">
+            <h2 className="font-semibold">Held orders ({heldOrders.length})</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Money is held for these orders. If the seller never ships, refund the buyer
+              here — the buyer gets the item price + shipping back and the listing goes
+              back to active. Refunds need the milestone-16 database rule; until it runs
+              this reports the database error and refunds nothing.
+            </p>
+            {heldOrders.length === 0 ? (
+              <p className="mt-2 text-sm text-neutral-500">No held orders.</p>
+            ) : (
+              <ul className="mt-2 space-y-2">
+                {heldOrders.map((o) => (
+                  <li
+                    key={o.id}
+                    className="rounded-xl border border-neutral-200 bg-white p-3 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+                  >
+                    <span className="font-bold">{o.code}</span> · {o.status} ·{" "}
+                    {formatMoney(o.total)} · {o.delivery_method} · {timeAgo(o.created_at)}
+                    <div className="mt-2">
+                      <GhostButton
+                        disabled={busyAction !== ""}
+                        onClick={() => handleRefundHeld(o)}
+                      >
+                        {busyAction === `refund-${o.id}` ? "Refunding…" : "Refund buyer — seller never shipped"}
+                      </GhostButton>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {/* (e) Locked handoffs */}
+          <section className="mt-8">
+            <h2 className="font-semibold">Locked handoffs ({lockedHandoffs.length})</h2>
+            <p className="mt-1 text-xs text-neutral-500">
+              Five wrong seller codes locked these meetups — the held money can neither be
+              delivered nor released until the handoff is unlocked. Unlocking resets the
+              attempt count; it does not unflag the buyer.
+            </p>
+            {lockedHandoffs.length === 0 ? (
+              <p className="mt-2 text-sm text-neutral-500">No locked handoffs.</p>
+            ) : (
+              <ul className="mt-2 space-y-2">
+                {lockedHandoffs.map((o) => (
+                  <li
+                    key={o.id}
+                    className="rounded-xl border border-neutral-200 bg-white p-3 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+                  >
+                    <span className="font-bold">{o.code}</span> · {o.status} ·{" "}
+                    {formatMoney(o.total)} · {o.code_attempts || 5} wrong codes · {timeAgo(o.created_at)}
+                    <div className="mt-2">
+                      <GhostButton
+                        disabled={busyAction !== ""}
+                        onClick={() => handleUnlockHandoff(o)}
+                      >
+                        {busyAction === `unlock-${o.id}` ? "Unlocking…" : "Unlock handoff"}
+                      </GhostButton>
+                    </div>
                   </li>
                 ))}
               </ul>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { EmptyState, PrimaryButton } from "../components/ui";
 import { getVerification } from "../lib/store";
@@ -20,11 +20,16 @@ export default function Chat() {
   const verification = getVerification();
   const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
+  // Poll guard: one load at a time, and none while the tab is hidden —
+  // a slow fetch used to stack overlapping 20s polls.
+  const loadRunning = useRef(false);
 
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
     async function load() {
+      if (loadRunning.current) return;
+      loadRunning.current = true;
       try {
         const rows = await fetchConversations(user.id);
         if (!cancelled) {
@@ -36,11 +41,15 @@ export default function Chat() {
           setConversations([]);
           setLoading(false);
         }
+      } finally {
+        loadRunning.current = false;
       }
     }
     load();
     // Polling-based chat (no realtime dependency): refresh the list.
-    const timer = setInterval(load, 20000);
+    const timer = setInterval(() => {
+      if (!document.hidden) load();
+    }, 20000);
     return () => {
       cancelled = true;
       clearInterval(timer);

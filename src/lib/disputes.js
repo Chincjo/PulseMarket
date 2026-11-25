@@ -340,7 +340,24 @@ export async function resolveDispute(disputeId, { resolutionNote }) {
   const current = await fetchDisputeDetail(disputeId);
   if (!current) throw new Error("Report not found.");
   if (current.status === "resolved") {
-    throw new Error("This report is already resolved.");
+    // A first resolve can leave the dispute resolved but the order
+    // still frozen: the unfreeze below runs AFTER the dispute row
+    // is saved, so if it failed the money was frozen with no open
+    // dispute left to resolve. Refusing here would brick the money
+    // for ever, so retry the unfreeze instead of throwing.
+    const { data: ord } = await supabase
+      .from("orders")
+      .select("id, frozen")
+      .eq("id", current.order_id)
+      .maybeSingle();
+    if (ord?.frozen) {
+      const { error: unfreezeError } = await supabase
+        .from("orders")
+        .update({ frozen: false, updated_at: new Date().toISOString() })
+        .eq("id", current.order_id);
+      if (unfreezeError) throw unfreezeError;
+    }
+    return current;
   }
   const { data, error } = await supabase
     .from("disputes")
@@ -350,6 +367,7 @@ export async function resolveDispute(disputeId, { resolutionNote }) {
       resolved_at: new Date().toISOString(),
     })
     .eq("id", disputeId)
+    .in("status", ["open", "under_review"])
     .select()
     .single();
   if (error) throw error;

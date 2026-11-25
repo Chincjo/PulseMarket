@@ -615,6 +615,12 @@ export async function openReturn(orderId, { reason, fault }) {
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
+  // (DB-2) Cash orders are paid face to face — there is no held
+  // money to refund, so a return through the ledger can never
+  // resolve. Sort it out with the seller directly.
+  if (order.payment_method === "cash") {
+    throw new Error("Cash orders are paid face to face — there is no held money to refund. Sort it out with the seller directly.");
+  }
   if (!["shipped", "delivered"].includes(order.status)) {
     throw new Error(
       `This order is ${order.status} — a return can only be opened after the item has shipped.`
@@ -673,6 +679,11 @@ export async function resolveReturn(orderId, { fault }) {
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
+  // (DB-2) Cash orders never hold money, so there is no refund to
+  // resolve through the ledger.
+  if (order.payment_method === "cash") {
+    throw new Error("Cash orders are paid face to face — there is no held money to refund.");
+  }
   if (order.return_status !== "opened") {
     throw new Error("There is no open return for this order.");
   }
@@ -712,6 +723,28 @@ export async function resolveReturn(orderId, { fault }) {
         status: "refunded",
         return_status: "resolved",
       });
+      // (DB-16) If the first resolve wrote the refund but crashed
+      // before recording the seller-fault debt, re-record it now —
+      // otherwise the advance the seller kept is never owed back.
+      if (fault === "seller" && advance > 0) {
+        const { data: existingDebt } = await supabase
+          .from("wallet_ledger")
+          .select("id")
+          .eq("order_id", order.id)
+          .eq("kind", "debt")
+          .limit(1);
+        if (!existingDebt || existingDebt.length === 0) {
+          try {
+            await recordSellerDebt(
+              order.id,
+              advance,
+              `Shipping advance to pay back — seller-fault return, order ${order.code}. Recorded on recovery: the refund moved before the debt did.`
+            );
+          } catch (debtErr) {
+            console.error("[PulseMarket] Could not re-record seller debt on return recovery:", debtErr?.message || debtErr);
+          }
+        }
+      }
       notifyUser(order.buyer_id, {
         kind: "dispute",
         title: "Return resolved",

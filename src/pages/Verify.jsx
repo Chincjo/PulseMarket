@@ -56,6 +56,7 @@ export default function Verify({ onVerified }) {
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
   const [formError, setFormError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   function filePreview(e, set) {
     const f = e.target.files?.[0];
@@ -117,6 +118,10 @@ export default function Verify({ onVerified }) {
   }
 
   async function submitVerification() {
+    // No busy guard before: a double-tap generated TWO different
+    // invite codes and saved the verification twice — the local record
+    // could end up holding a different invite code from the server row.
+    if (submitting) return;
     setFormError("");
     // Before this fix a student ID of only spaces passed (the button
     // only checked the raw string was non-empty) and a mistyped
@@ -158,21 +163,26 @@ export default function Verify({ onVerified }) {
       referredBy: /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral) ? cleanReferral : null,
       submittedAt: new Date().toISOString(),
     };
-    saveVerification(rec);
-    setSaved(rec);
-    onVerified?.(rec);
-    // Also save to the server so the record follows the student to any
-    // phone. If the tables are not set up yet, the device copy above is
-    // still the fallback — the app keeps working either way.
-    if (user?.id) {
-      try {
-        await saveVerificationRow(user.id, rec);
-      } catch {
-        // Server save failed (tables not run yet, or offline) — local
-        // record still unlocks the app; the next app load retries the sync.
+    setSubmitting(true);
+    try {
+      saveVerification(rec);
+      setSaved(rec);
+      onVerified?.(rec);
+      // Also save to the server so the record follows the student to any
+      // phone. If the tables are not set up yet, the device copy above is
+      // still the fallback — the app keeps working either way.
+      if (user?.id) {
+        try {
+          await saveVerificationRow(user.id, rec);
+        } catch {
+          // Server save failed (tables not run yet, or offline) — local
+          // record still unlocks the app; the next app load retries the sync.
+        }
       }
+      navigate("/");
+    } finally {
+      setSubmitting(false);
     }
-    navigate("/");
   }
 
   // Verification already submitted on this device.
@@ -260,10 +270,10 @@ export default function Verify({ onVerified }) {
 
         <PrimaryButton
           className="w-full"
-          disabled={!studentId.trim()}
+          disabled={!studentId.trim() || submitting}
           onClick={submitVerification}
         >
-          Review & submit
+          {submitting ? "Submitting…" : "Review & submit"}
         </PrimaryButton>
         <button
           className="w-full text-center text-sm text-neutral-500 underline"

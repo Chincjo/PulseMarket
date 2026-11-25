@@ -172,6 +172,13 @@ export async function createOrder({
   if (!["cash", "held"].includes(paymentMethod)) {
     throw new Error("Choose cash or pay through the app.");
   }
+  // Cash is paid face to face, so it always means meeting in
+  // person: the app has no shipped path for a cash order (shipping
+  // proof needs status 'held', which a cash order never reaches),
+  // so a cash + shipping order could never ship or complete.
+  if (paymentMethod === "cash" && deliveryMethod === "shipping") {
+    throw new Error("Cash is paid face to face — choose meet in person for cash orders.");
+  }
   if (!["meetup", "shipping"].includes(deliveryMethod)) {
     throw new Error("Choose meet in person or shipping.");
   }
@@ -295,7 +302,8 @@ export async function fetchMyOrders(userId) {
     .from("orders")
     .select("*")
     .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (error) {
     dbError(error, "fetch my orders");
     return [];
@@ -309,7 +317,8 @@ export async function fetchOrdersForListing(listingId) {
     .from("orders")
     .select("*")
     .eq("listing_id", listingId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100);
   if (error) {
     dbError(error, "fetch orders for listing");
     return [];
@@ -581,6 +590,13 @@ export async function releaseOrder(orderId, user) {
   // landed (network dropped). Throwing "already released" then would
   // leave the order stuck for ever, so finish the move instead.
   async function finishRelease() {
+    // A frozen order never completes its release — same rule as
+    // the first attempt. Without this check a retry after a
+    // completed release (money moved, status not updated) would
+    // surface the database's frozen error instead of a plain one.
+    if (order.frozen) {
+      throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+    }
     // A return opened after the money moved still stops the
     // release from completing — the team resolves the return first.
     if (order.return_status === "opened") {
@@ -671,6 +687,126 @@ export async function releaseOrder(orderId, user) {
     orderId: order.id,
   });
   return updated;
+}
+
+// Owner only: refund a HELD order whose seller never ships.
+// Until now a held order had no exit at all when the seller went
+// quiet: cancel only works from reserved/paid, a return needs the
+// order shipped/delivered, and resolving a dispute only unfreezes
+// — so the buyer's money sat in hold for ever. The buyer gets the
+// item price + shipping back (same as a seller-fault return; the
+// service and secure fees stay with PulseMarket) and the listing
+// goes back to active. No shipping advance can exist while the
+// order is still held (an advance is only paid after held ->
+// shipped), so no seller debt is recorded.
+// NOTE: this needs supabase/milestone-16.sql — until it runs, the
+// database refuses a refund from a held order with no open return
+// (pm_validate_ledger_insert + pm_validate_order_update), and this
+// throws that database error. The team resolves any open dispute
+// first: a frozen order cannot be refunded.
+export async function refundHeldOrder(orderId, user) {
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (!isOwner(user)) {
+    throw new Error("Only the PulseMarket team can refund a held order.");
+  }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  if (order.payment_method !== "held") {
+    throw new Error("Only held orders can be refunded this way — cash orders are settled face to face.");
+  }
+  if (order.return_status === "opened") {
+    throw new Error("A return is open for this order — resolve the return instead.");
+  }
+  if (order.status !== "held") {
+    throw new Error(`This order is ${order.status} — only a held order can be refunded this way.`);
+  }
+  // Double-refund guard: the refund must move exactly once. A
+  // refund row can exist while the order still says 'held' — the
+  // money moved, then the status update never landed. Close the
+  // order out instead of moving money again.
+  async function closeOut(note) {
+    const closed = await updateOrder(orderId, { status: "refunded" });
+    try {
+      await updateListing(order.listing_id, { status: "active" });
+    } catch (err) {
+      console.error("[PulseMarket] refund: could not put listing back to active:", err?.message || err);
+    }
+    notifyUser(order.buyer_id, {
+      kind: "dispute",
+      title: "Order refunded",
+      body: `Order ${order.code} was refunded — the seller never shipped it.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    notifyUser(order.seller_id, {
+      kind: "dispute",
+      title: "Order refunded",
+      body: `Order ${order.code} was refunded — the item never shipped.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    return { order: closed, note };
+  }
+  if (supabase) {
+    const { data: existingRefund } = await supabase
+      .from("wallet_ledger")
+      .select("id")
+      .eq("order_id", order.id)
+      .eq("kind", "refund")
+      .eq("bucket", "held")
+      .limit(1);
+    if (existingRefund && existingRefund.length > 0) {
+      return closeOut("This order was already refunded — the refund moved once, so this just closes the order out.");
+    }
+  }
+  const advance = await advanceAlreadyReleased(order.id);
+  const remainingHeld = Math.max(0, Number(order.total || 0) - advance);
+  const refundToBuyer =
+    Number(order.item_price || 0) + Number(order.shipping_fee || 0);
+  try {
+    await recordLedgerMove(order, [
+      {
+        userId: order.seller_id,
+        bucket: "held",
+        kind: "refund",
+        amount: -remainingHeld,
+        note: `Refund — seller never shipped, order ${order.code}`,
+      },
+      {
+        userId: order.buyer_id,
+        bucket: "available",
+        kind: "refund",
+        amount: refundToBuyer,
+        note: `Refund — seller never shipped, order ${order.code}`,
+      },
+    ]);
+  } catch (err) {
+    if (err?.code === "23505") {
+      return closeOut("This order was already refunded — the refund moved once, so this just closes the order out.");
+    }
+    throw err;
+  }
+  return closeOut(
+    `Refunded — the buyer gets ${refundToBuyer} naira back (item price + shipping). The listing is active again.`
+  );
+}
+
+// Team-only read: every order still sitting in 'held', for the
+// /admin panel's refund step above.
+export async function fetchHeldOrders(user) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!isOwner(user)) {
+    throw new Error("This page is not available.");
+  }
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("status", "held")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data || [];
 }
 
 // Buyer only, while the order is still 'reserved' or 'paid'. The listing

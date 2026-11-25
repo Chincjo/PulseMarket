@@ -250,7 +250,15 @@ export default function Tracking() {
   }
 
   const tiers = courierTiers(order.item_price);
-  const courierAllowed = tiers.allowedCouriers.includes(order.courier);
+  // The tiers are interstate-only. Chowdeck Relay is the same-city
+  // courier and Bus Park Waybill is the always-allowed fallback, so
+  // neither is "outside the tier" — the old check warned the seller
+  // to contact the team before shipping every legitimate same-city
+  // or bus-park order.
+  const courierAllowed =
+    order.courier === "Chowdeck Relay" ||
+    order.courier === "Bus Park Waybill" ||
+    tiers.allowedCouriers.includes(order.courier);
   const proofChecklist = {
     waybillNumber: waybillNumber.trim().length > 0 || Boolean(order.waybill_number),
     waybillPhoto: Boolean(waybillPhoto) || Boolean(order.waybill_photo),
@@ -445,6 +453,14 @@ export default function Tracking() {
           <p className="text-sm text-neutral-500">
             Only confirm when the item is in your hands and you have checked it. A wrong PIN
             confirms nothing.
+          </p>
+          <p className="text-sm text-neutral-500">
+            You also need your unboxing video first — delivery only confirms with a verified
+            unboxing video recorded in the app.{" "}
+            <Link to="/evidence" className="font-semibold text-brown underline">
+              Record it in the Evidence Locker
+            </Link>
+            .
           </p>
           <input
             className={inputCls}

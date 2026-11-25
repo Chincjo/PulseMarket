@@ -169,7 +169,7 @@ export async function notifyUser(userId, { kind, title, body, link, orderId, con
   const cleanTitle = String(title).trim().slice(0, 200);
   const cleanBody = body ? String(body).trim().slice(0, 500) || null : null;
   const cleanLink =
-    link && String(link).trim().startsWith("/")
+    link && String(link).trim().startsWith("/") && !String(link).trim().startsWith("//")
       ? String(link).trim().slice(0, 500)
       : null;
   const { data, error } = await supabase.rpc("insert_notification", {

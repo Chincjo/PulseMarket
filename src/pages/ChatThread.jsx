@@ -4,7 +4,7 @@
 // Accept or Decline it while it is pending; accepting sets the agreed
 // price on the conversation. Pickup tickets only plan the meetup — the
 // seller-code handoff that proves the handover arrives in Milestone 7.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
 import { getVerification } from "../lib/store";
@@ -58,6 +58,15 @@ export default function ChatThread() {
   const [showPickup, setShowPickup] = useState(false);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
+  const [respondingId, setRespondingId] = useState(null);
+  const [savingPickup, setSavingPickup] = useState(false);
+  const [blocking, setBlocking] = useState(false);
+  // Poll guards: one load at a time (a slow fetch must never stack
+  // up overlapping polls), no polling while the tab is hidden, and
+  // markRead only when a new message actually arrived — the old code
+  // rewrote the read timestamp on every 10s tick, even with nothing new.
+  const loadRunning = useRef(false);
+  const lastMarkedId = useRef(null);
 
   const isParticipant =
     conversation &&
@@ -75,38 +84,50 @@ export default function ChatThread() {
     if (!user || !id) return;
     let cancelled = false;
     async function load() {
-      let conv;
+      if (loadRunning.current) return;
+      loadRunning.current = true;
       try {
-        conv = await fetchConversation(id);
-      } catch {
-        if (!cancelled) {
+        let conv;
+        try {
+          conv = await fetchConversation(id);
+        } catch {
+          if (!cancelled) {
+            setNotFound(true);
+            setLoading(false);
+          }
+          return;
+        }
+        if (cancelled) return;
+        if (!conv) {
           setNotFound(true);
           setLoading(false);
+          return;
         }
-        return;
-      }
-      if (cancelled) return;
-      if (!conv) {
-        setNotFound(true);
+        setConversation(conv);
         setLoading(false);
-        return;
+        if (conv.buyer_id !== user.id && conv.seller_id !== user.id) return;
+        const [msgs, tks, blocked] = await Promise.all([
+          fetchMessages(id),
+          fetchPickupTickets(id),
+          fetchBlockedIds(user.id),
+        ]);
+        if (cancelled) return;
+        setMessages(msgs);
+        setTickets(tks);
+        setBlockedIds(blocked);
+        const newestId = msgs.length ? msgs[msgs.length - 1].id : null;
+        if (newestId !== lastMarkedId.current) {
+          lastMarkedId.current = newestId;
+          markRead(id, user.id).catch(() => {});
+        }
+      } finally {
+        loadRunning.current = false;
       }
-      setConversation(conv);
-      setLoading(false);
-      if (conv.buyer_id !== user.id && conv.seller_id !== user.id) return;
-      const [msgs, tks, blocked] = await Promise.all([
-        fetchMessages(id),
-        fetchPickupTickets(id),
-        fetchBlockedIds(user.id),
-      ]);
-      if (cancelled) return;
-      setMessages(msgs);
-      setTickets(tks);
-      setBlockedIds(blocked);
-      markRead(id, user.id).catch(() => {});
     }
     load();
-    const timer = setInterval(load, 10000);
+    const timer = setInterval(() => {
+      if (!document.hidden) load();
+    }, 10000);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -163,14 +184,25 @@ export default function ChatThread() {
   }
 
   async function handleRespond(messageId, decision) {
-    const ok = await respondOffer(messageId, decision);
-    if (!ok) {
-      setError("Could not update the offer. Try again.");
-      return;
+    // No busy guard before: a double-tap sent the response twice and
+    // the second call failed (offer no longer pending), showing a
+    // misleading "Could not update the offer" error for a tap that
+    // had already worked.
+    if (respondingId) return;
+    setRespondingId(messageId);
+    setError("");
+    try {
+      const ok = await respondOffer(messageId, decision);
+      if (!ok) {
+        setError("Could not update the offer. Try again.");
+        return;
+      }
+      const conv = await fetchConversation(id);
+      if (conv) setConversation(conv);
+      refreshMessages();
+    } finally {
+      setRespondingId(null);
     }
-    const conv = await fetchConversation(id);
-    if (conv) setConversation(conv);
-    refreshMessages();
   }
 
   async function handlePickup(e) {
@@ -195,29 +227,47 @@ export default function ChatThread() {
       setError("Pick a date within the next 90 days.");
       return;
     }
+    // No busy guard before: a double-tap saved the same pickup twice
+    // (there is no uniqueness rule on pickup_tickets).
+    if (savingPickup) return;
+    setSavingPickup(true);
     setError("");
-    const ticket = await schedulePickup(id, { spot, date, time });
-    if (!ticket) {
-      setError("Could not save the pickup. Try again.");
-      return;
+    try {
+      const ticket = await schedulePickup(id, { spot, date, time });
+      if (!ticket) {
+        setError("Could not save the pickup. Try again.");
+        return;
+      }
+      setTickets((t) => [ticket, ...t]);
+      setDate("");
+      setTime("");
+      setShowPickup(false);
+    } finally {
+      setSavingPickup(false);
     }
-    setTickets((t) => [ticket, ...t]);
-    setDate("");
-    setTime("");
-    setShowPickup(false);
   }
 
   async function handleBlock() {
-    if (!otherId) return;
+    if (!otherId || blocking) return;
     if (isBlocked) {
-      if (await unblockUser(user.id, otherId)) {
-        setBlockedIds((b) => b.filter((x) => x !== otherId));
+      setBlocking(true);
+      try {
+        if (await unblockUser(user.id, otherId)) {
+          setBlockedIds((b) => b.filter((x) => x !== otherId));
+        }
+      } finally {
+        setBlocking(false);
       }
       return;
     }
     if (!window.confirm("Block this student? They will not be able to start a new chat with you.")) return;
-    if (await blockUser(user.id, otherId)) {
-      setBlockedIds((b) => [...b, otherId]);
+    setBlocking(true);
+    try {
+      if (await blockUser(user.id, otherId)) {
+        setBlockedIds((b) => [...b, otherId]);
+      }
+    } finally {
+      setBlocking(false);
     }
   }
 
@@ -351,10 +401,10 @@ export default function ChatThread() {
                   </p>
                   {canRespond ? (
                     <div className="mt-3 flex gap-2">
-                      <PrimaryButton onClick={() => handleRespond(m.id, "accepted")}>
-                        Accept offer
+                      <PrimaryButton disabled={respondingId === m.id} onClick={() => handleRespond(m.id, "accepted")}>
+                        {respondingId === m.id ? "Saving…" : "Accept offer"}
                       </PrimaryButton>
-                      <GhostButton onClick={() => handleRespond(m.id, "declined")}>
+                      <GhostButton disabled={respondingId === m.id} onClick={() => handleRespond(m.id, "declined")}>
                         Decline
                       </GhostButton>
                     </div>
@@ -472,7 +522,9 @@ export default function ChatThread() {
                 <input className={inputCls} type="time" value={time} onChange={(e) => setTime(e.target.value)} />
               </label>
             </div>
-            <PrimaryButton type="submit">Save pickup</PrimaryButton>
+            <PrimaryButton type="submit" disabled={savingPickup}>
+              {savingPickup ? "Saving…" : "Save pickup"}
+            </PrimaryButton>
           </form>
         ) : null}
         {tickets.length > 0 ? (
@@ -491,8 +543,8 @@ export default function ChatThread() {
       </div>
 
       <div className="flex justify-between gap-2">
-        <GhostButton onClick={handleBlock}>
-          {isBlocked ? "Unblock student" : "Block student"}
+        <GhostButton onClick={handleBlock} disabled={blocking}>
+          {blocking ? "Saving…" : isBlocked ? "Unblock student" : "Block student"}
         </GhostButton>
         <p className="text-xs text-neutral-400">
           Need help? Support: pulsemarketsupport@gmail.com

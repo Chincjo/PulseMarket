@@ -21,6 +21,7 @@
 //      unblocked — releaseOrder / confirmDelivery in orders.js enforce
 //      that with handoffComplete().
 import { supabase } from "./supabase";
+import { OWNER_EMAIL } from "./payments";
 
 export const EVIDENCE_MEDIA_BUCKET = "evidence-media";
 
@@ -135,6 +136,15 @@ export async function ensureSellerCode(orderId) {
   if (order.delivery_method !== "meetup") {
     throw new Error("This handoff is only for meet-in-person orders.");
   }
+  // Only the seller may open (or create) the code. The database
+  // refuses a buyer here too, but the app must not even ask: a buyer
+  // calling this used to get a raw database error back instead of a
+  // plain refusal, and the intent — the code is the seller's to show
+  // — belongs in the app as well as the policy.
+  const userId = await currentUserId();
+  if (!userId || userId !== order.seller_id) {
+    throw new Error("Only the seller can open the seller code for this order.");
+  }
   if (order.handoff_locked) {
     throw new Error("This handoff is locked — contact support.");
   }
@@ -225,6 +235,18 @@ export async function uploadHandoffPhoto(orderId, role, dataUrl) {
   if (userId !== expectedId) {
     throw new Error("Only your own side of the handoff can upload this photo.");
   }
+  // A handover photo is frozen once that side has confirmed — the
+  // evidence cannot be swapped after the handoff is agreed — and a
+  // closed order has no handoff left to photograph. The database
+  // refuses the swap too; refuse here first so the photo is never
+  // even uploaded.
+  const confirmedField = role === "buyer" ? "buyer_confirmed" : "seller_confirmed";
+  if (order[confirmedField]) {
+    throw new Error("You already confirmed this handoff — the photo cannot be changed now.");
+  }
+  if (["cancelled", "refunded", "released"].includes(order.status)) {
+    throw new Error("This order is closed — there is no handoff to photograph.");
+  }
   const blob = await dataUrlToBlob(dataUrl);
   const path = `${userId}/handoff-${orderId}-${role}.jpg`;
   const { error } = await supabase.storage
@@ -270,6 +292,56 @@ export async function confirmHandoff(orderId, role) {
 }
 
 // ---------------------------------------------------------------------------
+// Locked handoffs — team recovery.
+// ---------------------------------------------------------------------------
+// Five wrong codes locks the handoff, and until now nothing in the
+// app could ever unlock it: the buyer cannot scan, the seller cannot
+// re-issue a code, and a held meetup order can neither be delivered
+// nor released without the handoff — so the money sat frozen in
+// hold for ever. Only the PulseMarket team unlocks it (the database
+// trigger lets the owner write handoff_locked / code_attempts, and
+// the orders RLS lets the owner update the order). Unlocking resets
+// the attempt count so the buyer can try the code again. It does
+// NOT unflag the buyer — the flag stays for the team to judge.
+export async function unlockHandoff(orderId) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const { data: user } = await supabase.auth.getUser();
+  if (!user?.user || user.user.email !== OWNER_EMAIL) {
+    throw new Error("Only the PulseMarket team can unlock a handoff.");
+  }
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (!order.handoff_locked && !(order.code_attempts || 0)) return order;
+  const updated = await updateOrder(orderId, {
+    handoff_locked: false,
+    code_attempts: 0,
+  });
+  await logSecurityEvent(
+    orderId,
+    user.user.id,
+    "handoff_unlocked",
+    `Handoff unlocked by the PulseMarket team for order ${order.code} — the buyer can try the seller code again.`
+  );
+  return updated;
+}
+
+// Team-only read: every order whose handoff is locked, for /admin.
+export async function fetchLockedHandoffs() {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const { data: user } = await supabase.auth.getUser();
+  if (!user?.user || user.user.email !== OWNER_EMAIL) {
+    throw new Error("This page is not available.");
+  }
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("handoff_locked", true)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+// ---------------------------------------------------------------------------
 // Status — the order's handoff fields plus whether release is unblocked.
 // ---------------------------------------------------------------------------
 
@@ -278,9 +350,12 @@ export async function getHandoffStatus(orderId) {
   if (!order) return null;
   // The code comes from handoff_codes, which only the seller can
   // read — a buyer asking for the status gets null here, never the
-  // code (see supabase/milestone-14.sql).
+  // code (see supabase/milestone-14.sql). Do not even send the query
+  // as a buyer: the seller-only policy would refuse it, and the
+  // status a buyer needs never includes the code.
   let code = null;
-  if (supabase) {
+  const callerId = await currentUserId();
+  if (supabase && callerId && callerId === order.seller_id) {
     const { data } = await supabase
       .from("handoff_codes")
       .select("code")

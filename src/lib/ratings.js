@@ -138,7 +138,10 @@ export async function fetchSellerRating(sellerId) {
   const { data, error } = await supabase
     .from("ratings")
     .select("stars")
-    .eq("rated_id", sellerId);
+    .eq("rated_id", sellerId)
+    .limit(1000); // Bound: the average needs every row, but a seller with
+  // more than 1000 ratings is far beyond this app's scale; without a
+  // cap this fetch grows with every rating ever left.
   if (error) {
     dbError(error, "fetch seller rating");
     return { average: 0, count: 0 };

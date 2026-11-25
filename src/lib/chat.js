@@ -135,6 +135,15 @@ export async function startConversation(listing) {
   // (The buyer is verified by the check above, but keep the rule explicit
   // so it still holds if the checks are ever reordered.)
   const sellerVerification = await fetchVerification(listing.seller_id);
+  // A flagged seller is under team review too: no new chats with
+  // them either, matching the database rule (which refuses a new
+  // conversation when either side is flagged).
+  if (sellerVerification?.flagged) {
+    return {
+      conversation: null,
+      error: "This seller's account is under review — contact support before starting a new chat.",
+    };
+  }
   if (sellerVerification?.chat_verified_only && !buyerVerification) {
     return {
       conversation: null,
@@ -218,7 +227,8 @@ export async function fetchConversations(userId) {
     .from("conversations")
     .select("*")
     .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
-    .order("last_message_at", { ascending: false, nullsFirst: false });
+    .order("last_message_at", { ascending: false, nullsFirst: false })
+    .limit(100); // Bound: the chat list was the last unbounded list fetch.
   if (error) {
     dbError(error, "fetch conversations");
     return [];
@@ -475,6 +485,15 @@ export async function respondOffer(messageId, decision) {
     dbError("You cannot accept or decline your own offer.", "respond to offer");
     return false;
   }
+  // A blocked student cannot answer offers in an old chat either:
+  // sendMessage / sendOffer / schedulePickup all refuse when either
+  // side blocked the other, and respondOffer was the one gap — the
+  // database refuses the message write, but answering an offer also
+  // sets the agreed price, so refuse here first.
+  if (await blockedWithOther(msg.conversation_id, me)) {
+    dbError("You cannot message this student.", "respond to offer");
+    return false;
+  }
   const { error } = await supabase
     .from("messages")
     .update({ offer_status: decision })
@@ -593,7 +612,8 @@ export async function fetchPickupTickets(conversationId) {
     .from("pickup_tickets")
     .select("*")
     .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100); // Bound: one chat's pickup plans, newest first.
   if (error) {
     dbError(error, "fetch pickup tickets");
     return [];

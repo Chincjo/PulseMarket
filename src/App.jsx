@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import { Analytics } from "@vercel/analytics/react";
 import Home from "./pages/Home.jsx";
@@ -54,6 +54,10 @@ function Shell() {
   const [verification, setVerification] = useState(() => getVerification());
   const [verifying, setVerifying] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
+  // Poll guards: the hourly auto-release must never run twice at once
+  // (a slow check overlapping the next hour's tick), and neither poll
+  // needs to run while the tab is hidden.
+  const autoReleaseRunning = useRef(false);
 
   useEffect(() => {
     applyAppearance(getSettings());
@@ -99,9 +103,18 @@ function Shell() {
   // never signed out and back in again.
   useEffect(() => {
     if (!user) return;
-    runAutoReleaseCheck(user).catch(() => {});
+    const runOnce = () => {
+      if (autoReleaseRunning.current) return;
+      autoReleaseRunning.current = true;
+      runAutoReleaseCheck(user)
+        .catch(() => {})
+        .finally(() => {
+          autoReleaseRunning.current = false;
+        });
+    };
+    runOnce();
     const timer = setInterval(() => {
-      runAutoReleaseCheck(user).catch(() => {});
+      if (!document.hidden) runOnce();
     }, 60 * 60 * 1000);
     return () => clearInterval(timer);
   }, [user]);
@@ -112,6 +125,7 @@ function Shell() {
     if (!user) return;
     let cancelled = false;
     const refresh = () => {
+      if (document.hidden) return;
       fetchUnreadCount(user.id).then((n) => {
         if (!cancelled) setUnreadCount(n);
       });

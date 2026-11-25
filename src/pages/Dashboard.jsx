@@ -1,6 +1,6 @@
 // Dashboard — the seller's own real listings (Milestone 4) with
 // edit / duplicate / mark sold / mark reserved / delete.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
@@ -11,6 +11,7 @@ import {
   duplicateListing,
   fetchMyListings,
   isBoosted,
+  reactivateListing,
   updateListing,
 } from "../lib/listings";
 import { useAuth } from "../lib/auth";
@@ -22,21 +23,28 @@ export default function Dashboard() {
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState(null);
+  // reload() is called from handlers as well as the effect, so it
+  // guards against setting state after unmount itself.
+  const mounted = useRef(true);
 
   async function reload() {
     if (!user) return;
     try {
       const rows = await fetchMyListings(user.id);
-      setListings(rows);
+      if (mounted.current) setListings(rows);
     } catch (err) {
-      setError(err?.message || "Could not load your listings. Try again.");
+      if (mounted.current) setError(err?.message || "Could not load your listings. Try again.");
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
     }
   }
 
   useEffect(() => {
+    mounted.current = true;
     reload();
+    return () => {
+      mounted.current = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
@@ -44,12 +52,34 @@ export default function Dashboard() {
   const totalValue = active.reduce((s, d) => s + (d.price || 0), 0);
 
   async function setStatus(listing, status) {
+    // No busy guard before: a double-tap fired two status updates and
+    // two reloads for one tap.
+    if (busyId) return;
+    setBusyId(listing.id);
     setError("");
     try {
       await updateListing(listing.id, { status });
       reload();
     } catch (err) {
       setError(err?.message || "Could not update the listing. Try again.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function reactivate(listing) {
+    // "Back to active" on a reserved listing with an open order
+    // used to flip it live mid-order (see reactivateListing).
+    if (busyId) return;
+    setBusyId(listing.id);
+    setError("");
+    try {
+      await reactivateListing(listing.id);
+      reload();
+    } catch (err) {
+      setError(err?.message || "Could not update the listing. Try again.");
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -57,12 +87,18 @@ export default function Dashboard() {
     // Deleting is permanent — ask first. (The listing detail page
     // already asks with a two-tap confirm; this page had none.)
     if (!window.confirm(`Delete "${listing.title}"? This cannot be undone.`)) return;
+    // No busy guard before: a double-click deleted twice, and the
+    // second call's "not found" error replaced the success.
+    if (busyId) return;
+    setBusyId(listing.id);
     setError("");
     try {
       await deleteListing(listing.id);
       reload();
     } catch (err) {
       setError(err?.message || "Could not delete the listing. Try again.");
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -150,13 +186,13 @@ export default function Dashboard() {
                 </GhostButton>
                 {d.status === "active" ? (
                   <>
-                    <GhostButton onClick={() => setStatus(d, "reserved")}>Mark reserved</GhostButton>
-                    <GhostButton onClick={() => setStatus(d, "sold")}>Mark sold</GhostButton>
+                    <GhostButton disabled={busyId === d.id} onClick={() => setStatus(d, "reserved")}>Mark reserved</GhostButton>
+                    <GhostButton disabled={busyId === d.id} onClick={() => setStatus(d, "sold")}>Mark sold</GhostButton>
                   </>
                 ) : (
-                  <GhostButton onClick={() => setStatus(d, "active")}>Back to active</GhostButton>
+                  <GhostButton disabled={busyId === d.id} onClick={() => reactivate(d)}>Back to active</GhostButton>
                 )}
-                <GhostButton onClick={() => remove(d)}>Delete</GhostButton>
+                <GhostButton disabled={busyId === d.id} onClick={() => remove(d)}>Delete</GhostButton>
               </div>
               {editingId === d.id ? (
                 <div className="mt-2">
