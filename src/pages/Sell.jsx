@@ -26,10 +26,14 @@ import { useAuth } from "../lib/auth";
 const STEPS = ["Item", "Price", "Delivery", "Campus", "Photos", "Description", "Meet-up & safety"];
 
 function downscale(file) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read that photo. Try a different one."));
     reader.onload = () => {
+      // A non-image file never fires onload — without onerror the
+      // promise never settles and adding a photo hangs for ever.
+      img.onerror = () => reject(new Error("That file is not a photo — choose an image file."));
       img.onload = () => {
         const max = 600;
         const scale = Math.min(1, max / Math.max(img.width, img.height));
@@ -81,6 +85,7 @@ export default function Sell({ verification }) {
       case 0: {
         const missing = [];
         if (!name.trim()) missing.push("Item name");
+        if (name.trim().length > 120) missing.push("Item name (under 120 characters)");
         if (!condition) missing.push("Condition");
         if (!category) missing.push("Category");
         return missing;
@@ -88,6 +93,7 @@ export default function Sell({ verification }) {
       case 1: {
         const n = Math.round(Number(price) || 0);
         if (!price || n <= 0) return ["Your price (above ₦0)"];
+        if (n > 10000000) return ["Your price (under ₦10,000,000)"];
         return [];
       }
       case 2: {
@@ -106,9 +112,11 @@ export default function Sell({ verification }) {
       case 4:
         return photos.length === 0 ? ["At least 1 photo"] : [];
       case 5:
-        return description.trim().length < 20
-          ? ["Description (at least 20 characters)"]
-          : [];
+        if (description.trim().length < 20)
+          return ["Description (at least 20 characters)"];
+        if (description.trim().length > 2000)
+          return ["Description (under 2,000 characters)"];
+        return [];
       case 6:
         return delivery === "meetup" && !spot ? ["Safe meetup spot"] : [];
       default:
@@ -156,8 +164,15 @@ export default function Sell({ verification }) {
   async function onPhotos(e) {
     const files = [...e.target.files].slice(0, 4 - photos.length);
     const urls = [];
-    for (const f of files) urls.push(await downscale(f));
-    setPhotos([...photos, ...urls]);
+    for (const f of files) {
+      try {
+        urls.push(await downscale(f));
+      } catch (err) {
+        setError(err?.message || "Could not read that photo. Try a different one.");
+      }
+    }
+    if (urls.length > 0) setPhotos([...photos, ...urls]);
+    e.target.value = "";
   }
 
   async function publish() {
@@ -282,7 +297,7 @@ export default function Sell({ verification }) {
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">What the buyer pays</p>
               <p className="mt-1 flex justify-between"><span>Item price</span><span>{formatNaira(fees.price)}</span></p>
-              <p className="flex justify-between text-neutral-500"><span>Service fee (5%)</span><span>{formatNaira(fees.serviceFee)}</span></p>
+              <p className="flex justify-between text-neutral-500"><span>Service fee {fees.price < 5000 ? "(flat ₦150 under ₦5,000)" : "(5%, capped at ₦2,000)"}</span><span>{formatNaira(fees.serviceFee)}</span></p>
               <p className="flex justify-between text-neutral-500"><span>Secure payment fee</span><span>{formatNaira(fees.secureFee)}</span></p>
               <p className="mt-1 flex justify-between font-bold"><span>Buyer pays (held)</span><span>{formatNaira(fees.total)}</span></p>
               <p className="mt-1 text-neutral-500">Cash face-to-face: no fees — buyer pays {formatNaira(fees.price)}. You keep the full price either way.</p>
@@ -303,7 +318,13 @@ export default function Sell({ verification }) {
               <label className="block text-sm font-semibold">Courier
                 <select value={courier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
                   <option value="">Choose a courier…</option>
-                  {["GIG", "GUO", "Peace Mass Transit", "ABC Transport", "DHL", "Chowdeck Relay", "Bus Park"].map((c) => <option key={c} value={c}>{c}</option>)}
+                  {/* Canonical courier names — the shipping advance,
+                      courier tiers and the database all match on these
+                      exact strings. The old short names ("GIG", "GUO",
+                      "DHL", "Bus Park") matched nothing, so a listing
+                      shipped with GIG could never earn its 50%
+                      shipping advance. */}
+                  {["GIG Logistics", "GUO Transport", "Peace Logistics", "ABC Transport", "DHL Domestic", "Chowdeck Relay", "Bus Park Waybill"].map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
               </label>
               <div>

@@ -81,14 +81,25 @@ function isMissingTableError(error) {
 // yet, so an empty result is probed directly: a missing table is
 // refused with the same "add evidence first" message instead of
 // letting a report through with no proof behind it.
+//
+// The gate needs a VERIFIED dispute video (kind 'dispute',
+// verified=true — a 10–20s clip recorded in the app). Before this fix
+// ANY evidence row satisfied it: a handoff photo, a receipt photo, or
+// the seller's packing video all let a dispute through with no video
+// of the actual problem.
 async function requireDisputeEvidence(orderId) {
   const rows = await fetchEvidenceForOrder(orderId);
-  if (rows && rows.length > 0) return rows;
-  // Empty — find out whether the table is missing or just empty.
+  if (rows && rows.some((r) => r.kind === "dispute" && r.verified === true)) {
+    return rows;
+  }
+  // No qualifying row — find out whether the table is missing or the
+  // student simply has not recorded a dispute video yet.
   const { data, error } = await supabase
     .from("evidence")
     .select("id")
     .eq("order_id", orderId)
+    .eq("kind", "dispute")
+    .eq("verified", true)
     .limit(1);
   if (error && isMissingTableError(error)) {
     throw new Error(
@@ -98,7 +109,7 @@ async function requireDisputeEvidence(orderId) {
   if (error) throw error;
   if (data && data.length > 0) return data;
   throw new Error(
-    "Add evidence first — record a short video of the problem in the app (Evidence Locker, dispute evidence, 10–20 seconds) before reporting it. A report needs at least one piece of in-app evidence."
+    "Add evidence first — record a short video of the problem in the app (Evidence Locker, dispute evidence, 10–20 seconds) before reporting it. A report needs a verified dispute video, not just any photo or video on the order."
   );
 }
 
@@ -137,6 +148,19 @@ export async function fileDispute(orderId, { category, explanation, email }) {
   if (!order) throw new Error("Order not found.");
   if (order.buyer_id !== user.id) {
     throw new Error("Only the buyer of this order can report a problem with it.");
+  }
+
+  // A dispute freezes money, so there has to be money to freeze. On a
+  // 'reserved' order nothing has been paid yet — the buyer cancels
+  // instead of reporting — and filing on one would freeze it so it
+  // could never even be cancelled. On a released / refunded /
+  // cancelled order the money has already moved (or never moved), so
+  // freezing achieves nothing; those go to the team by email.
+  if (!["paid", "held", "shipped", "delivered"].includes(order.status)) {
+    if (order.status === "reserved") {
+      throw new Error("This order has not started yet — cancel it from the order page if you no longer want it.");
+    }
+    throw new Error("This order is already closed — email pulsemarketsupport@gmail.com with the order code and the team will look into it.");
   }
 
   // One open report per order — a second report for the same order
@@ -227,7 +251,8 @@ export async function fetchMyDisputes(userId) {
     .from("disputes")
     .select(REPORTER_COLUMNS)
     .eq("reporter_id", userId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100);
   if (error) {
     dbError(error, "fetch my disputes");
     return [];
@@ -306,7 +331,17 @@ export async function resolveDispute(disputeId, { resolutionNote }) {
   if (note.length < 5) {
     throw new Error("Write a short note saying how this was resolved.");
   }
+  if (note.length > 1000) {
+    throw new Error("Keep the resolution note under 1,000 characters.");
+  }
   const user = await requireOwner();
+  // Resolving twice used to re-run the unfreeze and write a second
+  // 'dispute_resolved' log row for a dispute that was already closed.
+  const current = await fetchDisputeDetail(disputeId);
+  if (!current) throw new Error("Report not found.");
+  if (current.status === "resolved") {
+    throw new Error("This report is already resolved.");
+  }
   const { data, error } = await supabase
     .from("disputes")
     .update({

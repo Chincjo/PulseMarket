@@ -161,12 +161,16 @@ export default function Notifications() {
   // Cash orders never auto-release (settled face to face — no held
   // money), and an open return pauses the release, so neither belongs
   // in the countdown list: open returns get their own card below.
+  // A frozen order (open dispute) never auto-releases either — it
+  // used to sit in this list with a countdown that would never fire.
   const deliveredOrders = orders.filter(
     (o) =>
       o.status === "delivered" &&
       o.payment_method !== "cash" &&
-      o.return_status !== "opened"
+      o.return_status !== "opened" &&
+      !o.frozen
   );
+  const frozenOrders = orders.filter((o) => o.frozen);
   const openReturns = orders.filter((o) => o.return_status === "opened");
   const boostsEndingSoon = listings.filter((l) => {
     if (!l.boosted_until || l.status !== "active") return false;
@@ -175,6 +179,7 @@ export default function Notifications() {
   });
   const attentionCount =
     deliveredOrders.length +
+    frozenOrders.length +
     (disputesOn ? openReturns.length : 0) +
     boostsEndingSoon.length;
 
@@ -230,6 +235,25 @@ export default function Notifications() {
               </div>
             );
           })}
+
+          {frozenOrders.map((order) => (
+            <div
+              key={`frozen-${order.id}`}
+              className="rounded-xl border border-neutral-200 bg-white p-3 dark:border-neutral-700 dark:bg-black"
+            >
+              <p className="text-sm font-bold">Dispute open — order {order.code}</p>
+              <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-300">
+                A dispute is open for this order, so the money is frozen while
+                the PulseMarket team reviews it. The 48-hour auto-release is
+                paused until then.
+              </p>
+              <p className="mt-2 text-sm">
+                <Link to={`/order/${order.id}`} className="font-semibold text-brown underline">
+                  Open order {order.code}
+                </Link>
+              </p>
+            </div>
+          ))}
 
           {disputesOn &&
             openReturns.map((order) => (

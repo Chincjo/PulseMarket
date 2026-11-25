@@ -67,13 +67,49 @@ export async function fetchVerificationRow(userId) {
 
 export async function saveVerificationRow(userId, rec) {
   if (!supabase || !userId) return false;
+  // A referral to your own invite code can never count — drop it
+  // instead of saving a self-referral.
+  const referredBy =
+    rec.referredBy && rec.inviteCode && rec.referredBy === rec.inviteCode
+      ? null
+      : rec.referredBy;
+  // A verification row is written once and then locked: university,
+  // student id and invite code are never overwritten from the app
+  // afterwards. Only a missing referred_by may still be filled in.
+  const { data: existing, error: readError } = await supabase
+    .from("verifications")
+    .select("user_id, referred_by")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (readError) {
+    dbError(readError, "read verification before save");
+    return false;
+  }
+  if (existing) {
+    if (referredBy && !existing.referred_by) {
+      const { error } = await supabase
+        .from("verifications")
+        .update({ referred_by: referredBy })
+        .eq("user_id", userId);
+      if (error) {
+        dbError(error, "save referral code");
+        return false;
+      }
+    }
+    return true;
+  }
+  // Status is ALWAYS "pending review" from the app, whatever the local
+  // record claims: a student must never be able to ask for — or
+  // re-save their way into — any other status. Only the PulseMarket
+  // team can change it (the database trigger refuses anything else,
+  // this just stops the app from ever sending a privileged value).
   const { error } = await supabase.from("verifications").upsert({
     user_id: userId,
     university: rec.university,
     student_id: rec.studentId,
     student_email: rec.studentEmail || null,
     invite_code: rec.inviteCode,
-    status: rec.status || "pending review",
+    status: "pending review",
   });
   if (error) {
     dbError(error, "save verification");
@@ -82,10 +118,10 @@ export async function saveVerificationRow(userId, rec) {
   // Milestone 11: referral attribution, saved as a separate update so
   // a missing referred_by column (milestone-11.sql not run yet) can
   // never break the verification save itself.
-  if (rec.referredBy) {
+  if (referredBy) {
     const { error: refError } = await supabase
       .from("verifications")
-      .update({ referred_by: rec.referredBy })
+      .update({ referred_by: referredBy })
       .eq("user_id", userId);
     if (refError) dbError(refError, "save referral code");
   }
@@ -174,6 +210,24 @@ export async function updateListing(id, patch) {
 }
 
 export async function deleteListing(id) {
+  if (!supabase || !id) throw new Error("Missing listing.");
+  // Deleting a listing cascades in the database: every order for it
+  // (and their handoff, checkpoints and evidence) is deleted too.
+  // Refuse while any live order history exists — a seller with an
+  // order on the listing marks it sold instead. Only a listing whose
+  // orders were all cancelled may be deleted.
+  const { data: orders, error: ordersError } = await supabase
+    .from("orders")
+    .select("id, status")
+    .eq("listing_id", id)
+    .limit(100);
+  if (ordersError) throw ordersError;
+  const blocking = (orders || []).filter((o) => o.status !== "cancelled");
+  if (blocking.length > 0) {
+    throw new Error(
+      "This listing has orders on it — mark it sold instead of deleting it, so the order history stays."
+    );
+  }
   const { error } = await supabase.from("listings").delete().eq("id", id);
   if (error) throw error;
 }
@@ -238,6 +292,9 @@ export async function uploadListingPhotos(userId, dataUrls) {
   const urls = [];
   for (let i = 0; i < dataUrls.length; i++) {
     const blob = await dataUrlToBlob(dataUrls[i]);
+    if (blob.size > 10 * 1024 * 1024) {
+      throw new Error("That photo is too big — keep listing photos under 10MB.");
+    }
     const path = `${userId}/${Date.now()}-${i}.jpg`;
     const { error } = await supabase.storage
       .from(LISTING_PHOTOS_BUCKET)
@@ -275,6 +332,10 @@ export async function setWatchlisted(userId, listingId, saved) {
       .from("watchlist")
       .insert({ user_id: userId, listing_id: listingId });
     if (error) {
+      // Already saved — a double tap, or the same save from another
+      // device, hits the (user, listing) key. That is a success, not
+      // an error: the item is on the watchlist either way.
+      if (error.code === "23505") return true;
       dbError(error, "save to watchlist");
       return false;
     }

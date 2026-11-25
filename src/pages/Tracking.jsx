@@ -13,7 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
 import { fetchListing } from "../lib/listings";
-import { fetchConversations } from "../lib/chat";
+import { fetchConversationForListing } from "../lib/chat";
 import { OWNER_EMAIL } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
@@ -28,6 +28,7 @@ import {
   fetchTracking,
   openReturn,
   resolveReturn,
+  retryShippingAdvance,
   submitShippingProof,
 } from "../lib/shipping";
 
@@ -130,8 +131,10 @@ export default function Tracking() {
         const item = await fetchListing(result.order.listing_id);
         setListing(item);
         if (user) {
-          const chats = await fetchConversations(user.id);
-          const match = (chats || []).find((c) => c.listing_id === result.order.listing_id);
+          // One query for this order's chat — the old code loaded the
+          // whole conversation list (with a last-message + unread
+          // query per chat) just to find one chat id.
+          const match = await fetchConversationForListing(result.order.listing_id, user.id);
           if (match) setChatId(match.id);
         }
       }
@@ -430,8 +433,7 @@ export default function Tracking() {
           <p className="mt-2 text-4xl font-bold tracking-[0.3em]">{order.delivery_pin}</p>
           <p className="mt-2 text-sm">Share this PIN with the courier at handover.</p>
           <p className="mt-1 text-xs text-neutral-500">
-            Only you can see this PIN — the seller never sees it. The courier says the PIN
-            back to you, or you type it below to confirm delivery.
+            The courier says the PIN back to you, or you type it below to confirm delivery.
           </p>
         </section>
       )}
@@ -624,8 +626,25 @@ export default function Tracking() {
                   ? "The 50% shipping advance was released to your available balance."
                   : "No shipping advance was released for this proof — the full shipping fee is released when the buyer confirms delivery."}
               </p>
+              {["shipped", "delivered"].includes(order.status) &&
+                !order.shipping_advance_released &&
+                order.waybill_number &&
+                order.receipt_photo &&
+                courierEarnsAdvance(order.courier) && (
+                  <div className="mt-3">
+                    <PrimaryButton
+                      disabled={busy !== ""}
+                      onClick={() => run("advance", () => retryShippingAdvance(order.id))}
+                    >
+                      {busy === "advance" ? "Releasing…" : "Retry shipping advance — release my 50%"}
+                    </PrimaryButton>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      Your proof is complete, but the advance never moved — tap to release it now.
+                    </p>
+                  </div>
+                )}
               <p className="mt-1 text-neutral-500">
-                The delivery PIN is only shown to the buyer — you never see it.
+                The delivery PIN is shown to the buyer on this page — they share it with the courier at handover.
               </p>
               {order.waybill_photo && (
                 <p className="mt-2">

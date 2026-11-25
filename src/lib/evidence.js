@@ -334,11 +334,76 @@ async function toBlob(fileOrBlob) {
   return fileOrBlob;
 }
 
+// Measure a video blob's real length from the file itself, instead of
+// trusting the duration the caller claims. Before this fix the
+// duration came from recordVideo's wall-clock timer (or from any
+// number a caller passed to uploadEvidence), so a 1-second clip — or
+// a photo renamed .webm — could be uploaded claiming 15 seconds and
+// earn a verified packing tick, and the database trigger recomputes
+// verified from that same claimed number, so it could not catch it
+// either. The measured length wins whenever the browser can read it;
+// when it cannot (unplayable file, timeout) the caller's number is
+// used as before and the row is still judged by the same rules.
+async function measureVideoDuration(blob) {
+  if (typeof document === "undefined" || !blob) return null;
+  const url = URL.createObjectURL(blob);
+  try {
+    return await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const timer = setTimeout(() => done(null), 5000);
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.onerror = () => {
+        clearTimeout(timer);
+        done(null);
+      };
+      video.onloadedmetadata = () => {
+        const d = video.duration;
+        if (Number.isFinite(d) && d > 0) {
+          clearTimeout(timer);
+          done(Math.round(d));
+          return;
+        }
+        // MediaRecorder webm files often report Infinity until the
+        // player seeks: jump to the end and read the real duration.
+        if (d === Infinity) {
+          const onSeek = () => {
+            clearTimeout(timer);
+            done(Number.isFinite(video.duration) && video.duration > 0 ? Math.round(video.duration) : null);
+          };
+          video.onseeked = onSeek;
+          video.ondurationchange = onSeek;
+          try {
+            video.currentTime = Number.MAX_SAFE_INTEGER;
+          } catch {
+            done(null);
+          }
+          return;
+        }
+        clearTimeout(timer);
+        done(null);
+      };
+      video.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 // Uploads the file to the evidence-media bucket at
 // <user-id>/evidence-<orderId>-<kind>-<timestamp>.<ext>, inserts the
 // evidence row, and sets verified=true ONLY when the media passes its
 // rule (video duration inside the kind's range, or a photo kind with a
 // file present). Otherwise verified=false with a plain verified_reason.
+// A video's duration is measured from the file itself, not taken on
+// trust from the caller — a clip claiming to be 15s that is really 1s
+// is stored unverified.
 export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob, durationSeconds }) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!orderId) throw new Error("Missing order.");
@@ -379,6 +444,13 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob, dur
         : "That video is too big — keep evidence videos under 100MB."
     );
   }
+  // Video length is measured from the file itself (see
+  // measureVideoDuration): the duration the caller claims is only a
+  // fallback when the file cannot be measured, never the authority.
+  const measuredDuration =
+    mediaType === "video"
+      ? (await measureVideoDuration(blob)) ?? durationSeconds ?? null
+      : null;
   const ext = extensionFor(fileOrBlob, mediaType);
   const path = `${user.id}/evidence-${orderId}-${kind}-${Date.now()}.${ext}`;
   const { error: uploadError } = await supabase.storage
@@ -392,7 +464,7 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob, dur
   const check = verifyEvidenceRow({
     kind,
     media_type: mediaType,
-    duration_seconds: mediaType === "video" ? durationSeconds ?? null : null,
+    duration_seconds: mediaType === "video" ? measuredDuration : null,
   });
   const { data, error } = await supabase
     .from("evidence")
@@ -402,7 +474,7 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob, dur
       kind,
       media_type: mediaType,
       url: urlData.publicUrl,
-      duration_seconds: mediaType === "video" ? durationSeconds ?? null : null,
+      duration_seconds: mediaType === "video" ? measuredDuration : null,
       verified: check.verified,
       verified_reason: check.verified_reason,
     })

@@ -28,15 +28,16 @@ export async function getBalances(userId) {
   return balances;
 }
 
-// Newest first. The order code is joined in where the database lets us,
-// so each entry can show which order it belongs to.
+// Newest first, at most 200 rows. The wallet page renders every row,
+// so an unbounded fetch grows with every order the student ever has.
 export async function fetchLedger(userId) {
   if (!supabase || !userId) return [];
   const { data, error } = await supabase
     .from("wallet_ledger")
     .select("*, orders(code)")
     .eq("user_id", userId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(200);
   if (error) {
     dbError(error, "fetch wallet ledger");
     return [];

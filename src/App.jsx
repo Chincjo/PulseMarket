@@ -93,10 +93,17 @@ function Shell() {
 
   // Milestone 10: app-side 48h auto-release — once per sign-in, release
   // any of this student's delivered orders whose 48h window has passed.
-  // Fire-and-forget; runAutoReleaseCheck never throws.
+  // Fire-and-forget; runAutoReleaseCheck never throws. It also re-runs
+  // hourly while the student stays signed in: the old code only ran
+  // once per sign-in, so money sat past its 48 hours for anyone who
+  // never signed out and back in again.
   useEffect(() => {
     if (!user) return;
     runAutoReleaseCheck(user).catch(() => {});
+    const timer = setInterval(() => {
+      runAutoReleaseCheck(user).catch(() => {});
+    }, 60 * 60 * 1000);
+    return () => clearInterval(timer);
   }, [user]);
 
   // Milestone 10: unread notification count for the header bell,

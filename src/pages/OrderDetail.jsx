@@ -263,6 +263,14 @@ export default function OrderDetail() {
         </p>
       )}
 
+      {/* A return that is open pauses any release until the team
+          resolves it — the money must stay put for the refund. */}
+      {order.return_status === "opened" && (isBuyer || isSeller || isOwner) && (
+        <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm dark:bg-neutral-900">
+          A return is open for this order — release is paused until the PulseMarket team resolves it.
+        </p>
+      )}
+
       {/* Deal steps — handoff (meetup) and shipping/tracking live on their own pages */}
       {!ended && (isBuyer || isSeller) && (
         <section className="space-y-2">
@@ -343,7 +351,7 @@ export default function OrderDetail() {
             {busy === "held" ? "Saving…" : "Confirm receipt — money now held"}
           </PrimaryButton>
         )}
-        {(isOwner || isBuyer) && ["held", "delivered"].includes(order.status) && order.payment_method === "held" && (
+        {(isOwner || isBuyer) && ["held", "delivered"].includes(order.status) && order.payment_method === "held" && !order.frozen && order.return_status !== "opened" && (
           <PrimaryButton
             className="w-full py-3"
             disabled={busy !== ""}

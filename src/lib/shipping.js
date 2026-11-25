@@ -166,7 +166,13 @@ export function courierTiers(itemPrice) {
     return {
       tier: 2,
       label: "Tier 2 — Peace or ABC",
-      allowedCouriers: ["Peace Logistics", "ABC Transport"],
+      allowedCouriers: [
+        "Peace Logistics",
+        "ABC Transport",
+        "GIG Logistics",
+        "GUO Transport",
+        "DHL Domestic",
+      ],
       note: "This item costs under ₦10,000, so the cheaper interstate couriers Peace Logistics or ABC Transport are allowed. GIG, GUO and DHL are also accepted but cost more.",
     };
   }
@@ -194,9 +200,15 @@ export function courierEarnsAdvance(courier) {
 
 // 6 digits, leading zeros kept (it is stored and compared as text).
 export function generateDeliveryPin() {
+  const bytes = new Uint32Array(6);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 6; i++) bytes[i] = Math.floor(Math.random() * 0xffffffff);
+  }
   let pin = "";
   for (let i = 0; i < 6; i++) {
-    pin += Math.floor(Math.random() * 10);
+    pin += String(bytes[i] % 10);
   }
   return pin;
 }
@@ -247,7 +259,23 @@ export async function submitShippingProof(
   if (order.seller_id !== user.id) {
     throw new Error("Only the seller can submit shipping proof for this order.");
   }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   if (order.status !== "held") {
+    // Retry path: the proof was already saved and the order already
+    // shipped, but the advance never moved (an earlier attempt died
+    // after shipping). Release it from the stored proof instead of
+    // refusing outright.
+    if (
+      ["shipped", "delivered"].includes(order.status) &&
+      order.waybill_number &&
+      order.receipt_photo &&
+      courierEarnsAdvance(order.courier) &&
+      !order.shipping_advance_released
+    ) {
+      return retryShippingAdvance(orderId);
+    }
     throw new Error(
       `This order is ${order.status} — shipping proof can only be submitted once the money is held.`
     );
@@ -258,6 +286,13 @@ export async function submitShippingProof(
   const waybill = String(waybillNumber || "").trim();
   if (!waybill) {
     throw new Error("Type in the waybill number from the paper waybill.");
+  }
+  if (waybill.length > 64) {
+    throw new Error("Keep the waybill number under 64 characters.");
+  }
+  const cleanDriverPhone = driverPhone ? String(driverPhone).trim() : "";
+  if (cleanDriverPhone && !/^\+?[0-9][0-9 ()-]{6,14}$/.test(cleanDriverPhone)) {
+    throw new Error("That driver phone number does not look right.");
   }
   if (!waybillPhoto) {
     throw new Error("Take a photo of the waybill — hold the paper steady, good light, all four corners visible.");
@@ -276,15 +311,156 @@ export async function submitShippingProof(
     courierEarnsAdvance(order.courier) && Boolean(waybill) && Boolean(receiptUrl);
   const advanceAmount = Math.floor((Number(order.shipping_fee) || 0) / 2);
 
+  // STEP 1 — save the proof and ship the order FIRST. The database
+  // (supabase/milestone-15.sql) only pays a shipping advance once
+  // the waybill number + receipt photo are already on the order, so
+  // an advance can no longer be taken with no proof behind it. The
+  // old order (advance first, proof second) could not satisfy that
+  // rule at all.
+  let shipped;
+  try {
+    shipped = await updateOrder(orderId, {
+      waybill_number: waybill,
+      waybill_photo: waybillUrl,
+      receipt_photo: receiptUrl,
+      driver_phone: cleanDriverPhone || null,
+      shipping_proof_at: new Date().toISOString(),
+      delivery_pin: generateDeliveryPin(),
+      status: "shipped",
+    });
+  } catch (err) {
+    // Lost a race: another device already shipped this order with
+    // its own proof. The order is shipped — say so instead of
+    // failing, and let the tracking page retry the advance if one
+    // is still due.
+    const fresh = await readOrder(orderId);
+    if (fresh && ["shipped", "delivered"].includes(fresh.status) && fresh.waybill_number) {
+      return {
+        order: fresh,
+        advanceReleased: Boolean(fresh.shipping_advance_released),
+        reason: "Shipping proof was already submitted for this order — the order is shipped.",
+      };
+    }
+    throw err;
+  }
+
+  // STEP 2 — pay the advance, only for a complete proof. An advance
+  // row can already exist while the order has no waybill saved (the
+  // old flow moved the money, then the order update never landed):
+  // in that case just carry on without moving money again. Any other
+  // failure here must NOT throw the whole submission away — the
+  // order is already shipped, so report the advance as pending and
+  // let the seller retry it from the tracking page.
   let advanceReleased = false;
+  let advancePending = false;
   let reason;
   if (proofComplete && advanceAmount > 0) {
-    // Double-submit guard: the advance must move exactly once. The
-    // database refuses a second advance pair too (unique indexes in
-    // supabase/milestone-14.sql); this check gives the plain error.
-    if (order.shipping_advance_released || (await advanceAlreadyReleased(order.id)) > 0) {
-      throw new Error("Shipping proof was already submitted for this order — the advance moved once.");
+    const alreadyAdvanced =
+      shipped.shipping_advance_released || (await advanceAlreadyReleased(order.id)) > 0;
+    if (alreadyAdvanced) {
+      advanceReleased = true;
+      reason = `Proof recorded — the 50% shipping advance (${advanceAmount.toLocaleString("en-NG")} naira) was already in your available balance. The rest is released when the buyer confirms delivery.`;
+    } else {
+      try {
+        await recordLedgerMove(shipped, [
+          {
+            userId: shipped.seller_id,
+            bucket: "held",
+            kind: "shipping_advance",
+            amount: -advanceAmount,
+            note: `Shipping advance (50%) for order ${shipped.code}`,
+          },
+          {
+            userId: shipped.seller_id,
+            bucket: "available",
+            kind: "shipping_advance",
+            amount: advanceAmount,
+            note: `Shipping advance (50%) for order ${shipped.code}`,
+          },
+        ]);
+        advanceReleased = true;
+        reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
+      } catch (err) {
+        if (err?.code === "23505") {
+          // Another device paid the advance a moment ago.
+          advanceReleased = true;
+          reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
+        } else {
+          advancePending = true;
+          reason =
+            "Proof recorded and the order is now shipped — but the 50% shipping advance could not be released yet. Use “Retry shipping advance” on the tracking page to release it.";
+        }
+      }
     }
+  } else if (!courierEarnsAdvance(order.courier)) {
+    reason =
+      order.courier === "Bus Park Waybill"
+        ? "Proof recorded and the order is now shipped — but a bus-park waybill (driver phone only, no receipt) never earns the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery."
+        : "Proof recorded and the order is now shipped — but this courier does not earn the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery.";
+  } else if (!receiptUrl) {
+    reason =
+      "Proof recorded and the order is now shipped — but there is no receipt photo, so no shipping advance was released. The full shipping fee is released when the buyer confirms delivery.";
+  } else {
+    reason =
+      "Proof recorded and the order is now shipped. The shipping fee is released when the buyer confirms delivery.";
+  }
+
+  // STEP 3 — record that the advance moved. Best effort: on the old
+  // database this flag-only update is refused (it needs the
+  // held -> shipped move), so the flag stays false until the
+  // database update lands — the tracking page then offers the retry.
+  if (advanceReleased) {
+    try {
+      await updateOrder(orderId, { shipping_advance_released: true });
+    } catch (err) {
+      dbError(err, "mark shipping advance released");
+    }
+  }
+  const fresh = (await readOrder(orderId)) || shipped;
+  return { order: fresh, advanceReleased, advancePending, reason };
+}
+
+// Release a shipping advance that is still owed after the proof was
+// already saved — used when an earlier submit shipped the order but
+// the advance insert failed (or the old database refused it), and by
+// the "Retry shipping advance" button on the tracking page. The
+// proof on the order is re-checked: no waybill + receipt, no advance.
+export async function retryShippingAdvance(orderId) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const user = await currentUser();
+  if (!user) throw new Error("Sign in first.");
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.seller_id !== user.id) {
+    throw new Error("Only the seller can release the shipping advance for this order.");
+  }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  if (!["shipped", "delivered"].includes(order.status)) {
+    throw new Error(
+      `This order is ${order.status} — the shipping advance is released once the order has shipped.`
+    );
+  }
+  if (order.shipping_advance_released) {
+    return {
+      order,
+      advanceReleased: true,
+      reason: "The 50% shipping advance was already released to your available balance.",
+    };
+  }
+  if (
+    !courierEarnsAdvance(order.courier) ||
+    !order.waybill_number ||
+    !order.receipt_photo
+  ) {
+    throw new Error("No shipping advance is due for this proof — it needs a tracked courier, a waybill number and a receipt photo.");
+  }
+  const advanceAmount = Math.floor((Number(order.shipping_fee) || 0) / 2);
+  if (advanceAmount <= 0) {
+    throw new Error("No shipping advance is due for this order.");
+  }
+  if ((await advanceAlreadyReleased(order.id)) <= 0) {
     try {
       await recordLedgerMove(order, [
         {
@@ -303,37 +479,26 @@ export async function submitShippingProof(
         },
       ]);
     } catch (err) {
-      if (err?.code === "23505") {
-        throw new Error("Shipping proof was already submitted for this order — the advance moved once.");
-      }
-      throw err;
+      if (err?.code !== "23505") throw err;
+      // Another device paid it a moment ago — carry on to the flag.
     }
-    advanceReleased = true;
-    reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
-  } else if (!courierEarnsAdvance(order.courier)) {
-    reason =
-      order.courier === "Bus Park Waybill"
-        ? "Proof recorded and the order is now shipped — but a bus-park waybill (driver phone only, no receipt) never earns the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery."
-        : "Proof recorded and the order is now shipped — but this courier does not earn the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery.";
-  } else if (!receiptUrl) {
-    reason =
-      "Proof recorded and the order is now shipped — but there is no receipt photo, so no shipping advance was released. The full shipping fee is released when the buyer confirms delivery.";
-  } else {
-    reason =
-      "Proof recorded and the order is now shipped. The shipping fee is released when the buyer confirms delivery.";
   }
-
-  const updated = await updateOrder(orderId, {
-    waybill_number: waybill,
-    waybill_photo: waybillUrl,
-    receipt_photo: receiptUrl,
-    driver_phone: driverPhone ? String(driverPhone).trim() : null,
-    shipping_proof_at: new Date().toISOString(),
-    delivery_pin: generateDeliveryPin(),
-    shipping_advance_released: advanceReleased,
-    status: "shipped",
-  });
-  return { order: updated, advanceReleased, reason };
+  try {
+    await updateOrder(orderId, { shipping_advance_released: true });
+  } catch {
+    // The flag-only update needs supabase/milestone-15.sql. The
+    // money has still moved — say so plainly instead of failing.
+    return {
+      order: (await readOrder(orderId)) || order,
+      advanceReleased: true,
+      reason: `The 50% shipping advance (${advanceAmount.toLocaleString("en-NG")} naira) is in your available balance. The tracking page will show it once the database update is run.`,
+    };
+  }
+  return {
+    order: (await readOrder(orderId)) || order,
+    advanceReleased: true,
+    reason: `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -349,8 +514,19 @@ export async function addCheckpoint(orderId, { status, location, note, photo }) 
   if (order.seller_id !== user.id) {
     throw new Error("Only the seller can add a checkpoint for this order.");
   }
+  if (!["shipped", "delivered"].includes(order.status)) {
+    throw new Error(
+      `This order is ${order.status} — checkpoints start once the parcel has shipped.`
+    );
+  }
   if (!CHECKPOINT_LABELS[status]) {
     throw new Error("Choose a checkpoint status.");
+  }
+  if (location && String(location).trim().length > 120) {
+    throw new Error("Keep the location under 120 characters.");
+  }
+  if (note && String(note).trim().length > 280) {
+    throw new Error("Keep the note under 280 characters.");
   }
   let photoUrl = null;
   if (photo) {
@@ -436,6 +612,9 @@ export async function openReturn(orderId, { reason, fault }) {
   if (order.buyer_id !== user.id) {
     throw new Error("Only the buyer can open a return for this order.");
   }
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   if (!["shipped", "delivered"].includes(order.status)) {
     throw new Error(
       `This order is ${order.status} — a return can only be opened after the item has shipped.`
@@ -447,7 +626,9 @@ export async function openReturn(orderId, { reason, fault }) {
   if (!["seller", "buyer"].includes(fault)) {
     throw new Error("Say whose fault the return is: the seller's or yours.");
   }
-  if (!reason) throw new Error("Choose a reason for the return.");
+  if (!reason || !RETURN_REASONS.includes(reason)) {
+    throw new Error("Choose a reason for the return from the list.");
+  }
   const updated = await updateOrder(orderId, {
     return_status: "opened",
     return_reason: `${fault === "seller" ? "Seller fault" : "Buyer fault"}: ${reason}`,
@@ -489,6 +670,9 @@ export async function resolveReturn(orderId, { fault }) {
   }
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   if (order.return_status !== "opened") {
     throw new Error("There is no open return for this order.");
   }
@@ -508,6 +692,10 @@ export async function resolveReturn(orderId, { fault }) {
   // Double-resolve guard: the refund must move exactly once. The
   // database refuses a second refund pair too (unique indexes in
   // supabase/milestone-14.sql); this check gives the plain error.
+  // BUT a refund row can exist while the order still says the return
+  // is open — the money moved, then the status update never landed.
+  // Throwing then would leave the order stuck for ever, so just close
+  // it out instead of moving money again.
   if (supabase) {
     const { data: existingRefund } = await supabase
       .from("wallet_ledger")
@@ -517,7 +705,31 @@ export async function resolveReturn(orderId, { fault }) {
       .eq("bucket", "held")
       .limit(1);
     if (existingRefund && existingRefund.length > 0) {
-      throw new Error("This return was already resolved — the refund moved once.");
+      if (order.status === "refunded" && order.return_status === "resolved") {
+        throw new Error("This return was already resolved — the refund moved once.");
+      }
+      const closed = await updateOrder(orderId, {
+        status: "refunded",
+        return_status: "resolved",
+      });
+      notifyUser(order.buyer_id, {
+        kind: "dispute",
+        title: "Return resolved",
+        body: `The return for order ${order.code} was resolved.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+      notifyUser(order.seller_id, {
+        kind: "dispute",
+        title: "Return resolved",
+        body: `The return for order ${order.code} was resolved.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+      return {
+        order: closed,
+        note: "This return was already resolved — the refund moved once, so this just closes the order out.",
+      };
     }
   }
   // Money still sitting in the seller's held bucket for this order:
@@ -631,6 +843,14 @@ export async function resolveReturn(orderId, { fault }) {
 // gates — this helper only records the debt.
 export async function recordSellerDebt(orderId, amount, note) {
   if (!supabase) throw new Error("Supabase is not configured.");
+  // Only the PulseMarket team records a seller debt. Without this
+  // check any order participant could call this helper directly and
+  // write an arbitrary debt against the seller — the database only
+  // checks that the debt belongs to the seller and is negative.
+  const user = await currentUser();
+  if (!user || user.email !== OWNER_EMAIL) {
+    throw new Error("Only the PulseMarket team can record a seller debt.");
+  }
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
   const owed = Math.max(0, Math.round(Number(amount) || 0));

@@ -138,6 +138,9 @@ export async function ensureSellerCode(orderId) {
   if (order.handoff_locked) {
     throw new Error("This handoff is locked — contact support.");
   }
+  if (["cancelled", "refunded", "released"].includes(order.status)) {
+    throw new Error("This order is closed — there is no handoff to open.");
+  }
   const { data: existing, error: readError } = await supabase
     .from("handoff_codes")
     .select("code")

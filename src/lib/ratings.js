@@ -162,7 +162,8 @@ export async function fetchRatingsForSeller(sellerId) {
     .from("ratings")
     .select("*")
     .eq("rated_id", sellerId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100);
   if (error) {
     dbError(error, "fetch ratings for seller");
     return [];

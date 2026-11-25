@@ -44,9 +44,15 @@ function dbError(err, where) {
 // code as the bank-transfer reference, so it must be unique and readable.
 export function generateOrderCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint32Array(6);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 6; i++) bytes[i] = Math.floor(Math.random() * 0xffffffff);
+  }
   let code = "";
   for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
+    code += chars[bytes[i] % chars.length];
   }
   return `PM-ORD-${code}`;
 }
@@ -175,14 +181,43 @@ export async function createOrder({
   if (deliveryMethod === "shipping" && !shipToState) {
     throw new Error("Choose the state to ship to.");
   }
+  // The delivery method must be one the seller actually offers — a
+  // direct call used to be able to order shipping on a meetup-only
+  // listing (and vice versa).
+  if (Array.isArray(listing.delivery_methods) && listing.delivery_methods.length > 0) {
+    if (!listing.delivery_methods.includes(deliveryMethod)) {
+      throw new Error(
+        deliveryMethod === "shipping"
+          ? "This seller does not ship this item — meet in person instead."
+          : "This seller does not offer meet-in-person for this item — choose shipping instead."
+      );
+    }
+  }
+  // A same-state-only listing never leaves the seller's state, and a
+  // meetup only makes sense in the seller's state either.
+  if (listing.ships_to === "same_state" && listing.state) {
+    if (deliveryMethod === "shipping" && shipToState && shipToState !== listing.state) {
+      throw new Error(`This item only ships within ${listing.state}.`);
+    }
+    if (deliveryMethod === "meetup" && buyerState && buyerState !== listing.state) {
+      throw new Error(`This item is only for students in ${listing.state}.`);
+    }
+  }
 
   const fees = feeBreakdown(
     listing.price,
     paymentMethod === "cash" ? "cash" : "held"
   );
+  // The shipping zone is priced from the ship-to state — the parcel
+  // goes where ship_to_state says, not where the buyer's university
+  // is. (Pricing it from buyerState charged the wrong zone whenever
+  // the two differed, and the total shown at checkout did not match
+  // the total charged. The server re-derives the same fee in
+  // supabase/milestone-15.sql.) Fall back to buyerState only when
+  // no ship-to state was picked, matching the checkout display.
   const zone =
     deliveryMethod === "shipping"
-      ? shippingZone(buyerState, listing.state)
+      ? shippingZone(shipToState || buyerState, listing.state)
       : null;
   const shippingFee = zone ? zone.fee : 0;
   const total = fees.total + shippingFee;
@@ -208,14 +243,43 @@ export async function createOrder({
     })
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // Two buyers reserving the same item at the same time: the
+    // second insert hits the one-open-order-per-listing index
+    // (supabase/milestone-15.sql) — say so plainly.
+    if (
+      error?.code === "23505" &&
+      String(error.message || "").includes("orders_one_open_order_per_listing_idx")
+    ) {
+      throw new Error("This item was just reserved by someone else — try another item.");
+    }
+    throw error;
+  }
 
   // Hold the listing so nobody else can buy it while this order is open.
   // If that fails, remove the order again rather than leaving a stray.
+  // There is no DELETE policy on orders, so a direct delete is refused
+  // by the database — fall back to cancelling the order instead, which
+  // the order rules do allow (reserved -> cancelled, buyer).
   try {
     await updateListing(listing.id, { status: "reserved" });
   } catch (err) {
-    await supabase.from("orders").delete().eq("id", data.id);
+    try {
+      const { error: delError } = await supabase
+        .from("orders")
+        .delete()
+        .eq("id", data.id);
+      if (delError) {
+        await supabase
+          .from("orders")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .eq("id", data.id);
+      }
+    } catch {
+      // Best effort only — the order is still 'reserved' and the
+      // listing was never held, so the buyer sees the error and the
+      // team can cancel the stray order by hand.
+    }
     throw err;
   }
   return data;
@@ -262,6 +326,9 @@ export async function fetchOrdersForListing(listingId) {
 export async function markPaid(orderId, userId) {
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   if (order.payment_method === "cash") {
     throw new Error("Cash orders are paid face to face — nothing to transfer.");
   }
@@ -286,14 +353,46 @@ export async function confirmReceipt(orderId, user) {
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
+  // The double-confirm check comes before the status check on purpose:
+  // a retry after a completed confirm (status already 'held', hold row
+  // already written) must return the order, not throw "there is no
+  // transfer to confirm" for a transfer that was already confirmed.
+  if (await ledgerMoveExists(order.id, "hold", "held")) {
+    return finishHeld();
+  }
   if (order.status !== "paid") {
     throw new Error(`This order is ${order.status} — there is no transfer to confirm.`);
   }
   // Double-confirm guard: the money must enter hold exactly once.
   // The database refuses a second hold row too (unique index in
   // supabase/milestone-14.sql); this check gives the plain error.
-  if (await ledgerMoveExists(order.id, "hold", "held")) {
-    throw new Error("This transfer was already confirmed — the money is already held.");
+  // BUT a hold row can exist while the order still says 'paid' — the
+  // money moved, then the status update never landed (network
+  // dropped). Throwing "already confirmed" then would leave the
+  // order stuck in 'paid' for ever, so finish the move instead.
+  async function finishHeld() {
+    if (order.status === "held") return order;
+    if (order.status !== "paid") {
+      throw new Error("This transfer was already confirmed — the money is already held.");
+    }
+    const updated = await updateOrder(orderId, { status: "held", held_at: new Date().toISOString() });
+    // The first attempt moved the money but never sent these (it died
+    // before the status update), so send them on the recovery run.
+    notifyUser(order.buyer_id, {
+      kind: "order",
+      title: "Payment confirmed",
+      body: `Your transfer for order ${order.code} arrived — the money is now held.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    notifyUser(order.seller_id, {
+      kind: "order",
+      title: "Money held",
+      body: `The buyer paid for order ${order.code} — the money is held until delivery.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    return updated;
   }
   try {
     await recordLedgerMove(order, [
@@ -307,7 +406,7 @@ export async function confirmReceipt(orderId, user) {
     ]);
   } catch (err) {
     if (err?.code === "23505") {
-      throw new Error("This transfer was already confirmed — the money is already held.");
+      return finishHeld();
     }
     throw err;
   }
@@ -401,7 +500,11 @@ export async function confirmDelivery(orderId, userId) {
     }
     await requireUnboxingEvidence(order);
     const updated = await updateOrder(orderId, { status: "delivered", delivered_at: now });
-    await updateListing(order.listing_id, { status: "sold" });
+    try {
+      await updateListing(order.listing_id, { status: "sold" });
+    } catch (err) {
+      console.error("[PulseMarket] delivery: could not mark listing sold:", err?.message || err);
+    }
     return updated;
   }
   if (!["held", "shipped"].includes(order.status)) {
@@ -430,6 +533,14 @@ export async function releaseOrder(orderId, user) {
   if (!allowed) {
     throw new Error("Only the buyer or the PulseMarket team can release this order.");
   }
+  // The double-release check comes before the status / frozen /
+  // handoff gates on purpose: a retry after a completed release
+  // (money moved, order already 'released') must finish quietly —
+  // including marking the listing sold — not throw "there is no held
+  // money to release" for money that was already released.
+  if (await ledgerMoveExists(order.id, "release", "held")) {
+    return finishRelease();
+  }
   if (!["held", "delivered"].includes(order.status)) {
     throw new Error(`This order is ${order.status} — there is no held money to release.`);
   }
@@ -438,6 +549,12 @@ export async function releaseOrder(orderId, user) {
   // until supabase/milestone-12.sql is run, which is safely falsy.
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  // A return that is open stops any release: the money must stay
+  // put until the team resolves the return, or the refund would
+  // have nothing left to pay from.
+  if (order.return_status === "opened") {
+    throw new Error("A return is open for this order — the PulseMarket team resolves it first.");
   }
   // Milestone 7 gate: a meet-in-person order releases only after the
   // handoff is complete — code scanned, both photos, both confirmations.
@@ -459,8 +576,53 @@ export async function releaseOrder(orderId, user) {
   // The database refuses a second release pair too (unique indexes
   // in supabase/milestone-14.sql); this check gives the plain error
   // and stops a double-click or two racing devices from paying twice.
-  if (await ledgerMoveExists(order.id, "release", "held")) {
-    throw new Error("This order was already released — the money moved once.");
+  // BUT a release pair can exist while the order still says 'held' /
+  // 'delivered' — the money moved, then the status update never
+  // landed (network dropped). Throwing "already released" then would
+  // leave the order stuck for ever, so finish the move instead.
+  async function finishRelease() {
+    // A return opened after the money moved still stops the
+    // release from completing — the team resolves the return first.
+    if (order.return_status === "opened") {
+      throw new Error("A return is open for this order — the PulseMarket team resolves it first.");
+    }
+    // The listing flip is best effort: if it fails the money has
+    // still moved and the order is still closed out — the seller can
+    // mark the listing sold by hand, and the next load retries it.
+    async function markSold() {
+      try {
+        await updateListing(order.listing_id, { status: "sold" });
+      } catch (err) {
+        console.error("[PulseMarket] release: could not mark listing sold:", err?.message || err);
+      }
+    }
+    if (order.status === "released") {
+      await markSold();
+      return order;
+    }
+    if (!["held", "delivered"].includes(order.status)) {
+      throw new Error("This order was already released — the money moved once.");
+    }
+    const updated = await updateOrder(orderId, {
+      status: "released",
+      released_at: new Date().toISOString(),
+    });
+    await markSold();
+    notifyUser(order.buyer_id, {
+      kind: "release",
+      title: "Money released",
+      body: `The held money for order ${order.code} was released to the seller.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    notifyUser(order.seller_id, {
+      kind: "release",
+      title: "Money released",
+      body: `The held money for order ${order.code} is now in your available balance.`,
+      link: `/order/${order.id}`,
+      orderId: order.id,
+    });
+    return updated;
   }
   try {
     await recordLedgerMove(order, [
@@ -481,7 +643,7 @@ export async function releaseOrder(orderId, user) {
     ]);
   } catch (err) {
     if (err?.code === "23505") {
-      throw new Error("This order was already released — the money moved once.");
+      return finishRelease();
     }
     throw err;
   }
@@ -489,7 +651,11 @@ export async function releaseOrder(orderId, user) {
     status: "released",
     released_at: new Date().toISOString(),
   });
-  await updateListing(order.listing_id, { status: "sold" });
+  try {
+    await updateListing(order.listing_id, { status: "sold" });
+  } catch (err) {
+    console.error("[PulseMarket] release: could not mark listing sold:", err?.message || err);
+  }
   notifyUser(order.buyer_id, {
     kind: "release",
     title: "Money released",
@@ -531,18 +697,40 @@ export async function cancelOrder(orderId, userId) {
       .eq("kind", "hold");
     const held = (data || []).reduce((sum, r) => sum + (r.amount || 0), 0);
     if (held !== 0) {
-      await recordLedgerMove(order, [
-        {
-          userId: order.seller_id,
-          bucket: "held",
-          kind: "refund",
-          amount: -held,
-          note: `Hold reversed — order ${order.code} cancelled`,
-        },
-      ]);
+      // If a reversal was already written (the first cancel moved the
+      // money back but the status update never landed), do not write
+      // it again — the one-per-order refund index would refuse it and
+      // the cancel could never complete.
+      const { data: existingRefund } = await supabase
+        .from("wallet_ledger")
+        .select("id")
+        .eq("order_id", order.id)
+        .eq("kind", "refund")
+        .eq("bucket", "held")
+        .limit(1);
+      if (!existingRefund || existingRefund.length === 0) {
+        try {
+          await recordLedgerMove(order, [
+            {
+              userId: order.seller_id,
+              bucket: "held",
+              kind: "refund",
+              amount: -held,
+              note: `Hold reversed — order ${order.code} cancelled`,
+            },
+          ]);
+        } catch (err) {
+          if (err?.code !== "23505") throw err;
+          // Another device already wrote the reversal — carry on.
+        }
+      }
     }
   }
   const updated = await updateOrder(orderId, { status: "cancelled" });
-  await updateListing(order.listing_id, { status: "active" });
+  try {
+    await updateListing(order.listing_id, { status: "active" });
+  } catch (err) {
+    console.error("[PulseMarket] cancel: could not put listing back to active:", err?.message || err);
+  }
   return updated;
 }

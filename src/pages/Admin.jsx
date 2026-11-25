@@ -242,6 +242,7 @@ export default function Admin() {
                             value={resolutionNote}
                             onChange={(e) => setResolutionNote(e.target.value)}
                             placeholder="Say how this was decided, in one or two lines."
+                            maxLength={1000}
                             disabled={resolving}
                           />
                           <p className="mt-1 text-xs text-neutral-500">

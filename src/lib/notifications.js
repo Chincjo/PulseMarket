@@ -160,12 +160,24 @@ export async function notifyUser(userId, { kind, title, body, link, orderId, con
   }
   if (!title || !String(title).trim()) return null;
   if (!kindAllowed(kind)) return null;
+  // Clamp to the insert_notification RPC's caps (title 200, body 500,
+  // link 500) instead of sending an overlong payload the server
+  // rejects whole — a long checkpoint location used to drop the entire
+  // notification. Links stay in-app only: the Notifications page
+  // navigates to item.link, so an external URL stored here must never
+  // be passed through.
+  const cleanTitle = String(title).trim().slice(0, 200);
+  const cleanBody = body ? String(body).trim().slice(0, 500) || null : null;
+  const cleanLink =
+    link && String(link).trim().startsWith("/")
+      ? String(link).trim().slice(0, 500)
+      : null;
   const { data, error } = await supabase.rpc("insert_notification", {
     p_user_id: userId,
     p_kind: kind,
-    p_title: String(title).trim(),
-    p_body: body ? String(body).trim() : null,
-    p_link: link ? String(link).trim() : null,
+    p_title: cleanTitle,
+    p_body: cleanBody,
+    p_link: cleanLink,
     p_order_id: orderId || null,
     p_conversation_id: conversationId || null,
   });

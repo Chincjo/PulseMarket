@@ -13,6 +13,7 @@ import { SAFE_MEETUP_SPOTS } from "../lib/data";
 import { formatNaira } from "../lib/fees";
 import {
   MAX_MESSAGE_LENGTH,
+  MAX_OFFER_NAIRA,
   QUICK_REPLIES,
   blockUser,
   fetchBlockedIds,
@@ -144,8 +145,8 @@ export default function ChatThread() {
       return;
     }
     // No upper bound before: an offer of ₦999,999,999 went through.
-    if (amount > 10000000) {
-      setError("Offer is too high — keep it under ₦10,000,000.");
+    if (amount > MAX_OFFER_NAIRA) {
+      setError(`Offer is too high — keep it under ₦${MAX_OFFER_NAIRA.toLocaleString("en-NG")}.`);
       return;
     }
     setSending(true);

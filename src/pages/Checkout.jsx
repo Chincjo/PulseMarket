@@ -78,9 +78,21 @@ export default function Checkout() {
   const total = fees ? fees.total + shippingFee : 0;
 
   const canMeet = listing ? (listing.delivery_methods || []).includes("meetup") : true;
+  // Shipping only when the seller actually offers it. The old check
+  // also allowed shipping for any nationwide listing, so a meetup-only
+  // listing could be ordered for shipping.
   const canShip = listing
-    ? (listing.delivery_methods || []).includes("shipping") || listing.ships_to === "nationwide"
+    ? (listing.delivery_methods || []).includes("shipping")
     : true;
+  // Chowdeck Relay is same-city only — it must never be offered for
+  // shipping to another state.
+  const courierOptions =
+    shipToState && listing && shipToState !== listing.state
+      ? COURIERS.filter((c) => c !== "Chowdeck Relay")
+      : COURIERS;
+  const effectiveCourier = courierOptions.includes(courier)
+    ? courier
+    : courierOptions[0];
 
   async function reserve() {
     if (!listing || !user) return;
@@ -105,7 +117,7 @@ export default function Checkout() {
         deliveryMethod,
         meetupSpot: deliveryMethod === "meetup" ? meetupSpot : null,
         shipToState: deliveryMethod === "shipping" ? shipToState || buyerState : null,
-        courier: deliveryMethod === "shipping" ? courier : null,
+        courier: deliveryMethod === "shipping" ? effectiveCourier : null,
         buyerState,
       });
       navigate(`/order/${order.id}`);
@@ -254,7 +266,23 @@ export default function Checkout() {
           <div className="space-y-2">
             <label className="block text-sm font-semibold">
               Ship to (state)
-              <select value={shipToState} onChange={(e) => setShipToState(e.target.value)} className={`${inputCls} mt-1`}>
+              <select
+                value={shipToState}
+                onChange={(e) => {
+                  setShipToState(e.target.value);
+                  // Leaving the seller's state drops Chowdeck Relay
+                  // (same-city only) from the courier list.
+                  if (
+                    e.target.value &&
+                    listing &&
+                    e.target.value !== listing.state &&
+                    courier === "Chowdeck Relay"
+                  ) {
+                    setCourier("GIG Logistics");
+                  }
+                }}
+                className={`${inputCls} mt-1`}
+              >
                 <option value="">Choose a state…</option>
                 {STATES.map((s) => (
                   <option key={s} value={s}>
@@ -265,8 +293,8 @@ export default function Checkout() {
             </label>
             <label className="block text-sm font-semibold">
               Courier
-              <select value={courier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
-                {COURIERS.map((c) => (
+              <select value={effectiveCourier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
+                {courierOptions.map((c) => (
                   <option key={c} value={c}>
                     {c}
                   </option>

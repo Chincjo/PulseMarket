@@ -138,7 +138,15 @@ export default function Verify({ onVerified }) {
     }
     // Milestone 11: a referral code is accepted only in the real
     // PM-XXXXXX shape; anything else is ignored, never blocks joining.
+    // Your own invite code can never count as your referrer — the code
+    // is generated first so it can be compared here, and
+    // saveVerificationRow drops a self-referral too.
+    const inviteCode = generateInviteCode();
     const cleanReferral = referralCode.trim().toUpperCase();
+    if (cleanReferral && cleanReferral === inviteCode) {
+      setFormError("That is your own invite code — ask the student who invited you for theirs.");
+      return;
+    }
     const rec = {
       userId: user?.id || null,
       email: user?.email || email,
@@ -146,7 +154,7 @@ export default function Verify({ onVerified }) {
       studentEmail: cleanStudentEmail,
       studentId: cleanStudentId,
       status: "pending review",
-      inviteCode: generateInviteCode(),
+      inviteCode,
       referredBy: /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral) ? cleanReferral : null,
       submittedAt: new Date().toISOString(),
     };
