@@ -12,8 +12,10 @@ import Settings from "./pages/Settings.jsx";
 import Verify from "./pages/Verify.jsx";
 import Welcome from "./pages/Welcome.jsx";
 import SignIn from "./pages/SignIn.jsx";
+import ListingDetail from "./pages/ListingDetail.jsx";
 import { Logo } from "./components/ui.jsx";
-import { getSettings, getVerification } from "./lib/store";
+import { getSettings, getVerification, saveVerification } from "./lib/store";
+import { fetchVerificationRow, saveVerificationRow } from "./lib/listings";
 import { AuthProvider, useAuth } from "./lib/auth";
 
 const TABS = [
@@ -38,12 +40,45 @@ function Shell() {
   const { user, loading } = useAuth();
   const navigate = useNavigate();
   const [verification, setVerification] = useState(() => getVerification());
+  const [verifying, setVerifying] = useState(false);
 
   useEffect(() => {
     applyAppearance(getSettings());
   }, []);
 
-  if (loading) {
+  // Milestone 3: when a student signs in, check the server for their
+  // verification record. If it exists, it wins (and is saved on this device
+  // too). If the student verified on this device before the server tables
+  // existed, push the local record up so it follows them to other phones.
+  // The device copy is always the fallback, so the app never locks a
+  // verified student out because of a server hiccup.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    setVerifying(true);
+    fetchVerificationRow(user.id)
+      .then((row) => {
+        if (cancelled) return;
+        if (row) {
+          const rec = { ...row, email: user.email };
+          setVerification(rec);
+          saveVerification(rec);
+        } else {
+          const local = getVerification();
+          if (local?.university) {
+            saveVerificationRow(user.id, local).catch(() => {});
+          }
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setVerifying(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  if (loading || (user && !verification && verifying)) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
         <Logo size={56} />
@@ -118,16 +153,17 @@ function Shell() {
 
       <main className="mx-auto max-w-2xl px-4 pb-28 pt-4 sm:pb-24">
         <Routes>
-          <Route path="/" element={<Home user={user} />} />
+          <Route path="/" element={<Home user={user} verification={verification} />} />
           <Route path="/search" element={<Search />} />
-          <Route path="/sell" element={<Sell />} />
+          <Route path="/sell" element={<Sell verification={verification} />} />
+          <Route path="/listing/:id" element={<ListingDetail />} />
           <Route path="/chat" element={<Chat />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/wallet" element={<Wallet />} />
           <Route path="/profile" element={<Profile user={user} />} />
           <Route path="/settings" element={<Settings applyAppearance={applyAppearance} />} />
           <Route path="/verify" element={<Verify onVerified={setVerification} />} />
-          <Route path="*" element={<Home user={user} />} />
+          <Route path="*" element={<Home user={user} verification={verification} />} />
         </Routes>
 
         <footer className="mt-12 border-t border-neutral-200 pt-6 text-sm text-neutral-500 dark:border-neutral-800">

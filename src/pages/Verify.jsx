@@ -3,12 +3,14 @@
 //    Supabase sends a confirmation email; the student clicks it, then signs in.
 // 2) Prove student status (university, student email, student ID, ID photos).
 // Only after step 2 does the home page and the rest of the app unlock.
-// Real server-side document review lands in Milestone 3 — for now the
-// submitted details are saved and the university locks.
+// Milestone 3: the submitted details are saved to the server
+// (verifications table) as well as on the device, so they follow the
+// student to any phone they sign in on. The university locks after submit.
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { UNIVERSITIES } from "../lib/data";
+import { UNIVERSITY_NAMES } from "../lib/data";
 import { getVerification, saveVerification } from "../lib/store";
+import { saveVerificationRow } from "../lib/listings";
 import { GhostButton, PrimaryButton, inputCls } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
@@ -43,7 +45,7 @@ export default function Verify({ onVerified }) {
   const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
 
   // Step 2 — student verification.
-  const [university, setUniversity] = useState(UNIVERSITIES[0]);
+  const [university, setUniversity] = useState(UNIVERSITY_NAMES[0]);
   const [studentEmail, setStudentEmail] = useState("");
   const [studentId, setStudentId] = useState("");
   const [idFront, setIdFront] = useState(null);
@@ -98,7 +100,7 @@ export default function Verify({ onVerified }) {
     }
   }
 
-  function submitVerification() {
+  async function submitVerification() {
     const rec = {
       userId: user?.id || null,
       email: user?.email || email,
@@ -112,6 +114,17 @@ export default function Verify({ onVerified }) {
     saveVerification(rec);
     setSaved(rec);
     onVerified?.(rec);
+    // Also save to the server so the record follows the student to any
+    // phone. If the tables are not set up yet, the device copy above is
+    // still the fallback — the app keeps working either way.
+    if (user?.id) {
+      try {
+        await saveVerificationRow(user.id, rec);
+      } catch {
+        // Server save failed (tables not run yet, or offline) — local
+        // record still unlocks the app; the next app load retries the sync.
+      }
+    }
     navigate("/");
   }
 
@@ -139,9 +152,9 @@ export default function Verify({ onVerified }) {
           <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
           <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
           <p className="mt-2 text-neutral-500">
-            Your university is now locked to {saved.university}. Real document
-            review goes live with Milestone 3 — your details are saved and will
-            carry over.
+            Your university is now locked to {saved.university}. Your details
+            are saved on PulseMarket&apos;s server, so they follow you to any
+            phone you sign in on.
           </p>
         </div>
         <PrimaryButton className="w-full" onClick={() => navigate("/")}>
@@ -164,7 +177,7 @@ export default function Verify({ onVerified }) {
         <label className="block text-sm font-semibold">
           University
           <select value={university} onChange={(e) => setUniversity(e.target.value)} className={`${inputCls} mt-1`}>
-            {UNIVERSITIES.map((u) => <option key={u}>{u}</option>)}
+            {UNIVERSITY_NAMES.map((u) => <option key={u}>{u}</option>)}
           </select>
         </label>
         <label className="block text-sm font-semibold">

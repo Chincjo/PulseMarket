@@ -15,7 +15,9 @@ export function save(key, value) {
   }
 }
 
-// Draft listings created on this device (Milestone 4 moves these to the server).
+// Legacy device drafts — Milestone 4 moved publishing to the server
+// (Supabase `listings` table). These helpers are no longer used by any page
+// and are kept only so old installs do not break on upgrade.
 export function getDrafts() {
   return load("pm-drafts", []);
 }
@@ -45,7 +47,8 @@ export function saveSettings(s) {
   save("pm-settings", s);
 }
 
-// Student verification record (real server verification lands in Milestone 3).
+// Student verification record (server copy lands in Milestone 3; the
+// device copy stays as the offline fallback).
 export function getVerification() {
   return load("pm-verification", null);
 }

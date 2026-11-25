@@ -1,9 +1,39 @@
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { CATEGORIES, UNIVERSITIES } from "../lib/data";
+import { CATEGORIES, UNIVERSITY_NAMES, universityState } from "../lib/data";
 import { EmptyState, PrimaryButton } from "../components/ui";
+import { ListingCard } from "../components/ListingCard";
+import { fetchActiveListings, sortListings, visibleTo } from "../lib/listings";
 
-export default function Home({ user }) {
+export default function Home({ user, verification }) {
   const navigate = useNavigate();
+  const [listings, setListings] = useState([]);
+  const [loadingListings, setLoadingListings] = useState(true);
+
+  const myState = verification?.university
+    ? universityState(verification.university)
+    : "";
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchActiveListings().then((rows) => {
+      if (!cancelled) {
+        setListings(rows);
+        setLoadingListings(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // A listing is visible to this student when it is in their state, or the
+  // seller ships anywhere in Nigeria. Same-state-only listings from other
+  // states never appear here.
+  const visible = listings.filter((l) => visibleTo(l, myState));
+  const nearYou = sortListings(visible.filter((l) => l.state === myState));
+  const justDropped = sortListings(visible);
+
   return (
     <div className="space-y-8">
       <section className="pt-2">
@@ -88,39 +118,59 @@ export default function Home({ user }) {
       </section>
 
       <section>
-        <h2 className="text-lg font-bold">Near you</h2>
+        <h2 className="text-lg font-bold">Near you{myState ? ` — ${myState}` : ""}</h2>
         <div className="mt-3">
-          <EmptyState
-            title="Nothing listed near you yet"
-            body="Be the first seller on your campus — post your first item and students nearby will see it here."
-            action={
-              <Link to="/sell">
-                <PrimaryButton>Post your first item</PrimaryButton>
-              </Link>
-            }
-          />
+          {loadingListings ? (
+            <p className="text-sm text-neutral-500">Loading listings…</p>
+          ) : nearYou.length === 0 ? (
+            <EmptyState
+              title="Nothing listed near you yet"
+              body="Be the first seller on your campus — post your first item and students nearby will see it here."
+              action={
+                <Link to="/sell">
+                  <PrimaryButton>Post your first item</PrimaryButton>
+                </Link>
+              }
+            />
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              {nearYou.slice(0, 6).map((l) => (
+                <ListingCard key={l.id} listing={l} />
+              ))}
+            </div>
+          )}
         </div>
       </section>
 
       <section>
         <h2 className="text-lg font-bold">Just dropped</h2>
         <div className="mt-3">
-          <EmptyState
-            title="Fresh listings land here"
-            body="No listings yet. Get verified so you can buy and sell the moment items appear."
-            action={
-              <Link to="/verify">
-                <PrimaryButton>Get verified</PrimaryButton>
-              </Link>
-            }
-          />
+          {loadingListings ? (
+            <p className="text-sm text-neutral-500">Loading listings…</p>
+          ) : justDropped.length === 0 ? (
+            <EmptyState
+              title="Fresh listings land here"
+              body="No listings yet. Get verified so you can buy and sell the moment items appear."
+              action={
+                <Link to="/verify">
+                  <PrimaryButton>Get verified</PrimaryButton>
+                </Link>
+              }
+            />
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              {justDropped.slice(0, 6).map((l) => (
+                <ListingCard key={l.id} listing={l} />
+              ))}
+            </div>
+          )}
         </div>
       </section>
 
       <section>
         <h2 className="text-lg font-bold">Universities on PulseMarket</h2>
         <div className="mt-3 flex flex-wrap gap-2">
-          {UNIVERSITIES.slice(0, 12).map((u) => (
+          {UNIVERSITY_NAMES.slice(0, 12).map((u) => (
             <span
               key={u}
               className="rounded-full bg-neutral-100 px-3 py-1.5 text-sm dark:bg-neutral-900"
