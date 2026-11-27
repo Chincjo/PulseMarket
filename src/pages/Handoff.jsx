@@ -76,9 +76,11 @@ export default function Handoff() {
       if (row) {
         const item = await fetchListing(row.listing_id);
         setListing(item);
-        // Seller opening the handoff creates the one-time code.
+        // Seller opening the handoff creates the one-time code —
+        // unless the order is frozen (open dispute): no handoff
+        // activity may start while the team is reviewing.
         let current = row;
-        if (user && row.seller_id === user.id && row.delivery_method === "meetup" && !row.seller_code && !row.handoff_locked) {
+        if (user && row.seller_id === user.id && row.delivery_method === "meetup" && !row.seller_code && !row.handoff_locked && !row.frozen) {
           try {
             current = await ensureSellerCode(row.id);
             setOrder(current);
@@ -231,6 +233,7 @@ export default function Handoff() {
   }
 
   const locked = status?.locked;
+  const frozen = Boolean(order?.frozen);
   const complete = status?.releaseUnblocked;
   const myPhotoUrl = role === "buyer" ? status?.buyerPhotoUrl : status?.sellerPhotoUrl;
   const myPhotoDone = role === "buyer" ? status?.buyerPhoto : status?.sellerPhoto;
@@ -252,6 +255,17 @@ export default function Handoff() {
           Order {order.code} · You are the {role}.
         </p>
       </div>
+
+      {frozen && (
+        <section className="rounded-2xl border border-red-300 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950">
+          <h2 className="text-lg font-bold text-red-700 dark:text-red-300">A dispute is open for this order</h2>
+          <p className="mt-1 text-sm">
+            The money is frozen while the PulseMarket team reviews it — the
+            handoff is paused until then. Do not scan the code or confirm
+            anything here; the team will tell you what happens next.
+          </p>
+        </section>
+      )}
 
       {locked && (
         <section className="rounded-2xl border border-red-300 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950">
@@ -338,17 +352,17 @@ export default function Handoff() {
                 placeholder="PM-XXXXXX"
                 autoCapitalize="characters"
                 autoComplete="off"
-                disabled={locked || busy !== ""}
+                disabled={locked || frozen || busy !== ""}
               />
               <div className="mt-3 flex gap-2">
                 <PrimaryButton
-                  disabled={locked || busy !== "" || !codeInput.trim()}
+                  disabled={locked || frozen || busy !== "" || !codeInput.trim()}
                   onClick={() => run("scan", () => scanSellerCode(orderId, codeInput))}
                 >
                   {busy === "scan" ? "Checking…" : "Check code"}
                 </PrimaryButton>
                 <GhostButton
-                  disabled={locked || busy !== ""}
+                  disabled={locked || frozen || busy !== ""}
                   onClick={() => scanInputRef.current?.click()}
                 >
                   Photograph the QR code
@@ -399,7 +413,7 @@ export default function Handoff() {
         )}
         <div className="mt-3">
           <GhostButton
-            disabled={busy !== "" || locked || myConfirmed}
+            disabled={busy !== "" || locked || frozen || myConfirmed}
             onClick={() => photoInputRef.current?.click()}
           >
             {busy === "photo"
@@ -454,7 +468,7 @@ export default function Handoff() {
             <div className="mt-3">
               <PrimaryButton
                 className="w-full py-3"
-                disabled={busy !== "" || locked || !canConfirm}
+                disabled={busy !== "" || locked || frozen || !canConfirm}
                 onClick={() => run("confirm", () => confirmHandoff(orderId, role))}
               >
                 {busy === "confirm" ? "Saving…" : "I confirm — the handover happened"}

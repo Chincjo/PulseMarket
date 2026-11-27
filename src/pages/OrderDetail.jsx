@@ -7,6 +7,7 @@ import { Link, useParams } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
 import { autoReleaseDue } from "../lib/autoRelease";
 import { fetchListing } from "../lib/listings";
+import { fetchEvidenceForOrder } from "../lib/evidence";
 import {
   cancelOrder,
   confirmDelivery,
@@ -57,10 +58,20 @@ export default function OrderDetail() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
+  // Whether the buyer has a verified unboxing video for this order
+  // (see the Confirm delivery button below).
+  const [hasVerifiedUnboxing, setHasVerifiedUnboxing] = useState(false);
 
   const isBuyer = user && order && order.buyer_id === user.id;
   const isSeller = user && order && order.seller_id === user.id;
   const isOwner = user?.email === OWNER_EMAIL;
+  // A shipping order cannot be confirmed delivered without the
+  // buyer's verified unboxing video (lib rule in orders.js) —
+  // meet-in-person orders are gated by the handoff instead.
+  const unboxingMissing =
+    order?.delivery_method === "shipping" &&
+    ["held", "shipped"].includes(order.status) &&
+    !hasVerifiedUnboxing;
 
   const load = useCallback(async () => {
     try {
@@ -69,6 +80,21 @@ export default function OrderDetail() {
       if (row) {
         const item = await fetchListing(row.listing_id);
         setListing(item);
+        // The lib's confirmDelivery refuses a shipping order without
+        // the BUYER's verified unboxing video (kind 'unboxing',
+        // media_type 'video', verified=true) — a seller's own clip
+        // does not count. Check it here so the button is disabled
+        // with a hint instead of failing on tap.
+        const rows = await fetchEvidenceForOrder(row.id);
+        setHasVerifiedUnboxing(
+          (rows || []).some(
+            (r) =>
+              r.kind === "unboxing" &&
+              r.media_type === "video" &&
+              r.verified === true &&
+              r.user_id === row.buyer_id
+          )
+        );
       }
     } finally {
       setLoading(false);
@@ -391,13 +417,22 @@ export default function OrderDetail() {
           </PrimaryButton>
         )}
         {isBuyer && ["held", "shipped"].includes(order.status) && (
-          <PrimaryButton
-            className="w-full py-3"
-            disabled={busy !== ""}
-            onClick={() => run("delivered", () => confirmDelivery(order.id, user.id))}
-          >
-            {busy === "delivered" ? "Saving…" : "Confirm delivery — I received the item"}
-          </PrimaryButton>
+          <>
+            <PrimaryButton
+              className="w-full py-3"
+              disabled={busy !== "" || unboxingMissing}
+              onClick={() => run("delivered", () => confirmDelivery(order.id, user.id))}
+            >
+              {busy === "delivered" ? "Saving…" : "Confirm delivery — I received the item"}
+            </PrimaryButton>
+            {unboxingMissing && (
+              <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+                Record your unboxing video in the{" "}
+                <Link to="/evidence" className="font-semibold text-brown underline">Evidence Locker</Link>{" "}
+                first — delivery cannot be confirmed without a verified unboxing video.
+              </p>
+            )}
+          </>
         )}
         {isBuyer && order.payment_method === "cash" && order.status === "reserved" && (
           <PrimaryButton

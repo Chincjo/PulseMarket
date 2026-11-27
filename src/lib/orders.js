@@ -26,7 +26,7 @@
 //     resolves it.
 import { supabase } from "./supabase";
 import { feeBreakdown } from "./fees";
-import { updateListing } from "./listings";
+import { fetchVerificationRowChecked, updateListing } from "./listings";
 import { handoffComplete, logSecurityEvent } from "./handoff";
 import { notifyUser } from "./notifications";
 import {
@@ -225,6 +225,26 @@ export async function createOrder({
   if (deliveryMethod === "shipping" && !shipToState) {
     throw new Error("Choose the state to ship to.");
   }
+  // Night deep check 2026-11-27: a shipping order needs a courier.
+  // Without this a >₦20,000 interstate order could be created with
+  // courier: null and sail straight past the Tier 1 check below
+  // (it only fired when a courier was supplied).
+  if (deliveryMethod === "shipping" && !courier) {
+    throw new Error("Choose a courier to ship with.");
+  }
+  // Night deep check 2026-11-27: only a verified student may buy.
+  // The database (DB-5 trigger) is the backstop, but without this
+  // plain check an unverified buyer got a raw database error.
+  // A failed verification read refuses too — it must never look
+  // like "not verified" (see fetchVerificationRowChecked).
+  const { row: buyerRow, failed: buyerCheckFailed } =
+    await fetchVerificationRowChecked(buyerId);
+  if (buyerCheckFailed) {
+    throw new Error("Could not check your verification — try again.");
+  }
+  if (!buyerRow || buyerRow.status !== "approved") {
+    throw new Error("Only verified students can buy — finish verification first.");
+  }
   // The delivery method must be one the seller actually offers — a
   // direct call used to be able to order shipping on a meetup-only
   // listing (and vice versa).
@@ -281,6 +301,14 @@ export async function createOrder({
     if (convError) {
       throw new Error("Could not check the agreed price — try again.");
     }
+    // Night deep check 2026-11-27: a conversationId with no
+    // conversation behind it used to fall through to the full
+    // listing price (serverAgreed came back NaN) — the exact
+    // silent-discount-loss the Milestone 22 fix was meant to kill.
+    // Refuse instead of charging full price.
+    if (!conv) {
+      throw new Error("That agreed price could not be found — try again.");
+    }
     // The deal must be this buyer, this seller and this listing —
     // another chat's agreed price is never this order's price (the
     // order-insert trigger re-checks the same thing server-side).
@@ -313,13 +341,16 @@ export async function createOrder({
   // filtered out for interstate shipping before createOrder).
   // (The same rule lives in courierTiers() in lib/shipping.js —
   // this file cannot import it: shipping.js imports orders.js.)
+  // Night deep check 2026-11-27: this used to be guarded by
+  // `courier &&`, so a shipping order created with no courier
+  // skipped the rule entirely. A courier is required above now,
+  // so the check runs unconditionally for interstate orders.
   if (
     deliveryMethod === "shipping" &&
     shipToState &&
     listing.state &&
     shipToState !== listing.state &&
     price > 20000 &&
-    courier &&
     !["GIG Logistics", "GUO Transport"].includes(courier)
   ) {
     throw new Error(
@@ -841,6 +872,14 @@ async function legacyReleaseOrder(order, user) {
   if (order.return_status === "opened") {
     throw new Error("A return is open for this order — the PulseMarket team resolves it first.");
   }
+  // Night deep check 2026-11-27: a refund already drained the hold
+  // (a return was resolved, or the team refunded a held order).
+  // The live RPC path checks this; this legacy fallback did not,
+  // so it could write release legs on top of a refund and the
+  // ledger trigger's held-sum backstop would refuse it cryptically.
+  if (await ledgerMoveExists(order.id, "refund", "held")) {
+    throw new Error("This order was already refunded — there is no held money to release.");
+  }
   // Milestone 7 gate: a meet-in-person order releases only after the
   // handoff is complete — code scanned, both photos, both confirmations.
   if (order.delivery_method === "meetup" && !handoffComplete(order)) {
@@ -1062,11 +1101,15 @@ export async function refundHeldOrder(orderId, user) {
         );
       }
     } catch (debtErr) {
+      // Night deep check 2026-11-27: a failed debt write used to
+      // be logged and swallowed, and the flip below then failed
+      // anyway — the M21 trigger refuses a refunded order with an
+      // advance and no debt — so the team saw the trigger's cryptic
+      // error instead of the real cause. Re-throw (except the
+      // 23505 duplicate, which just means the debt is already
+      // recorded) so the team sees why and can retry.
       if (debtErr?.code !== "23505") {
-        console.error(
-          "[PulseMarket] refund: could not record seller debt for advance:",
-          debtErr?.message || debtErr
-        );
+        throw debtErr;
       }
     }
     const closed = await updateOrder(orderId, { status: "refunded" });
@@ -1159,11 +1202,13 @@ export async function refundHeldOrder(orderId, user) {
         );
       }
     } catch (debtErr) {
+      // Night deep check 2026-11-27: same as closeOut above — a
+      // failed debt write must surface its real cause instead of
+      // being logged and leaving the team to hit the M21 trigger
+      // refusal on the flip below. The 23505 duplicate means the
+      // debt is already recorded, so only that is tolerated.
       if (debtErr?.code !== "23505") {
-        console.error(
-          "[PulseMarket] refund: could not record seller debt for advance:",
-          debtErr?.message || debtErr
-        );
+        throw debtErr;
       }
     }
   }
@@ -1271,12 +1316,16 @@ export async function fetchStaleShippedOrders(user, olderThanDays = STALE_SHIPPE
 // ---------------------------------------------------------------------------
 
 // Team-only: orders whose ledger and status disagree — the money
-// moved, the status update never landed. Three shapes, all
+// moved, the status update never landed. Four shapes, all
 // recoverable by re-running the matching action:
 //   paid + hold row     -> the transfer was confirmed, the order
 //                          still says 'paid' (confirmReceipt);
 //   held + refund row   -> the refund moved, the order still says
 //                          'held' (refundHeldOrder);
+//   delivered + refund row -> the refund moved, the order still
+//                          says 'delivered' (refundHeldOrder — a
+//                          team refund crashed after writing the
+//                          refund legs);
 //   delivered + release -> the release moved, the order still says
 //                          'delivered' (releaseOrder — the app-side
 //                          auto-release check already closes these
@@ -1321,6 +1370,16 @@ export async function fetchStuckMoneyOrders(user) {
       stuck.push({
         order: withoutPin(order, null),
         problem: "The refund was already paid, but the order still says 'held'.",
+        action: "refund-held",
+      });
+    } else if (order.status === "delivered" && kinds.has("refund:held")) {
+      // Night deep check 2026-11-27: a team refund of a delivered
+      // order that crashed after writing the refund legs was
+      // invisible here — the order is not stuck in 'held', so the
+      // old three-shape list never matched it.
+      stuck.push({
+        order: withoutPin(order, null),
+        problem: "The refund was already paid, but the order still says 'delivered'.",
         action: "refund-held",
       });
     } else if (order.status === "delivered" && kinds.has("release:held")) {
@@ -1370,6 +1429,18 @@ export async function reconcileOrder(orderId, user) {
     };
   }
   if (order.status === "held" && has("refund", "held")) {
+    const done = await refundHeldOrder(orderId, user);
+    return {
+      order: withoutPin(done.order || done, user?.id),
+      action: "refund-held",
+      note: "The refund was already paid — this just closed the order out. No money moved twice.",
+    };
+  }
+  // Night deep check 2026-11-27: same half-move on a delivered
+  // order — a team refund crashed after writing the refund legs.
+  // Checked before the release shape below: a refunded order must
+  // never be misread as released.
+  if (order.status === "delivered" && has("refund", "held")) {
     const done = await refundHeldOrder(orderId, user);
     return {
       order: withoutPin(done.order || done, user?.id),

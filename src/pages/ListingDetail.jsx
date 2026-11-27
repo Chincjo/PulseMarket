@@ -466,7 +466,11 @@ export default function ListingDetail() {
             </div>
           )}
 
-          {/* Boost */}
+          {/* Boost — only on a live listing: purchase_boost()
+              refuses any non-active listing server-side, so showing
+              the section on a reserved/sold one only led to a
+              failed tap. */}
+          {listing.status === "active" && (
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
             <p className="font-bold">Boost this listing</p>
             {boosted ? (
@@ -514,6 +518,7 @@ export default function ListingDetail() {
               </div>
             )}
           </div>
+          )}
         </div>
       ) : null}
     </div>

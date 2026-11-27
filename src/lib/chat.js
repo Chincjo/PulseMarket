@@ -487,6 +487,26 @@ export async function fetchConversationForListing(listingId, userId) {
   return data || null;
 }
 
+// Night deep check 2026-11-27: same read as above, but a failed
+// read THROWS instead of returning null. Checkout needs to tell
+// "no conversation" apart from "the read failed" — the null
+// version cannot, so a failed read used to look like no agreed
+// price and the buyer silently paid full price. Callers that only
+// need the row keep using fetchConversationForListing above.
+export async function fetchConversationForListingOrThrow(listingId, userId) {
+  if (!supabase || !listingId || !userId) return null;
+  const { data, error } = await supabase
+    .from("conversations")
+    .select("id, agreed_price")
+    .eq("listing_id", listingId)
+    .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
+    .order("last_message_at", { ascending: false, nullsFirst: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -652,6 +672,26 @@ export async function sendOffer(conversationId, amount) {
       `Offer is too high — keep it under ₦${MAX_OFFER_NAIRA.toLocaleString("en-NG")}.`,
       "send offer"
     );
+  }
+  // Night deep check 2026-11-27: an offer above the asking price
+  // used to be sendable and acceptable — it set an agreed price
+  // above the listing price, so the chat banner promised a price
+  // checkout would never charge (checkout caps at the listing
+  // price). Refuse it here; the database (M23 respond_offer)
+  // refuses it too. A failed price read fails open — the accept
+  // is still refused server-side, so no money is at risk.
+  const convForPrice = await fetchConversation(conversationId);
+  if (convForPrice?.listing_id) {
+    const { data: listingRow } = await supabase
+      .from("listings")
+      .select("price")
+      .eq("id", convForPrice.listing_id)
+      .maybeSingle();
+    const asking = Number(listingRow?.price);
+    if (Number.isFinite(asking) && asking > 0 && n > asking) {
+      lastGateError = `That is above the asking price of ₦${asking.toLocaleString("en-NG")} — offer that amount or less.`;
+      return dbError(lastGateError, "send offer");
+    }
   }
   const senderId = await currentUserId();
   if (!senderId) return null;

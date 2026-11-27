@@ -367,6 +367,30 @@ export async function submitShippingProof(
   if (order.delivery_method !== "shipping") {
     throw new Error("This order is a meet-in-person order — there is nothing to ship.");
   }
+  // Night deep check 2026-11-27: Tier 1 — a >₦20,000 interstate
+  // order must travel with GIG or GUO. createOrder enforces it,
+  // but an order created with no courier (or through a direct API
+  // call) could reach here with a park loader. Refuse before the
+  // parcel ships, not after. The listing's state comes from the
+  // listing row — the order only carries where it ships to. A
+  // failed listing read fails open here; the database (M23) is the
+  // hard backstop.
+  const { data: listingRow } = await supabase
+    .from("listings")
+    .select("state")
+    .eq("id", order.listing_id)
+    .maybeSingle();
+  if (
+    order.ship_to_state &&
+    listingRow?.state &&
+    order.ship_to_state !== listingRow.state &&
+    (Number(order.item_price) || 0) > 20000 &&
+    !["GIG Logistics", "GUO Transport"].includes(order.courier)
+  ) {
+    throw new Error(
+      "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
+    );
+  }
   const waybill = String(waybillNumber || "").trim();
   if (!waybill) {
     throw new Error("Type in the waybill number from the paper waybill.");
@@ -379,20 +403,31 @@ export async function submitShippingProof(
   }
   // One waybill number, one order: a number already used for another
   // order of this seller is either a typo or the same parcel being
-  // "shipped" twice to take two advances. (Best effort in the app —
-  // a direct API call skips it, so the hard backstop is the partial
-  // unique index on orders.waybill_number proposed for milestone-18.)
+  // "shipped" twice to take two advances. Night deep check
+  // 2026-11-27: the same number + the same courier on ANOTHER
+  // seller's order is the same fraud across two accounts, so the
+  // check below matches on courier as well as seller. Best effort
+  // in the app — the orders read policy only shows the caller their
+  // own orders, so a cross-seller reuse is invisible here; the hard
+  // backstop is the partial unique index on (courier, waybill_number)
+  // in milestone-23.sql. The same number with a different courier
+  // is a coincidence (couriers number parcels independently), so it
+  // does not count.
   if (supabase) {
     const { data: reuse, error: reuseError } = await supabase
       .from("orders")
-      .select("id, code")
-      .eq("seller_id", user.id)
+      .select("id, code, courier, seller_id")
       .eq("waybill_number", waybill)
       .neq("id", order.id)
-      .limit(1);
-    if (!reuseError && reuse && reuse.length > 0) {
+      .limit(5);
+    const hit = (reuse || []).find(
+      (r) =>
+        (order.courier && r.courier === order.courier) ||
+        r.seller_id === user.id
+    );
+    if (!reuseError && hit) {
       throw new Error(
-        `That waybill number was already used for order ${reuse[0].code} — check the number on the paper waybill.`
+        `That waybill number was already used for order ${hit.code} — check the number on the paper waybill.`
       );
     }
     if (reuseError) {
@@ -604,6 +639,15 @@ export async function retryShippingAdvance(orderId) {
     } catch (err) {
       if (err?.code !== "23505") throw err;
       // Another device paid it a moment ago — carry on to the flag.
+      // Night deep check 2026-11-27: a 23505 on the held leg only
+      // proves the HELD leg exists. A half-written pair (held leg
+      // only, no available leg) used to be marked released here,
+      // and the later release then failed the ledger trigger's
+      // held-sum backstop. Verify the available leg too — if it is
+      // missing, the team has to complete the pair by hand.
+      if ((await advanceAlreadyReleased(order.id)) <= 0) {
+        throw new Error("The shipping advance is only half recorded — ask the PulseMarket team to check it.");
+      }
     }
   }
   try {
@@ -656,6 +700,38 @@ export async function addCheckpoint(orderId, { status, location, note, photo }) 
   }
   if (note && String(note).trim().length > 280) {
     throw new Error("Keep the note under 280 characters.");
+  }
+  // Night deep check 2026-11-27: the database refuses backwards
+  // checkpoints and a repeated 'delivered', but it allows equal-rank
+  // repeats — a seller could spam the same stop and fire a buyer
+  // notification each time. Refuse an exact repeat of the latest
+  // update, and the same status again within a minute. A failed
+  // latest-read fails open here; the database is the backstop for
+  // ordering, and a duplicate still costs the seller a tap, not the
+  // buyer a notification storm.
+  const { data: latest } = await supabase
+    .from("shipping_checkpoints")
+    .select("status, location, note, created_at")
+    .eq("order_id", order.id)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const last = (latest || [])[0];
+  if (last) {
+    const cleanLocation = location ? String(location).trim() : null;
+    const cleanNote = note ? String(note).trim() : null;
+    if (
+      last.status === status &&
+      (last.location || null) === cleanLocation &&
+      (last.note || null) === cleanNote
+    ) {
+      throw new Error("That update is already on the tracking page.");
+    }
+    if (
+      last.status === status &&
+      Date.now() - new Date(last.created_at).getTime() < 60 * 1000
+    ) {
+      throw new Error("Wait a moment before adding the same update again.");
+    }
   }
   let photoUrl = null;
   if (photo) {
@@ -903,24 +979,31 @@ export async function resolveReturn(orderId, { fault }) {
   // written, because the ledger prices the legs from the stored
   // reason at insert time, and the resolving update comes after
   // the legs. The detail text after the prefix is kept.
+  // Night deep check 2026-11-27: the correction used to run BEFORE
+  // the double-resolve guard below, so a retry with the wrong fault
+  // permanently rewrote the stored label even though the money was
+  // already priced for the original fault. It now runs after the
+  // guard (see below, before the money moves).
   const storedFault = String(order.return_reason || "").startsWith("Seller fault")
     ? "seller"
     : String(order.return_reason || "").startsWith("Buyer fault")
       ? "buyer"
       : null;
   let labelCorrected = false;
-  if (storedFault !== fault) {
-    const detail = String(order.return_reason || "")
-      .split(":")
-      .slice(1)
-      .join(":")
-      .trim();
-    const corrected =
-      (fault === "seller" ? "Seller fault" : "Buyer fault") +
-      (detail ? `: ${detail}` : "");
-    await updateOrder(orderId, { return_reason: corrected });
-    labelCorrected = true;
-  }
+  const correctFaultLabel = async () => {
+    if (storedFault !== fault) {
+      const detail = String(order.return_reason || "")
+        .split(":")
+        .slice(1)
+        .join(":")
+        .trim();
+      const corrected =
+        (fault === "seller" ? "Seller fault" : "Buyer fault") +
+        (detail ? `: ${detail}` : "");
+      await updateOrder(orderId, { return_reason: corrected });
+      labelCorrected = true;
+    }
+  };
 
   const total = Number(order.total) || 0;
   const itemPrice = Number(order.item_price) || 0;
@@ -981,7 +1064,13 @@ export async function resolveReturn(orderId, { fault }) {
               `Shipping advance to pay back — seller-fault return, order ${order.code}. Recorded on recovery: the refund moved before the debt did.`
             );
           } catch (debtErr) {
-            console.error("[PulseMarket] Could not re-record seller debt on return recovery:", debtErr?.message || debtErr);
+            // Night deep check 2026-11-27: same as refundHeldOrder —
+            // a failed debt write must surface its real cause
+            // instead of being logged while the flip below fails
+            // anyway on the M21 trigger (refunded order with an
+            // advance and no debt). The 23505 duplicate means the
+            // debt is already recorded.
+            if (debtErr?.code !== "23505") throw debtErr;
           }
         }
       }
@@ -1020,6 +1109,12 @@ export async function resolveReturn(orderId, { fault }) {
       };
     }
   }
+  // The label correction runs here, AFTER the double-resolve guard
+  // above and BEFORE the refund legs below: a retry of an
+  // already-moved refund never rewrites the stored fault label,
+  // and a fresh resolve still corrects it before the legs are
+  // priced from it.
+  await correctFaultLabel();
   // Money still sitting in the seller's held bucket for this order:
   // the full total, minus any advance already released.
   const remainingHeld = Math.max(0, total - advance);
@@ -1253,16 +1348,17 @@ export async function sellerDebtAmount(sellerId) {
   return Math.max(0, owed);
 }
 
-// Debt gate — ready to wire, not yet wired (see the coordinator's
-// report). Call sites the coordinator owns:
+// Debt gate — WIRED since Milestone 19 (the old "ready to wire,
+// not yet wired" comment was stale). Call sites:
 //   1. Sell.jsx, before createListingRow(): a seller who still owes
 //      money from an earlier order must not list a new item until
 //      the team settles the debt.
 //      `await assertSellerClearOfDebt(user.id);`
 //   2. The manual withdrawal step (Wallet.jsx): withdrawals are paid
 //      by hand by the team, so there is no in-app withdraw function
-//      to gate — the team checks sellerDebtAmount() before paying
-//      any withdrawal, and holds the payout while debt is outstanding.
+//      to gate — the team checks sellerDebtAmount() (Admin.jsx debt
+//      check) before paying any withdrawal, and holds the payout
+//      while debt is outstanding.
 //   The wallet math already nets debt: a debt row is a negative
 //   'available' entry, so getBalances() already subtracts what is
 //   owed — a seller cannot withdraw more than the net available

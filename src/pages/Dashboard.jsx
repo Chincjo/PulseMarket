@@ -11,6 +11,7 @@ import {
   deleteListing,
   duplicateListing,
   fetchMyListings,
+  fetchOpenOrderCount,
   isBoosted,
   reactivateListing,
   updateListing,
@@ -120,6 +121,20 @@ export default function Dashboard() {
     setBusyId(listing.id);
     setError("");
     try {
+      // Night deep check 2026-11-27: "Mark sold" / "Mark reserved"
+      // used to check nothing — ListingDetail got this guard in
+      // Milestone 22 but Dashboard was missed, so a seller with a
+      // paid/held order open could mark the listing Sold while the
+      // buyer's order and held money were still live. Refuse while
+      // any order is open (same count reactivateListing uses); the
+      // order flows move the status themselves. The database (M23)
+      // refuses it too.
+      if (
+        (status === "sold" || status === "reserved") &&
+        (await fetchOpenOrderCount(listing.id)) > 0
+      ) {
+        throw new Error("This item has an open order on it — its status moves with the order, not by hand.");
+      }
       await updateListing(listing.id, { status });
       reload();
     } catch (err) {

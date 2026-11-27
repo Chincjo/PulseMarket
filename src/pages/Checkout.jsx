@@ -7,7 +7,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { SAFE_MEETUP_SPOTS, STATES } from "../lib/data";
 import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
 import { fetchListing, fetchVerificationRow } from "../lib/listings";
-import { fetchConversationForListing } from "../lib/chat";
+import { fetchConversationForListingOrThrow } from "../lib/chat";
 import { courierTiers } from "../lib/shipping";
 import { universityState } from "../lib/data";
 import { createOrder } from "../lib/orders";
@@ -49,6 +49,11 @@ export default function Checkout() {
   // page's copy (Milestone 22: a failed read here used to mean the
   // buyer silently paid full price).
   const [conversationId, setConversationId] = useState(null);
+  // Night deep check 2026-11-27: whether the agreed-price read
+  // failed (as opposed to "no conversation"). While this is true
+  // Reserve stays disabled — a failed read used to look exactly
+  // like no agreed price, so the buyer silently paid full price.
+  const [convFailed, setConvFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -60,6 +65,7 @@ export default function Checkout() {
     // listing's price.
     setAgreedPrice(null);
     setConversationId(null);
+    setConvFailed(false);
     fetchListing(listingId)
       .then((row) => {
         if (cancelled) return;
@@ -106,14 +112,22 @@ export default function Checkout() {
     if (user) {
       // An accepted offer on this listing sets the price the buyer
       // actually pays. Without this the chat banner promises an
-      // agreed price that checkout never charged.
-      fetchConversationForListing(listingId, user.id).then((conv) => {
-        if (cancelled) return;
-        setConversationId(conv?.id || null);
-        if (!conv?.agreed_price) return;
-        const agreed = Number(conv.agreed_price);
-        setAgreedPrice(agreed);
-      });
+      // agreed price that checkout never charged. The throwing read
+      // tells a failed read apart from "no conversation": a failed
+      // read sets convFailed and blocks Reserve below, instead of
+      // silently charging the full listing price.
+      fetchConversationForListingOrThrow(listingId, user.id)
+        .then((conv) => {
+          if (cancelled) return;
+          setConversationId(conv?.id || null);
+          if (!conv?.agreed_price) return;
+          const agreed = Number(conv.agreed_price);
+          setAgreedPrice(agreed);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setConvFailed(true);
+        });
     }
     return () => {
       cancelled = true;
@@ -174,8 +188,26 @@ export default function Checkout() {
     ? courier
     : courierOptions[0];
 
+  async function retryConversation() {
+    if (!user) return;
+    setConvFailed(false);
+    try {
+      const conv = await fetchConversationForListingOrThrow(listingId, user.id);
+      setConversationId(conv?.id || null);
+      if (conv?.agreed_price) setAgreedPrice(Number(conv.agreed_price));
+    } catch {
+      setConvFailed(true);
+    }
+  }
+
   async function reserve() {
     if (!listing || !user) return;
+    // A failed agreed-price read must never reserve at full price
+    // (belt and braces with the disabled button below).
+    if (convFailed) {
+      setError("Could not check your agreed price — check your connection and try again.");
+      return;
+    }
     // Belt and braces with the disabled button below: a double-tap
     // must never fire createOrder twice (the second call would hit
     // the one-open-order-per-listing index and report — wrongly —
@@ -481,9 +513,18 @@ export default function Checkout() {
         )}
       </section>
 
+      {convFailed && (
+        <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">
+          Could not check your agreed price — check your connection and try again.{" "}
+          <button type="button" onClick={retryConversation} className="font-semibold underline">
+            Try again
+          </button>
+        </p>
+      )}
+
       {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
 
-      <PrimaryButton onClick={reserve} disabled={reserving || !user || (paymentMethod === "cash" && !canMeet)} className="w-full py-3 text-base">
+      <PrimaryButton onClick={reserve} disabled={reserving || !user || convFailed || (paymentMethod === "cash" && !canMeet)} className="w-full py-3 text-base">
         {reserving ? "Reserving…" : "Reserve — Put on Hold"}
       </PrimaryButton>
       <p className="text-center text-xs text-neutral-500">

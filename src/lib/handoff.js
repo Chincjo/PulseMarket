@@ -152,6 +152,12 @@ export async function ensureSellerCode(orderId) {
   if (["cancelled", "refunded", "released"].includes(order.status)) {
     throw new Error("This order is closed — there is no handoff to open.");
   }
+  // Night deep check 2026-11-27: a frozen order (open dispute) must
+  // not start a handoff — the code would let the seller show it and
+  // the buyer scan it while the team is still reviewing.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   const { data: existing, error: readError } = await supabase
     .from("handoff_codes")
     .select("code")
@@ -248,6 +254,12 @@ export async function uploadHandoffPhoto(orderId, role, dataUrl) {
   if (["cancelled", "refunded", "released"].includes(order.status)) {
     throw new Error("This order is closed — there is no handoff to photograph.");
   }
+  // Night deep check 2026-11-27: no handoff evidence may change
+  // while a dispute is open — the photo is part of the meetup
+  // proof the team is reviewing.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   const blob = await dataUrlToBlob(dataUrl);
   // A handoff photo with no checks used to accept any file at any
   // size. Same 10MB cap and magic-byte check as the waybill photos.
@@ -291,6 +303,15 @@ export async function confirmHandoff(orderId, role) {
   if (["cancelled", "refunded", "released"].includes(order.status)) {
     throw new Error("This order is closed — there is no handoff to confirm.");
   }
+  // Night deep check 2026-11-27: a frozen order (open dispute) must
+  // not gain handoff confirmations — a seller could otherwise get
+  // the buyer to scan + confirm after a "never received it" dispute
+  // was filed, and the team would see "handoff complete" with no
+  // way to know it happened after the filing. The database (M23)
+  // refuses it too.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   const userId = await currentUserId();
   if (!userId) throw new Error("Sign in first to confirm the handoff.");
   const expectedId = role === "buyer" ? order.buyer_id : order.seller_id;
@@ -305,7 +326,19 @@ export async function confirmHandoff(orderId, role) {
     throw new Error("Take your handoff photo first.");
   }
   const field = role === "buyer" ? "buyer_confirmed" : "seller_confirmed";
-  return updateOrder(orderId, { [field]: true });
+  const updated = await updateOrder(orderId, { [field]: true });
+  // Night deep check 2026-11-27: confirmations are plain booleans
+  // with no timestamp on the order, so the team could not tell a
+  // confirm that happened after a dispute was filed from one
+  // before it. Log it (best effort, timestamped) so the audit
+  // trail shows when each side confirmed.
+  await logSecurityEvent(
+    orderId,
+    userId,
+    "handoff_confirmed",
+    `Handoff confirmed by the ${role} for order ${order.code}.`
+  );
+  return updated;
 }
 
 // ---------------------------------------------------------------------------

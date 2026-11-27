@@ -188,14 +188,18 @@ export async function fetchSellerRating(sellerId) {
 // table, so the rater label is the handle the rater uses on their own
 // listings (listings.seller_label); a rater who never listed shows as
 // "Student". A label is never invented from an email or a user id.
-export async function fetchRatingsForSeller(sellerId) {
+export async function fetchRatingsForSeller(sellerId, { before } = {}) {
   if (!supabase || !sellerId) return [];
-  const { data, error } = await supabase
+  // Cursor pagination, same shape as fetchNotifications: pass the
+  // created_at of the oldest row already shown as `before` to page
+  // further back. No cursor keeps the old behaviour (newest 100).
+  let query = supabase
     .from("ratings")
     .select("*")
     .eq("rated_id", sellerId)
-    .order("created_at", { ascending: false })
-    .limit(100);
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(100);
   if (error) {
     dbError(error, "fetch ratings for seller");
     return [];
@@ -219,7 +223,7 @@ export async function fetchRatingsForSeller(sellerId) {
       }
     }
   }
-  return rows.map((r) => ({
+  const mapped = rows.map((r) => ({
     id: r.id,
     orderId: r.order_id,
     raterId: r.rater_id,
@@ -228,6 +232,10 @@ export async function fetchRatingsForSeller(sellerId) {
     comment: r.comment,
     createdAt: r.created_at,
   }));
+  // Same as fetchNotifications: a full page means there may be
+  // older ratings to page to with { before }.
+  mapped.hasMore = rows.length === 100;
+  return mapped;
 }
 
 // The signed-in buyer's rating for one order, or null when they have

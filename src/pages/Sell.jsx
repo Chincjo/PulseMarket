@@ -388,7 +388,19 @@ export default function Sell({ verification }) {
           </label>
           <div className="grid grid-cols-2 gap-2">
             {photos.map((p, i) => (
-              <img key={i} src={p} alt={`Photo ${i + 1}`} className="h-32 w-full rounded-xl object-cover" />
+              <div key={i} className="relative">
+                <img src={p} alt={`Photo ${i + 1}`} className="h-32 w-full rounded-xl object-cover" />
+                {/* A photo picked by mistake used to be stuck — the
+                    only way out was starting the listing over. */}
+                <button
+                  type="button"
+                  aria-label={`Remove photo ${i + 1}`}
+                  onClick={() => setPhotos(photos.filter((_, j) => j !== i))}
+                  className="absolute right-1 top-1 rounded-full bg-black/60 px-2 py-0.5 text-xs font-bold text-white"
+                >
+                  ✕
+                </button>
+              </div>
             ))}
           </div>
           <p className="text-sm text-neutral-500">

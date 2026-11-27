@@ -215,6 +215,26 @@ export async function fileDispute(orderId, { category, explanation, email }) {
         "Reports are not set up yet — ask the PulseMarket team to run supabase/milestone-12.sql, then try again."
       );
     }
+    // Night deep check 2026-11-27: a double-submit from two tabs
+    // can both pass the open-dispute check above, then the second
+    // insert hits the M16 partial unique index (one open dispute
+    // per order — disputes_one_open_per_order_idx). The report IS
+    // filed, so return the ticket that already exists instead of
+    // showing a raw database error. (The race itself is already
+    // closed server-side; this is only the user-facing path.)
+    if (insertError.code === "23505") {
+      const { data: raced } = await supabase
+        .from("disputes")
+        .select("ticket_id")
+        .eq("order_id", orderId)
+        .eq("reporter_id", user.id)
+        .in("status", ["open", "under_review"])
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (raced && raced.length > 0) {
+        return { ticketId: raced[0].ticket_id };
+      }
+    }
     throw insertError;
   }
 
@@ -313,7 +333,8 @@ export async function fetchAllDisputes() {
   const { data, error } = await supabase
     .from("disputes")
     .select("*")
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(1000);
   if (error) throw error;
   return data || [];
 }

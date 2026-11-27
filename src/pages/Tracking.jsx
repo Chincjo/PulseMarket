@@ -828,7 +828,18 @@ export default function Tracking() {
       )}
 
       {/* ---- Returns (buyer) ---- */}
-      {isBuyer && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && (
+      {/* Cash orders have no held money to refund, so the return form
+          would always fail in openReturn() — cash returns are sorted
+          out with the seller directly. */}
+      {isBuyer && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && order.payment_method === "cash" && (
+        <section className="space-y-3 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
+          <h2 className="text-lg font-bold">Open a return</h2>
+          <p className="text-sm text-neutral-500">
+            This was a cash order — there is no held money to refund, so returns are sorted out with the seller directly.
+          </p>
+        </section>
+      )}
+      {isBuyer && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && order.payment_method !== "cash" && (
         <section className="space-y-3 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
           <h2 className="text-lg font-bold">Open a return</h2>
           <p className="text-sm text-neutral-500">

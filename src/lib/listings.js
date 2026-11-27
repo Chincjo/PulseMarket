@@ -453,7 +453,13 @@ export async function replaceVerificationPhotos(userId, frontFile, backFile) {
   let photoPaths;
   try {
     photoPaths = await uploadVerificationIdPhotos(userId, frontFile, backFile);
-  } catch {
+  } catch (err) {
+    // Validation failures (too big, not a photo, magic-byte fail,
+    // same file twice) are plain Errors thrown by the upload helper
+    // — pass the real reason on, so the student knows what to fix.
+    // A storage/network failure arrives as a Supabase error object,
+    // not an Error, and gets the plain connection message instead.
+    if (err instanceof Error) throw err;
     throw new Error("Your ID photos could not be uploaded. Please check your connection and try again.");
   }
   try {
@@ -650,6 +656,17 @@ export async function fetchMyListings(userId, { before } = {}) {
 export async function createListingRow(row) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!row || !row.seller_id) throw new Error("Missing seller.");
+  // The row's seller must be the signed-in student. The function
+  // used to check that seller's verification and then insert, so a
+  // crafted call could publish a listing under another student's
+  // name with only RLS in the way. (This file has no currentUser()
+  // helper — this is the same supabase.auth.getUser() call
+  // updateListing uses.)
+  const { data: authData } = await supabase.auth.getUser();
+  const caller = authData?.user || null;
+  if (!caller || caller.id !== row.seller_id) {
+    throw new Error("You can only post a listing as yourself.");
+  }
   // A listing is only ever published by a student whose verification
   // is APPROVED on the server. The Sell page shows the form from the
   // device copy of the record, but that copy lives in localStorage
@@ -728,6 +745,10 @@ export async function createListingRow(row) {
     throw new Error("A new listing starts with 0 views.");
   }
   const clean = checkListingValues(row);
+  // A new listing is always born 'active' — a passed-in status of
+  // 'sold' or 'reserved' used to sail through validation and land
+  // in the insert as-is.
+  clean.status = "active";
   // The whole form is compulsory — the same rules the Sell page and
   // the database CHECKs enforce. A crafted call used to publish
   // with a missing photo, a 2-character description, an unknown
@@ -960,6 +981,18 @@ export async function reactivateListing(id) {
 
 export async function deleteListing(id) {
   if (!supabase || !id) throw new Error("Missing listing.");
+  // Only the listing's seller — or the PulseMarket team — may
+  // delete it. updateListing checks this; deleteListing had no
+  // app-side check at all, so any signed-in caller could delete
+  // another student's listing (RLS was the only backstop).
+  const listing = await fetchListing(id);
+  if (!listing) throw new Error("Listing not found.");
+  const { data: authData } = await supabase.auth.getUser();
+  const caller = authData?.user || null;
+  const isOwner = caller?.email === OWNER_EMAIL;
+  if (!caller || (!isOwner && caller.id !== listing.seller_id)) {
+    throw new Error("Only the seller can delete this listing.");
+  }
   // Deleting a listing cascades in the database: every order for it
   // (and their handoff, checkpoints and evidence) is deleted too.
   // Refuse while any live order history exists — a seller with an
@@ -1132,13 +1165,21 @@ export async function confirmBoostPurchase(row) {
   // A second confirm of the same request (double-tap, or two team
   // members at once) must not extend the boost: the row is already
   // 'paid', so the update above matched nothing — but the boost may
-  // already be live from the first confirm. Skip re-applying when
-  // the same tier is still running. A retry after a FAILED apply
-  // still works: the listing is not boosted then, so it applies.
+  // already be live from the first confirm. Skip re-applying
+  // whenever ANY boost is currently live on the listing — a stale
+  // re-confirm of a different tier used to overwrite the live boost
+  // with this row's tier. A retry after a FAILED apply still works:
+  // the listing is not boosted then, so it applies.
   const listing = await fetchListing(row.listing_id);
+  if (!listing) {
+    // The listing is gone (deleted) — the boost can never apply, so
+    // say so plainly instead of the generic "marked paid but did not
+    // apply" message, which invites confirming again forever.
+    throw new Error(
+      "This listing no longer exists — the boost cannot be applied. Refund the buyer if they paid."
+    );
+  }
   if (
-    listing &&
-    listing.boost_tier === tier.amount &&
     listing.boosted_until &&
     new Date(listing.boosted_until).getTime() > Date.now()
   ) {
@@ -1185,25 +1226,45 @@ async function dataUrlToBlob(dataUrl) {
 
 export async function uploadListingPhotos(userId, dataUrls) {
   if (!supabase) throw new Error("Supabase is not configured.");
+  // A listing holds at most 4 photos — passing more used to upload
+  // all of them and silently drop the extras.
+  if (!dataUrls || dataUrls.length === 0) {
+    throw new Error("Add at least 1 photo.");
+  }
+  if (dataUrls.length > 4) {
+    throw new Error("A listing can have at most 4 photos.");
+  }
   const urls = [];
-  for (let i = 0; i < dataUrls.length; i++) {
-    const blob = await dataUrlToBlob(dataUrls[i]);
-    if (blob.size > 10 * 1024 * 1024) {
-      throw new Error("That photo is too big — keep listing photos under 10MB.");
+  const uploadedPaths = [];
+  try {
+    for (let i = 0; i < dataUrls.length; i++) {
+      const blob = await dataUrlToBlob(dataUrls[i]);
+      if (blob.size > 10 * 1024 * 1024) {
+        throw new Error("That photo is too big — keep listing photos under 10MB.");
+      }
+      // Milestone 20 (APP-10): the file must actually be a photo —
+      // a renamed video or document used to sail through on its MIME
+      // type alone. Same magic-byte check as the waybill photos.
+      await assertRealPhoto(blob, "listing");
+      const path = `${userId}/${Date.now()}-${i}.jpg`;
+      const { error } = await supabase.storage
+        .from(LISTING_PHOTOS_BUCKET)
+        .upload(path, blob, { contentType: "image/jpeg", upsert: false });
+      if (error) throw error;
+      uploadedPaths.push(path);
+      const { data } = supabase.storage
+        .from(LISTING_PHOTOS_BUCKET)
+        .getPublicUrl(path);
+      urls.push(data.publicUrl);
     }
-    // Milestone 20 (APP-10): the file must actually be a photo —
-    // a renamed video or document used to sail through on its MIME
-    // type alone. Same magic-byte check as the waybill photos.
-    await assertRealPhoto(blob, "listing");
-    const path = `${userId}/${Date.now()}-${i}.jpg`;
-    const { error } = await supabase.storage
-      .from(LISTING_PHOTOS_BUCKET)
-      .upload(path, blob, { contentType: "image/jpeg", upsert: false });
-    if (error) throw error;
-    const { data } = supabase.storage
-      .from(LISTING_PHOTOS_BUCKET)
-      .getPublicUrl(path);
-    urls.push(data.publicUrl);
+  } catch (err) {
+    // A failure part-way used to leave the photos already uploaded
+    // orphaned in the bucket. Remove them before rethrowing, so a
+    // failed publish leaves nothing behind.
+    if (uploadedPaths.length > 0) {
+      await supabase.storage.from(LISTING_PHOTOS_BUCKET).remove(uploadedPaths);
+    }
+    throw err;
   }
   return urls;
 }

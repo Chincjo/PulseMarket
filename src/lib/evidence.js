@@ -578,7 +578,8 @@ export async function fetchEvidenceForOrder(orderId) {
     .from("evidence")
     .select("*")
     .eq("order_id", orderId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100);
   if (error) {
     dbError(error, "fetch evidence for order");
     return [];
@@ -593,7 +594,8 @@ export async function fetchMyEvidence(userId) {
     .from("evidence")
     .select("*")
     .eq("user_id", userId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(100);
   if (error) {
     dbError(error, "fetch my evidence");
     return [];
@@ -658,19 +660,21 @@ export async function deleteEvidence(id) {
       }
     }
   }
+  // Delete the ROW first, then the file. The old order deleted the
+  // file first — if the row delete then failed, the row survived
+  // pointing at a deleted file. An orphaned file is harmless; a
+  // dangling pointer is not. A failed file delete is only logged.
+  const { error } = await supabase.from("evidence").delete().eq("id", id);
+  if (error) throw error;
   const path = storagePathFromUrl(row.url);
   if (path) {
     const { error: storageError } = await supabase.storage
       .from(EVIDENCE_BUCKET)
       .remove([path]);
     if (storageError) {
-      // Log it and carry on — the row must still go, or the student
-      // is left with evidence they cannot remove.
       dbError(storageError, "delete evidence file");
     }
   }
-  const { error } = await supabase.from("evidence").delete().eq("id", id);
-  if (error) throw error;
   return true;
 }
 
