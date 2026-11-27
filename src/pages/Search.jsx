@@ -27,7 +27,9 @@ export default function Search() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchActiveListings()
+    // Milestone 20 (APP-16): capped at 200 rows — the page never
+    // needs more than a screenful of candidates to filter and sort.
+    fetchActiveListings(200)
       .then((rows) => {
         if (!cancelled) {
           setAll(rows);

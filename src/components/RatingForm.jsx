@@ -49,10 +49,16 @@ export default function RatingForm({ order, onSubmitted }) {
         if (alive) setLoading(false);
         return;
       }
-      const mine = await fetchMyRatingForOrder(order.id);
-      if (alive) {
-        setExisting(mine);
-        setLoading(false);
+      // A failed read must never leave the form stuck on
+      // "Loading rating…" for ever — on error the form still shows
+      // (the one-rating-per-order rule is enforced again on submit).
+      try {
+        const mine = await fetchMyRatingForOrder(order.id);
+        if (alive) setExisting(mine);
+      } catch {
+        // keep existing null; the form stays usable
+      } finally {
+        if (alive) setLoading(false);
       }
     }
     load();
@@ -96,15 +102,20 @@ export default function RatingForm({ order, onSubmitted }) {
     );
   }
 
-  if (order.status !== "released") {
+  if (order.status !== "released" && !(order.status === "delivered" && order.payment_method === "cash")) {
     return (
       <p className="text-sm text-neutral-500">
-        You can rate the seller once this order is released.
+        You can rate the seller once this order is released — or once a cash order is delivered.
       </p>
     );
   }
 
   async function onSubmit() {
+    // Busy guard first: the button only disables after re-render, so
+    // two fast taps used to fire two inserts — the second hit the
+    // one-rating-per-order index and showed "already rated" even
+    // though the first tap had saved.
+    if (busy) return;
     setError("");
     if (stars < 1 || stars > 5) {
       setError("Tap 1 to 5 stars first.");
@@ -117,8 +128,11 @@ export default function RatingForm({ order, onSubmitted }) {
       if (onSubmitted) onSubmitted(rating);
     } catch (err) {
       setError(err?.message || "Could not save your rating. Try again.");
+    } finally {
+      // finally, not after the catch: if onSubmitted throws, the
+      // button must not stay stuck on "Saving…".
+      setBusy(false);
     }
-    setBusy(false);
   }
 
   return (

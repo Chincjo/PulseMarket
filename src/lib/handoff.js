@@ -22,6 +22,7 @@
 //      that with handoffComplete().
 import { supabase } from "./supabase";
 import { OWNER_EMAIL } from "./payments";
+import { assertRealPhoto } from "./shipping";
 
 export const EVIDENCE_MEDIA_BUCKET = "evidence-media";
 
@@ -248,10 +249,20 @@ export async function uploadHandoffPhoto(orderId, role, dataUrl) {
     throw new Error("This order is closed — there is no handoff to photograph.");
   }
   const blob = await dataUrlToBlob(dataUrl);
-  const path = `${userId}/handoff-${orderId}-${role}.jpg`;
+  // A handoff photo with no checks used to accept any file at any
+  // size. Same 10MB cap and magic-byte check as the waybill photos.
+  if (blob.size > 10 * 1024 * 1024) {
+    throw new Error("That photo is too big — keep photos under 10MB.");
+  }
+  await assertRealPhoto(blob, "handoff");
+  // Timestamped path, never overwritten: the old fixed path with
+  // upsert:true let the bytes behind a frozen photo URL be swapped
+  // after confirming. A retake writes a new file and the order row
+  // points at it; the old file is simply orphaned.
+  const path = `${userId}/handoff-${orderId}-${role}-${Date.now()}.jpg`;
   const { error } = await supabase.storage
     .from(EVIDENCE_MEDIA_BUCKET)
-    .upload(path, blob, { contentType: "image/jpeg", upsert: true });
+    .upload(path, blob, { contentType: "image/jpeg", upsert: false });
   if (error) throw error;
   const { data } = supabase.storage
     .from(EVIDENCE_MEDIA_BUCKET)
@@ -274,6 +285,12 @@ export async function confirmHandoff(orderId, role) {
   }
   const order = await readOrder(orderId);
   if (!order) throw new Error("Order not found.");
+  // Same closed-order guard as uploadHandoffPhoto: confirming a
+  // handoff on a closed order writes confirmations that can never
+  // be used (release / delivery refuse closed orders).
+  if (["cancelled", "refunded", "released"].includes(order.status)) {
+    throw new Error("This order is closed — there is no handoff to confirm.");
+  }
   const userId = await currentUserId();
   if (!userId) throw new Error("Sign in first to confirm the handoff.");
   const expectedId = role === "buyer" ? order.buyer_id : order.seller_id;
@@ -363,8 +380,17 @@ export async function getHandoffStatus(orderId) {
       .maybeSingle();
     code = data?.code || null;
   }
+  // The delivery PIN belongs to the buyer only. This function does
+  // not gate on meet-in-person, so a seller asking for the status of
+  // a SHIPPING order would otherwise receive the full row including
+  // the PIN — strip it for anyone but the buyer.
+  let safeOrder = order;
+  if (callerId !== order.buyer_id && order && "delivery_pin" in order) {
+    const { delivery_pin: _delivery_pin, ...rest } = order;
+    safeOrder = rest;
+  }
   return {
-    order,
+    order: safeOrder,
     code,
     scanned: Boolean(order.handoff_scanned_at),
     scannedAt: order.handoff_scanned_at || null,

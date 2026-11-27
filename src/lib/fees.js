@@ -16,6 +16,24 @@ export function formatNaira(n) {
   return "₦" + Math.round(Number(n) || 0).toLocaleString("en-NG");
 }
 
+// Milestone 20 (APP-16): the fee label strings live here, not as
+// hardcoded literals in Sell / ListingDetail / Checkout, so the
+// three pages can never drift apart (one used to say "5%" while
+// another said something else). The amounts themselves still come
+// from feeBreakdown() above.
+export const FEE_LABELS = {
+  serviceFlat: "(flat ₦150 under ₦5,000)",
+  servicePercent: "(5%, capped at ₦2,000)",
+  secure: "(1.5% + ₦100)",
+  cashNoFee: "(cash — no fee)",
+};
+
+// Which service-fee label goes with this price: flat ₦150 under
+// ₦5,000, otherwise 5% capped at ₦2,000 (same rule as feeBreakdown).
+export function serviceFeeLabel(price) {
+  return Number(price) < 5000 ? FEE_LABELS.serviceFlat : FEE_LABELS.servicePercent;
+}
+
 // Silent Suggest Price: percentage of the new price by condition.
 export const SUGGEST_PRICE = {
   New: 1.0,

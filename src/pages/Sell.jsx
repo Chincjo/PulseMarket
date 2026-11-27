@@ -17,7 +17,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CATEGORIES, CONDITIONS, SAFE_MEETUP_SPOTS, universityState } from "../lib/data";
-import { feeBreakdown, formatNaira, suggestPrice } from "../lib/fees";
+import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel, suggestPrice } from "../lib/fees";
 import { createListingRow, uploadListingPhotos } from "../lib/listings";
 import { assertSellerClearOfDebt } from "../lib/shipping";
 import { isSupabaseConfigured } from "../lib/supabase";
@@ -166,6 +166,13 @@ export default function Sell({ verification }) {
     const files = [...e.target.files].slice(0, 4 - photos.length);
     const urls = [];
     for (const f of files) {
+      // Milestone 20 (APP-16): reject an oversized photo BEFORE
+      // reading it — a 30MB photo used to be read into memory and
+      // downscaled before anything complained.
+      if (f.size > 10 * 1024 * 1024) {
+        setError("That photo is too big — keep listing photos under 10MB.");
+        continue;
+      }
       try {
         urls.push(await downscale(f));
       } catch (err) {
@@ -177,6 +184,10 @@ export default function Sell({ verification }) {
   }
 
   async function publish() {
+    // Busy guard first: the button only disables after re-render,
+    // so two fast taps used to run publish twice — photos uploaded
+    // twice and two identical listings created.
+    if (publishing) return;
     setError("");
     // Defence in depth: never publish an incomplete listing, even if the
     // button state and this check ever disagree.
@@ -292,7 +303,7 @@ export default function Sell({ verification }) {
           <label className="block text-sm font-semibold">What does it cost new? (optional)
             <input value={newPrice} onChange={(e) => setNewPrice(e.target.value)} type="number" placeholder="e.g. 12000" className={`${inputCls} mt-1`} />
           </label>
-          {suggested !== null && (
+          {suggested !== null && suggested > 0 && (
             <p className="rounded-xl bg-brown-soft px-3 py-2 text-sm text-brown-dark">
               Suggested price for {condition}: <b>{formatNaira(suggested)}</b> — you can change it below.
             </p>
@@ -300,12 +311,12 @@ export default function Sell({ verification }) {
           <label className="block text-sm font-semibold">Your price (₦)
             <input value={price} onChange={(e) => setPrice(e.target.value)} type="number" placeholder="e.g. 8500" className={`${inputCls} mt-1`} />
           </label>
-          {price ? (
+          {price && Number(price) > 0 ? (
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">What the buyer pays</p>
               <p className="mt-1 flex justify-between"><span>Item price</span><span>{formatNaira(fees.price)}</span></p>
-              <p className="flex justify-between text-neutral-500"><span>Service fee {fees.price < 5000 ? "(flat ₦150 under ₦5,000)" : "(5%, capped at ₦2,000)"}</span><span>{formatNaira(fees.serviceFee)}</span></p>
-              <p className="flex justify-between text-neutral-500"><span>Secure payment fee</span><span>{formatNaira(fees.secureFee)}</span></p>
+              <p className="flex justify-between text-neutral-500"><span>Service fee {serviceFeeLabel(fees.price)}</span><span>{formatNaira(fees.serviceFee)}</span></p>
+              <p className="flex justify-between text-neutral-500"><span>Secure payment fee {FEE_LABELS.secure}</span><span>{formatNaira(fees.secureFee)}</span></p>
               <p className="mt-1 flex justify-between font-bold"><span>Buyer pays (held)</span><span>{formatNaira(fees.total)}</span></p>
               <p className="mt-1 text-neutral-500">Cash face-to-face: no fees — buyer pays {formatNaira(fees.price)}. You keep the full price either way.</p>
             </div>
@@ -354,7 +365,7 @@ export default function Sell({ verification }) {
             {delivery === "meetup"
               ? "Face-to-face: the buyer scans your seller code at handoff before any money moves."
               : delivery === "shipping"
-                ? "Shipping: GIG / GUO between states, Chowdeck Relay same-city. You get 50% after shipping proof, 50% after delivery."
+                ? "Shipping: GIG / GUO between states, Chowdeck Relay same-city. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery."
                 : "Choose one to continue."}
           </p>
         </div>
@@ -412,7 +423,7 @@ export default function Sell({ verification }) {
           ) : (
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">Shipping chosen</p>
-              <p className="mt-1 text-neutral-500">The buyer pays the courier at delivery or as agreed in chat. You get 50% after shipping proof, 50% after delivery.</p>
+              <p className="mt-1 text-neutral-500">Shipping is included in the held payment — the buyer pays it through the app, not to the courier. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery.</p>
             </div>
           )}
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">

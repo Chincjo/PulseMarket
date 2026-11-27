@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
+import { autoReleaseDue } from "../lib/autoRelease";
 import { fetchListing } from "../lib/listings";
 import {
   cancelOrder,
@@ -24,6 +25,10 @@ import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
 import RatingForm from "../components/RatingForm";
 
 const HELD_STEPS = ["reserved", "paid", "held", "shipped", "delivered", "released"];
+// Meet-in-person held orders never ship: their status goes held ->
+// delivered directly, so showing a "Shipped" step left the progress
+// sitting on a step that could never happen.
+const MEETUP_STEPS = ["reserved", "paid", "held", "delivered", "released"];
 const STEP_LABELS = {
   reserved: "Reserved",
   paid: "Paid — transfer sent",
@@ -105,10 +110,41 @@ export default function OrderDetail() {
       />
     );
   }
+  // The database already refuses this row to non-participants
+  // (RLS: buyer, seller or the team), but the page used to render
+  // the order code, fee breakdown and bank details to anyone who
+  // reached it, with only a small "not part of this order" line at
+  // the bottom. Stop before any of it renders — same as Handoff
+  // and Tracking.
+  if (!isBuyer && !isSeller && !isOwner) {
+    return (
+      <EmptyState
+        title="This order is not yours"
+        body="Order details are only visible to the buyer, the seller and the PulseMarket team."
+        action={
+          <Link to="/dashboard">
+            <GhostButton>Back to dashboard</GhostButton>
+          </Link>
+        }
+      />
+    );
+  }
 
-  const steps = order.payment_method === "cash" ? CASH_STEPS : HELD_STEPS;
+  const steps =
+    order.payment_method === "cash"
+      ? CASH_STEPS
+      : order.delivery_method === "meetup"
+        ? MEETUP_STEPS
+        : HELD_STEPS;
   const stepIndex = steps.indexOf(order.status);
   const ended = ["cancelled", "refunded", "disputed"].includes(order.status);
+  // Countdown to the 48h auto-release, for a delivered held order —
+  // the page used to show the Release button with no word that the
+  // money moves on its own 48 hours after delivery.
+  const releaseCountdown =
+    order.payment_method === "held" && order.status === "delivered"
+      ? autoReleaseDue(order)
+      : null;
   const copyEmail = () => copyText(OWNER_EMAIL, (ok) => setCopied(ok ? "Email copied." : "Copy failed — the email is " + OWNER_EMAIL));
 
   return (
@@ -311,8 +347,11 @@ export default function OrderDetail() {
       )}
 
       {/* Milestone 11: the buyer rates the seller once the deal is done
-          and the money is released. */}
-      {order.status === "released" && isBuyer && (
+          and the money is released. Cash orders end at 'delivered'
+          (Milestone 20, APP-7), so a cash buyer rates from there. */}
+      {(order.status === "released" ||
+        (order.status === "delivered" && order.payment_method === "cash")) &&
+        isBuyer && (
         <section>
           <h2 className="text-lg font-bold">Rate the seller</h2>
           <div className="mt-2">
@@ -388,13 +427,22 @@ export default function OrderDetail() {
           </p>
         )}
         {(isOwner || isBuyer) && order.status === "delivered" && order.payment_method === "held" && !order.frozen && order.return_status !== "opened" && (
-          <PrimaryButton
-            className="w-full py-3"
-            disabled={busy !== ""}
-            onClick={() => run("released", () => releaseOrder(order.id, user))}
-          >
-            {busy === "released" ? "Saving…" : "Release to seller"}
-          </PrimaryButton>
+          <>
+            {releaseCountdown && releaseCountdown.hoursLeft !== null && (
+              <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+                {releaseCountdown.hoursLeft > 0
+                  ? `If nobody releases it first, the money goes to the seller automatically in about ${releaseCountdown.hoursLeft} ${releaseCountdown.hoursLeft === 1 ? "hour" : "hours"} (48 hours after delivery).`
+                  : "The 48 hours after delivery are up — the money will be released to the seller automatically the next time the app checks."}
+              </p>
+            )}
+            <PrimaryButton
+              className="w-full py-3"
+              disabled={busy !== ""}
+              onClick={() => run("released", () => releaseOrder(order.id, user))}
+            >
+              {busy === "released" ? "Saving…" : "Release to seller"}
+            </PrimaryButton>
+          </>
         )}
         {/* Cancel — Milestone 18 §8: the database already allows
             seller-cancel from 'reserved' and team-cancel from
@@ -413,9 +461,6 @@ export default function OrderDetail() {
             {busy === "cancelled" ? "Cancelling…" : "Cancel order"}
           </GhostButton>
         ) : null}
-        {!isBuyer && !isSeller && !isOwner && (
-          <p className="text-sm text-neutral-500">You are not part of this order.</p>
-        )}
       </section>
 
       <p className="text-xs text-neutral-400">

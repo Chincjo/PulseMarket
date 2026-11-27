@@ -199,7 +199,11 @@ export default function Handoff() {
       />
     );
   }
-  if (["cancelled", "refunded"].includes(order.status)) {
+  // "released" belongs here too: the money has already moved, so
+  // there is no handoff left to do — without it a released order
+  // rendered the whole handoff UI and the seller-code creation
+  // attempt failed with "This order is closed" on top of it.
+  if (["cancelled", "refunded", "released"].includes(order.status)) {
     return (
       <div className="space-y-5">
         <Link to={`/order/${order.id}`} className="text-sm font-semibold text-brown">

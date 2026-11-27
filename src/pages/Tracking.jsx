@@ -17,6 +17,7 @@ import { fetchConversationForListing } from "../lib/chat";
 import { OWNER_EMAIL } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
+import { useSignedEvidenceUrls } from "../lib/evidence";
 import {
   CHECKPOINT_LABELS,
   CHECKPOINT_STATUSES,
@@ -93,6 +94,14 @@ export default function Tracking() {
   const [order, setOrder] = useState(null);
   const [listing, setListing] = useState(null);
   const [checkpoints, setCheckpoints] = useState([]);
+  // Milestone 20 (M-6): checkpoint, waybill and receipt photos
+  // render through short-lived signed URLs (the evidence-media
+  // bucket goes private) — stored URLs are the fallback until then.
+  const signedPhotoUrls = useSignedEvidenceUrls([
+    ...(checkpoints || []).map((c) => c.photo),
+    order?.waybill_photo,
+    order?.receipt_photo,
+  ]);
   const [chatId, setChatId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -291,8 +300,8 @@ export default function Tracking() {
   if (checkpoints.some((c) => ["left_origin", "stopped", "arrived_terminal", "out_for_delivery", "ready_for_pickup"].includes(c.status))) progressIndex = 3;
   if (checkpoints.some((c) => c.status === "delivered") || delivered) progressIndex = 4;
 
-  const showProofForm = isSeller && order.status === "held" && order.delivery_method === "shipping";
-  const showCheckpointForm = isSeller && ["shipped", "delivered"].includes(order.status);
+  const showProofForm = isSeller && order.status === "held" && order.delivery_method === "shipping" && !order.frozen;
+  const showCheckpointForm = isSeller && ["shipped", "delivered"].includes(order.status) && !order.frozen;
   // Milestone 19, Decision 6: the seller enters the rider's name
   // and phone for a same-city Chowdeck Relay order, only while the
   // money is held or the order has shipped. Any other courier or
@@ -373,7 +382,7 @@ export default function Tracking() {
             )}
           </div>
           {/* Milestone 19, Decision 6 — seller enters the rider */}
-          {showRiderForm && (
+          {showRiderForm && !order.frozen && (
             <div className="space-y-2 rounded-xl border border-neutral-200 p-3 dark:border-neutral-800">
               <h3 className="text-sm font-bold">Rider details</h3>
               <p className="text-xs text-neutral-500">
@@ -514,7 +523,7 @@ export default function Tracking() {
       )}
 
       {/* ---- Confirm delivery with PIN (buyer) ---- */}
-      {isBuyer && order.status === "shipped" && (
+      {isBuyer && order.status === "shipped" && !order.frozen && (
         <section className="space-y-2 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
           <h2 className="text-lg font-bold">Confirm delivery with PIN</h2>
           <p className="text-sm text-neutral-500">
@@ -565,7 +574,7 @@ export default function Tracking() {
                 <p className="text-xs text-neutral-500">{timeAgo(c.created_at)}</p>
                 {c.note && <p className="mt-1 text-sm">{c.note}</p>}
                 {c.photo && (
-                  <a href={c.photo} target="_blank" rel="noreferrer" className="text-sm font-semibold text-brown underline">
+                  <a href={signedPhotoUrls.get(c.photo) || c.photo} target="_blank" rel="noreferrer" className="text-sm font-semibold text-brown underline">
                     View photo
                   </a>
                 )}
@@ -731,14 +740,14 @@ export default function Tracking() {
               </p>
               {order.waybill_photo && (
                 <p className="mt-2">
-                  <a href={order.waybill_photo} target="_blank" rel="noreferrer" className="font-semibold text-brown underline">
+                  <a href={signedPhotoUrls.get(order.waybill_photo) || order.waybill_photo} target="_blank" rel="noreferrer" className="font-semibold text-brown underline">
                     View waybill photo
                   </a>
                 </p>
               )}
               {order.receipt_photo && (
                 <p className="mt-1">
-                  <a href={order.receipt_photo} target="_blank" rel="noreferrer" className="font-semibold text-brown underline">
+                  <a href={signedPhotoUrls.get(order.receipt_photo) || order.receipt_photo} target="_blank" rel="noreferrer" className="font-semibold text-brown underline">
                     View receipt photo
                   </a>
                 </p>
@@ -819,12 +828,12 @@ export default function Tracking() {
       )}
 
       {/* ---- Returns (buyer) ---- */}
-      {isBuyer && ["shipped", "delivered"].includes(order.status) && order.return_status !== "opened" && order.return_status !== "resolved" && (
+      {isBuyer && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && (
         <section className="space-y-3 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
           <h2 className="text-lg font-bold">Open a return</h2>
           <p className="text-sm text-neutral-500">
             If the item is wrong, damaged, not as described or fake, the seller is at fault:
-            you get the item price + shipping back and the seller pays the return shipping.
+            you get the full total back — item price + shipping + fees — and the seller pays the return shipping.
             If you simply changed your mind, you get the item price back only, the seller
             keeps the shipping money, and you pay the return shipping. The PulseMarket team
             decides after looking at the evidence — email {OWNER_EMAIL} if you need help.

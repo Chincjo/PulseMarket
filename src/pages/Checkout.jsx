@@ -5,8 +5,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { SAFE_MEETUP_SPOTS, STATES } from "../lib/data";
-import { feeBreakdown, formatNaira } from "../lib/fees";
+import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
 import { fetchListing, fetchVerificationRow } from "../lib/listings";
+import { fetchConversationForListing } from "../lib/chat";
+import { courierTiers } from "../lib/shipping";
 import { universityState } from "../lib/data";
 import { createOrder } from "../lib/orders";
 import { OWNER_EMAIL, shippingZone } from "../lib/payments";
@@ -37,10 +39,27 @@ export default function Checkout() {
   const [courier, setCourier] = useState("");
   const [reserving, setReserving] = useState(false);
   const [error, setError] = useState("");
+  // The price the buyer and seller agreed in chat (an accepted
+  // offer), when there is one — the buyer pays the agreed price,
+  // not the original asking price. It only counts when it is a
+  // real number below the listed price.
+  const [agreedPrice, setAgreedPrice] = useState(null);
+  // The conversation the agreed price came from, so createOrder can
+  // re-read the price from the server instead of trusting this
+  // page's copy (Milestone 22: a failed read here used to mean the
+  // buyer silently paid full price).
+  const [conversationId, setConversationId] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    // The agreed price belongs to THIS listing's conversation. Reset
+    // it on every load: without this, opening checkout for a second
+    // listing kept the first listing's agreed price, and the buyer
+    // was charged the other deal's price whenever it was below this
+    // listing's price.
+    setAgreedPrice(null);
+    setConversationId(null);
     fetchListing(listingId)
       .then((row) => {
         if (cancelled) return;
@@ -52,6 +71,16 @@ export default function Checkout() {
           const methods = row.delivery_methods || [];
           if (!methods.includes("meetup") && methods.includes("shipping")) {
             setDeliveryMethod("shipping");
+            // Shipping-only listing: cash is paid face to face, so
+            // there is no cash path for this item — default to held.
+            setPaymentMethod("held");
+          } else {
+            // The delivery choice also belongs to this listing: a
+            // previous checkout that left it on "shipping" used to
+            // carry over onto a meetup-only listing, showing a
+            // shipping fee in the total for a trip that cannot be
+            // booked (reserve then failed server-side).
+            setDeliveryMethod("meetup");
           }
         }
       })
@@ -74,14 +103,37 @@ export default function Checkout() {
         }
       });
     }
+    if (user) {
+      // An accepted offer on this listing sets the price the buyer
+      // actually pays. Without this the chat banner promises an
+      // agreed price that checkout never charged.
+      fetchConversationForListing(listingId, user.id).then((conv) => {
+        if (cancelled) return;
+        setConversationId(conv?.id || null);
+        if (!conv?.agreed_price) return;
+        const agreed = Number(conv.agreed_price);
+        setAgreedPrice(agreed);
+      });
+    }
     return () => {
       cancelled = true;
     };
   }, [listingId, user]);
 
+  // The price that is actually charged: the agreed price when there
+  // is one below the asking price, otherwise the listed price.
+  const effectivePrice =
+    agreedPrice !== null &&
+    Number.isFinite(agreedPrice) &&
+    agreedPrice > 0 &&
+    listing &&
+    agreedPrice < listing.price
+      ? agreedPrice
+      : listing?.price ?? null;
+
   const fees = useMemo(
-    () => (listing ? feeBreakdown(listing.price, paymentMethod) : null),
-    [listing, paymentMethod]
+    () => (effectivePrice !== null ? feeBreakdown(effectivePrice, paymentMethod) : null),
+    [effectivePrice, paymentMethod]
   );
   // No destination, no shipping fee: pricing the fee from an empty
   // state used to charge the same-state ₦1,500 before the buyer had
@@ -108,17 +160,27 @@ export default function Checkout() {
   // listing could be ordered for shipping.
   const canShip = !listing || !deliveryMethods ? true : deliveryMethods.includes("shipping");
   // Chowdeck Relay is same-city only — it must never be offered for
-  // shipping to another state.
-  const courierOptions =
-    shipToState && listing && shipToState !== listing.state
-      ? COURIERS.filter((c) => c !== "Chowdeck Relay")
-      : COURIERS;
+  // shipping to another state. Tier 1 — items over ₦20,000 travel
+  // with GIG or GUO only (see courierTiers in lib/shipping.js); a
+  // park loader or cheaper courier is not offered for them.
+  const isInterstate = Boolean(shipToState && listing && shipToState !== listing.state);
+  const tier = effectivePrice !== null ? courierTiers(effectivePrice) : null;
+  const courierOptions = !isInterstate
+    ? COURIERS
+    : tier && tier.tier === 1
+      ? tier.allowedCouriers
+      : COURIERS.filter((c) => c !== "Chowdeck Relay");
   const effectiveCourier = courierOptions.includes(courier)
     ? courier
     : courierOptions[0];
 
   async function reserve() {
     if (!listing || !user) return;
+    // Belt and braces with the disabled button below: a double-tap
+    // must never fire createOrder twice (the second call would hit
+    // the one-open-order-per-listing index and report — wrongly —
+    // that "someone else" just reserved the item).
+    if (reserving) return;
     setError("");
     // Shipping with no destination state used to sail through and
     // silently fall back to the buyer's state (or none at all) —
@@ -167,6 +229,8 @@ export default function Checkout() {
         shipToState: deliveryMethod === "shipping" ? shipToState || buyerState : null,
         courier: deliveryMethod === "shipping" ? finalCourier : null,
         buyerState,
+        agreedPrice: effectivePrice !== null && effectivePrice < listing.price ? effectivePrice : null,
+        conversationId,
       });
       navigate(`/order/${order.id}`);
     } catch (err) {
@@ -231,7 +295,12 @@ export default function Checkout() {
         <p className="text-sm text-neutral-500">
           {listing.seller_label} · {listing.state} · {listing.condition}
         </p>
-        <p className="mt-1 text-lg font-bold">{formatNaira(listing.price)}</p>
+        <p className="mt-1 text-lg font-bold">{formatNaira(effectivePrice)}</p>
+        {effectivePrice !== null && effectivePrice < listing.price ? (
+          <p className="text-sm text-neutral-500">
+            Agreed price — listed at {formatNaira(listing.price)}.
+          </p>
+        ) : null}
       </div>
 
       <section className="space-y-2">
@@ -377,17 +446,15 @@ export default function Checkout() {
             <dt>
               Service fee{" "}
               {paymentMethod === "cash"
-                ? "(cash — no fee)"
-                : listing.price < 5000
-                  ? "(flat ₦150 under ₦5,000)"
-                  : "(5%, capped at ₦2,000)"}
+                ? FEE_LABELS.cashNoFee
+                : serviceFeeLabel(effectivePrice)}
             </dt>
             <dd className="font-semibold">{formatNaira(fees.serviceFee)}</dd>
           </div>
           <div className="flex justify-between">
             <dt>
               Secure payment fee{" "}
-              {paymentMethod === "cash" ? "(cash — no fee)" : "(1.5% + ₦100)"}
+              {paymentMethod === "cash" ? FEE_LABELS.cashNoFee : FEE_LABELS.secure}
             </dt>
             <dd className="font-semibold">{formatNaira(fees.secureFee)}</dd>
           </div>

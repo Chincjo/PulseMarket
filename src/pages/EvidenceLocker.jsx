@@ -23,6 +23,7 @@ import {
   fetchMyEvidence,
   recordVideo,
   uploadEvidence,
+  useSignedEvidenceUrls,
 } from "../lib/evidence";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
 
@@ -58,6 +59,11 @@ function timeAgo(iso) {
 function EvidenceItem({ item, onDeleted }) {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
+  // Milestone 20 (M-6): the evidence-media bucket goes private, so
+  // the stored public URL is swapped for a short-lived signed URL
+  // at render time (falls back to the stored URL until then).
+  const signedUrls = useSignedEvidenceUrls([item.url]);
+  const src = signedUrls.get(item.url) || item.url;
 
   async function handleDelete() {
     if (!window.confirm("Delete this evidence? This cannot be undone.")) return;
@@ -77,14 +83,14 @@ function EvidenceItem({ item, onDeleted }) {
     <li className="flex gap-3 rounded-xl border border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-950">
       {item.media_type === "video" ? (
         <video
-          src={item.url}
+          src={src}
           controls
           preload="metadata"
           className="h-20 w-28 shrink-0 rounded-lg bg-black object-cover"
         />
       ) : (
         <img
-          src={item.url}
+          src={src}
           alt={kindLabel(item.kind)}
           className="h-20 w-28 shrink-0 rounded-lg bg-neutral-100 object-cover dark:bg-neutral-900"
         />
@@ -146,8 +152,11 @@ function UploadBox({ order, defaultKind, onUploaded }) {
       recorderRef.current?.stop?.();
       if (clipUrl) URL.revokeObjectURL(clipUrl);
     };
+    // Runs on clipUrl change too: the old clip's blob URL is freed
+    // when a new clip replaces it (and on unmount). With [] deps
+    // the cleanup closed over the initial "" and never freed a clip.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [clipUrl]);
 
   function resetClip() {
     if (clipUrl) URL.revokeObjectURL(clipUrl);
@@ -156,6 +165,9 @@ function UploadBox({ order, defaultKind, onUploaded }) {
   }
 
   async function startRecording() {
+    // No guard before: a double-tap opened two camera streams and
+    // the second overwrote recorderRef, leaking the first stream.
+    if (recording) return;
     setError("");
     setNotice("");
     resetClip();
@@ -189,6 +201,9 @@ function UploadBox({ order, defaultKind, onUploaded }) {
 
   async function uploadClip() {
     if (!clip) return;
+    // No in-flight guard before: a double-tap saved the same clip
+    // twice (the disabled button only helps after a re-render).
+    if (busy) return;
     // A clip outside the kind's range can never count — refuse the
     // save plainly instead of storing an unverified video.
     if ((rule.minSeconds > 0 && clip.durationSeconds < rule.minSeconds) || clip.durationSeconds > rule.maxSeconds) {
@@ -399,7 +414,7 @@ export default function EvidenceLocker() {
 
   if (!user) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Evidence Locker</h1>
         <div className="mt-4">
           <EmptyState
@@ -412,7 +427,7 @@ export default function EvidenceLocker() {
             }
           />
         </div>
-      </main>
+      </div>
     );
   }
 
@@ -423,7 +438,7 @@ export default function EvidenceLocker() {
   }
 
   return (
-    <main className="mx-auto max-w-2xl px-4 py-6">
+    <div className="mx-auto max-w-2xl px-4 py-6">
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold">Evidence Locker</h1>
@@ -522,6 +537,6 @@ export default function EvidenceLocker() {
       <p className="mt-8 text-center text-xs text-neutral-500">
         Questions about evidence? Email pulsemarketsupport@gmail.com
       </p>
-    </main>
+    </div>
   );
 }

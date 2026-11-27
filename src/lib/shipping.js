@@ -105,9 +105,17 @@ async function updateOrder(id, patch) {
   return data;
 }
 
-// Same paired-move shape as Milestone 6's ledger writes.
+// Same paired-move shape as Milestone 6's ledger writes. Milestone
+// 22 (APP-17 mirror): created_by is the student actually making the
+// move — the seller claiming their advance, or the team resolving a
+// return — not always the buyer. orders.js recordLedgerMove() was
+// fixed the same way in Milestone 20; this copy still hardcoded the
+// buyer, so team-resolved refunds and seller advances were
+// attributed to the buyer in the audit trail. Falls back to the
+// buyer only when no one is signed in (a timed/system call).
 async function recordLedgerMove(order, moves) {
   if (!supabase) throw new Error("Supabase is not configured.");
+  const actor = (await currentUser())?.id || order.buyer_id;
   const rows = moves.map((m) => ({
     order_id: order.id,
     user_id: m.userId,
@@ -115,7 +123,7 @@ async function recordLedgerMove(order, moves) {
     kind: m.kind,
     amount: m.amount,
     note: m.note || null,
-    created_by: order.buyer_id,
+    created_by: actor,
   }));
   const { error } = await supabase.from("wallet_ledger").insert(rows);
   if (error) throw error;
@@ -231,6 +239,13 @@ export async function uploadEvidencePhoto(userId, orderId, fileOrDataUrl, label)
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!fileOrDataUrl) return null;
   const blob = await toBlob(fileOrDataUrl);
+  // A checkpoint / shipping photo with no checks used to accept any
+  // file at any size — the waybill photos go through assertRealPhoto
+  // and a 10MB cap, so these do too.
+  if (blob.size > 10 * 1024 * 1024) {
+    throw new Error("That photo is too big — keep photos under 10MB.");
+  }
+  await assertRealPhoto(blob, label || "checkpoint");
   const path = `${userId}/shipping/${orderId}-${label}-${Date.now()}.jpg`;
   const { error } = await supabase.storage
     .from(EVIDENCE_BUCKET)
@@ -267,7 +282,7 @@ function withoutDeliveryPin(order) {
 //   3. A waybill number may only ever be used for one order (checked
 //      again below, before the proof is saved).
 // ---------------------------------------------------------------------------
-async function assertRealPhoto(blob, label) {
+export async function assertRealPhoto(blob, label) {
   if (!blob || blob.size < 512) {
     throw new Error(
       `That ${label} photo does not look like a photo — take it again with the camera.`
@@ -622,6 +637,12 @@ export async function addCheckpoint(orderId, { status, location, note, photo }) 
   if (order.seller_id !== user.id) {
     throw new Error("Only the seller can add a checkpoint for this order.");
   }
+  // A frozen order (open dispute) takes no new checkpoints — the
+  // seller could otherwise spam the buyer with parcel updates (each
+  // one fires a notification) while the team is reviewing the order.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
   if (!["shipped", "delivered"].includes(order.status)) {
     throw new Error(
       `This order is ${order.status} — checkpoints start once the parcel has shipped.`
@@ -722,7 +743,11 @@ export async function updateRiderDetails(orderId, { riderName, riderPhone }) {
     );
   }
   const name = String(riderName || "").trim();
-  const phone = String(riderPhone || "").trim();
+  // Spaced numbers ("+234 803 123 4567") are how people actually
+  // type phone numbers — strip the spaces before checking, so a
+  // good number is not refused. The stored number has no spaces,
+  // so it also passes the database's own phone check.
+  const phone = String(riderPhone || "").trim().replace(/\s+/g, "");
   if (!name) {
     throw new Error("Enter the rider's name.");
   }
@@ -828,10 +853,12 @@ export async function openReturn(orderId, { reason, fault }) {
 
 // Owner only. The `fault` decides who pays:
 //   - Seller fault (wrong / damaged / not as described / fake): the
-//     buyer gets the item price + the shipping fee back. The seller
-//     owes the shipping advance back — it is recorded as a 'debt'
-//     ledger entry against the seller until they settle it, and the
-//     seller pays the return shipping.
+//     buyer gets the FULL total back — item price + shipping +
+//     fees (Milestone 20 D-3: the buyer loses nothing when the
+//     seller is at fault). The seller owes the shipping advance
+//     back — it is recorded as a 'debt' ledger entry against the
+//     seller until they settle it, and the seller pays the return
+//     shipping.
 //   - Buyer fault (changed mind): the buyer gets the item price back
 //     only. The seller keeps the shipping advance, and the rest of the
 //     shipping fee is released to the seller. The buyer pays the return
@@ -859,10 +886,40 @@ export async function resolveReturn(orderId, { fault }) {
   if (!["seller", "buyer"].includes(fault)) {
     throw new Error("Resolve the return as seller fault or buyer fault.");
   }
+  // The status check comes BEFORE the label correction below: a
+  // resolve that cannot run must not leave the stored fault label
+  // changed behind it.
   if (!["shipped", "delivered"].includes(order.status)) {
     throw new Error(
       `This order is ${order.status} — it can no longer be refunded this way.`
     );
+  }
+  // The refund legs are priced from the fault stored on the return
+  // when it was opened ("Seller fault: ..." / "Buyer fault: ..."),
+  // and the database refuses legs priced for the other fault.
+  // Milestone 20 (§12-B, widened) lets the team correct a wrong
+  // stored label while the return is still open — but the
+  // correction MUST be its own update BEFORE the refund legs are
+  // written, because the ledger prices the legs from the stored
+  // reason at insert time, and the resolving update comes after
+  // the legs. The detail text after the prefix is kept.
+  const storedFault = String(order.return_reason || "").startsWith("Seller fault")
+    ? "seller"
+    : String(order.return_reason || "").startsWith("Buyer fault")
+      ? "buyer"
+      : null;
+  let labelCorrected = false;
+  if (storedFault !== fault) {
+    const detail = String(order.return_reason || "")
+      .split(":")
+      .slice(1)
+      .join(":")
+      .trim();
+    const corrected =
+      (fault === "seller" ? "Seller fault" : "Buyer fault") +
+      (detail ? `: ${detail}` : "");
+    await updateOrder(orderId, { return_reason: corrected });
+    labelCorrected = true;
   }
 
   const total = Number(order.total) || 0;
@@ -879,7 +936,7 @@ export async function resolveReturn(orderId, { fault }) {
   if (supabase) {
     const { data: existingRefund } = await supabase
       .from("wallet_ledger")
-      .select("id")
+      .select("id, note")
       .eq("order_id", order.id)
       .eq("kind", "refund")
       .eq("bucket", "held")
@@ -888,14 +945,28 @@ export async function resolveReturn(orderId, { fault }) {
       if (order.status === "refunded" && order.return_status === "resolved") {
         throw new Error("This return was already resolved — the refund moved once.");
       }
-      const closed = await updateOrder(orderId, {
-        status: "refunded",
-        return_status: "resolved",
-      });
       // (DB-16) If the first resolve wrote the refund but crashed
       // before recording the seller-fault debt, re-record it now —
       // otherwise the advance the seller kept is never owed back.
-      if (fault === "seller" && advance > 0) {
+      // The fault that counts is the one the refund legs were
+      // actually priced for — read it from the refund leg's note,
+      // not from this call's `fault` argument: a retry with the
+      // other fault would otherwise record a debt for a buyer-fault
+      // refund (the seller legitimately kept the advance) or skip
+      // the debt for a seller-fault one (the seller keeps money the
+      // buyer was refunded in full).
+      // ORDER MATTERS (milestone-21 §1): the debt must be recorded
+      // BEFORE the order flips to refunded — the database refuses
+      // a refunded order with an advance and no debt row. If the
+      // debt write fails here, the flip below fails loudly with
+      // the exact error instead of silently creating money.
+      const refundNote = String(existingRefund[0]?.note || "");
+      const refundWasSellerFault = /seller fault/i.test(refundNote)
+        ? true
+        : /buyer fault/i.test(refundNote)
+          ? false
+          : fault === "seller";
+      if (refundWasSellerFault && advance > 0) {
         const { data: existingDebt } = await supabase
           .from("wallet_ledger")
           .select("id")
@@ -914,6 +985,10 @@ export async function resolveReturn(orderId, { fault }) {
           }
         }
       }
+      const closed = await updateOrder(orderId, {
+        status: "refunded",
+        return_status: "resolved",
+      });
       notifyUser(order.buyer_id, {
         kind: "dispute",
         title: "Return resolved",
@@ -928,6 +1003,17 @@ export async function resolveReturn(orderId, { fault }) {
         link: `/order/${order.id}`,
         orderId: order.id,
       });
+      // Milestone 20 (APP-14): same reactivation as the main path
+      // below — the item comes back to the seller even when this
+      // call only closes out an already-moved refund.
+      try {
+        await reactivateListingAfterRefund(order.listing_id);
+      } catch (err) {
+        console.error(
+          "[PulseMarket] resolve return: could not put listing back to active:",
+          err?.message || err
+        );
+      }
       return {
         order: closed,
         note: "This return was already resolved — the refund moved once, so this just closes the order out.",
@@ -952,7 +1038,11 @@ export async function resolveReturn(orderId, { fault }) {
         userId: order.buyer_id,
         bucket: "available",
         kind: "refund",
-        amount: itemPrice + shippingFee,
+        // Milestone 20 (D-3 / M-1): the buyer gets the FULL total
+        // back, fees included — NOT item + shipping. The shipping
+        // advance the seller already received is clawed back
+        // separately as a seller debt below, so the books balance.
+        amount: total,
         note: `Refund — seller fault return, order ${order.code}`,
       },
     ];
@@ -972,7 +1062,10 @@ export async function resolveReturn(orderId, { fault }) {
       );
     }
     note =
-      `Seller fault: the buyer gets ${itemPrice + shippingFee} naira back (item price + shipping). ` +
+      `Seller fault: the buyer gets ${total} naira back (the full total — item price + shipping + fees). ` +
+      (labelCorrected
+        ? `The return was opened under the other fault label, so the label was corrected to seller fault first. `
+        : "") +
       (advance > 0
         ? `The seller owes the ${advance} naira shipping advance back — it is recorded as a debt on the seller's wallet until they settle it, and the seller pays the return shipping.`
         : `No shipping advance was ever released, so the seller owes nothing back. The seller pays the return shipping.`);
@@ -1013,6 +1106,9 @@ export async function resolveReturn(orderId, { fault }) {
     }
     note =
       `Buyer fault: the buyer gets the item price back only (${itemPrice} naira). ` +
+      (labelCorrected
+        ? `The return was opened under the other fault label, so the label was corrected to buyer fault first. `
+        : "") +
       `The seller keeps the shipping advance${advance > 0 ? ` (${advance} naira)` : ""} and the rest of the shipping fee, and the buyer pays the return shipping.`;
   }
 
@@ -1020,6 +1116,21 @@ export async function resolveReturn(orderId, { fault }) {
     status: "refunded",
     return_status: "resolved",
   });
+  // Milestone 20 (APP-14): the item comes back to the seller, so
+  // the listing goes back to 'active' — a refunded listing used to
+  // stay reserved/sold and could never be listed again. Best
+  // effort: the refund already moved, so a failed reactivation is
+  // logged, never thrown. Amounts above match the Milestone 20
+  // SQL (D-3/M-1): seller fault pays the buyer the full total,
+  // the advance is clawed back as a seller debt.
+  try {
+    await reactivateListingAfterRefund(order.listing_id);
+  } catch (err) {
+    console.error(
+      "[PulseMarket] resolve return: could not put listing back to active:",
+      err?.message || err
+    );
+  }
   // Milestone 10: tell both parties the return is resolved.
   notifyUser(order.buyer_id, {
     kind: "dispute",
@@ -1036,6 +1147,20 @@ export async function resolveReturn(orderId, { fault }) {
     orderId: order.id,
   });
   return { order: updated, note };
+}
+
+// Listing reactivation after a refund (APP-14). A status-only
+// update through the listings table: no ownership check applies to
+// a status move, and the listing-status trigger allows
+// reserved -> active, so the team (the only caller of
+// resolveReturn) can put the item back on sale.
+async function reactivateListingAfterRefund(listingId) {
+  if (!supabase || !listingId) return;
+  const { error } = await supabase
+    .from("listings")
+    .update({ status: "active" })
+    .eq("id", listingId);
+  if (error) throw error;
 }
 
 // Record that a seller owes money back (a negative 'available' entry).
@@ -1057,6 +1182,20 @@ export async function recordSellerDebt(orderId, amount, note) {
   if (!order) throw new Error("Order not found.");
   const owed = Math.max(0, Math.round(Number(amount) || 0));
   if (owed <= 0) return null;
+  // Milestone 20 (APP-17): one debt per order — return the existing
+  // debt row when one is already recorded for this order, instead of
+  // inserting a second one. The unique index in the Milestone 20 SQL
+  // is the backstop; this is the app-side check, and the 23505 catch
+  // below covers a debt recorded between the check and the insert
+  // (double-tap / retry from another device).
+  const { data: existingDebt } = await supabase
+    .from("wallet_ledger")
+    .select("*")
+    .eq("order_id", order.id)
+    .eq("kind", "debt")
+    .limit(1)
+    .maybeSingle();
+  if (existingDebt) return existingDebt;
   const { data, error } = await supabase
     .from("wallet_ledger")
     .insert({
@@ -1066,11 +1205,25 @@ export async function recordSellerDebt(orderId, amount, note) {
       kind: "debt",
       amount: -owed,
       note: note || `Seller debt for order ${order.code}`,
-      created_by: order.buyer_id,
+      // Milestone 22: the team records the debt, so the team is the
+      // actor — the old code blamed the buyer (see recordLedgerMove).
+      created_by: user.id,
     })
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    if (error.code === "23505") {
+      const { data: raced } = await supabase
+        .from("wallet_ledger")
+        .select("*")
+        .eq("order_id", order.id)
+        .eq("kind", "debt")
+        .limit(1)
+        .maybeSingle();
+      if (raced) return raced;
+    }
+    throw error;
+  }
   return data;
 }
 

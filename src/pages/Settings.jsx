@@ -29,7 +29,7 @@ const DEVICE_PREF_KEYS = {
 };
 
 export default function Settings({ applyAppearance }) {
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
   const [settings, setSettings] = useState(getSettings());
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -41,6 +41,7 @@ export default function Settings({ applyAppearance }) {
   // are the display fallback until then.
   const [serverPrefs, setServerPrefs] = useState(null);
   const [prefsNote, setPrefsNote] = useState("");
+  const [chatNote, setChatNote] = useState("");
 
   // The old line here always said "Blocked users: none", even after
   // the student blocked someone in a chat. Read the real list.
@@ -112,17 +113,26 @@ export default function Settings({ applyAppearance }) {
   // The verified-only chat toggle is enforced server-side (Milestone 5):
   // the value lives on the verifications row so it follows the student to
   // any phone. The device copy in pm-settings stays as the fallback.
-  function toggleVerifiedOnlyChat() {
-    const next = !settings.verifiedOnlyChat;
+  // The toggle flips at once, but if the server save fails the toggle
+  // rolls back and says so — the old code only logged the failure,
+  // so the switch could show ON while the server still had it OFF.
+  async function toggleVerifiedOnlyChat() {
+    const prev = settings.verifiedOnlyChat;
+    const next = !prev;
+    setChatNote("");
     update({ verifiedOnlyChat: next });
     if (supabase && user) {
-      supabase
+      const { error } = await supabase
         .from("verifications")
         .update({ chat_verified_only: next })
-        .eq("user_id", user.id)
-        .then(({ error }) => {
-          if (error) console.error("[PulseMarket] save verified-only chat:", error.message);
-        });
+        .eq("user_id", user.id);
+      if (error) {
+        console.error("[PulseMarket] save verified-only chat:", error.message);
+        update({ verifiedOnlyChat: prev });
+        setChatNote(
+          "That setting could not be saved on the server — it is back to how it was. Check your connection and try again."
+        );
+      }
     }
   }
 
@@ -152,8 +162,12 @@ export default function Settings({ applyAppearance }) {
   // the save fails (Milestone 19 SQL not run yet, or offline), the
   // toggle rolls back and a note says so — the device value stays
   // as the fallback, and the server remains the real gate once it
-  // is live.
+  // is live. Milestone 20 (D-2): 'dispute' and 'system' can never
+  // be turned off — the team must always reach a student about a
+  // frozen order or a system notice — so this refuses them here
+  // as well as disabling their checkboxes below.
   async function toggleServerPref(kind) {
+    if (kind === "dispute" || kind === "system") return;
     const current = serverPrefValue(kind);
     const next = !current;
     const prevPrefs = serverPrefs;
@@ -206,15 +220,29 @@ export default function Settings({ applyAppearance }) {
         </p>
         {NOTIFICATION_KINDS.map((kind) => (
           <label key={kind} className="flex items-center justify-between text-sm">
-            <span>{KIND_LABELS[kind]}</span>
+            <span>
+              {KIND_LABELS[kind]}
+              {/* Milestone 20 (D-2): dispute and system notices
+                  always come through — the server sends them
+                  regardless of prefs — so these toggles are off
+                  limits, not a choice. */}
+              {(kind === "dispute" || kind === "system") && (
+                <span className="text-neutral-400"> — always on</span>
+              )}
+            </span>
             <input
               type="checkbox"
-              checked={serverPrefValue(kind)}
+              checked={kind === "dispute" || kind === "system" ? true : serverPrefValue(kind)}
               onChange={() => toggleServerPref(kind)}
-              className="h-5 w-5 accent-[#7d5027]"
+              disabled={kind === "dispute" || kind === "system"}
+              className="h-5 w-5 accent-[#7d5027] disabled:opacity-40"
             />
           </label>
         ))}
+        <p className="text-sm text-neutral-500">
+          Return / dispute and PulseMarket notices always come through, even if you turn the
+          others off — the team needs to reach you about a frozen order.
+        </p>
         <label className="flex items-center justify-between text-sm">
           <span>
             Price drops on saved items
@@ -242,6 +270,7 @@ export default function Settings({ applyAppearance }) {
             className="h-5 w-5 accent-[#7d5027]"
           />
         </label>
+        {chatNote ? <p className="text-sm text-neutral-500">{chatNote}</p> : null}
         <p className="text-sm text-neutral-500">
           Blocked users:{" "}
           {blockedCount === null
@@ -273,10 +302,20 @@ export default function Settings({ applyAppearance }) {
       <section className="space-y-3">
         <h2 className="font-bold">Data</h2>
         <button
-          onClick={() => {
+          onClick={async () => {
             if (window.confirm("Clear all PulseMarket data on this device (drafts, settings, verification)?")) {
               Object.keys(localStorage).filter((k) => k.startsWith("pm-")).forEach((k) => localStorage.removeItem(k));
               setCleared(true);
+              // Milestone 20 (APP-16): clearing must actually sign
+              // the student out and reload — the old code only wiped
+              // the device copy, so the session stayed live and the
+              // app kept reading the server copy as if nothing had
+              // been cleared.
+              try {
+                await signOut();
+              } finally {
+                window.location.reload();
+              }
             }
           }}
           className="rounded-full border border-red-300 px-4 py-2 text-sm font-semibold text-red-600"

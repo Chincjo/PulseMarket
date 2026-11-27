@@ -23,11 +23,11 @@ import Verify from "./pages/Verify.jsx";
 import Welcome from "./pages/Welcome.jsx";
 import SignIn from "./pages/SignIn.jsx";
 import ListingDetail from "./pages/ListingDetail.jsx";
-import { GhostButton, Logo, PrimaryButton } from "./components/ui.jsx";
+import { Logo } from "./components/ui.jsx";
 import { getSettings, getVerification, saveVerification } from "./lib/store";
 import { fetchVerificationRow, saveVerificationRow } from "./lib/listings";
 import { fetchUnreadCount } from "./lib/notifications";
-import { runAutoReleaseCheck } from "./lib/autoRelease";
+import { runAutoReleaseCheck, runReservationExpirySweep } from "./lib/autoRelease";
 import { AuthProvider, useAuth } from "./lib/auth";
 
 const TABS = [
@@ -49,7 +49,7 @@ function applyAppearance(s) {
 }
 
 function Shell() {
-  const { user, loading, signOut } = useAuth();
+  const { user, loading } = useAuth();
   const navigate = useNavigate();
   const [verification, setVerification] = useState(() => getVerification());
   // Starts true: the full app must never render from the device
@@ -58,12 +58,18 @@ function Shell() {
   // the whole app from that copy before the server check came back.
   // The loading screen holds until the first server check settles.
   const [verifying, setVerifying] = useState(true);
-  const [checking, setChecking] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
+  // Milestone 20 (APP-16): the verification gate must never hang
+  // for ever on a slow or dead connection — after ~15s the loading
+  // screen gives way to a retry screen (below) instead of a blank
+  // wait. Bumping verifyNonce re-runs the check.
+  const [verifyTimedOut, setVerifyTimedOut] = useState(false);
+  const [verifyNonce, setVerifyNonce] = useState(0);
   // Poll guards: the hourly auto-release must never run twice at once
   // (a slow check overlapping the next hour's tick), and neither poll
   // needs to run while the tab is hidden.
   const autoReleaseRunning = useRef(false);
+  const reservationSweepRunning = useRef(false);
 
   useEffect(() => {
     applyAppearance(getSettings());
@@ -82,14 +88,26 @@ function Shell() {
     if (!user) return;
     let cancelled = false;
     setVerifying(true);
+    setVerifyTimedOut(false);
+    // Milestone 20 (APP-16): ~15s ceiling on the server check. If
+    // it fires, the loading screen gives way to the retry screen
+    // below; if the check lands afterwards anyway, it clears the
+    // timeout flag and the app opens normally.
+    const timer = setTimeout(() => {
+      if (!cancelled) {
+        setVerifyTimedOut(true);
+        setVerifying(false);
+      }
+    }, 15000);
     (async () => {
       try {
-        const row = await fetchVerificationRow(user.id);
+        const row = await fetchVerificationRow(user.id).catch(() => null);
         if (cancelled) return;
         if (row) {
           const rec = { ...row, email: user.email };
           setVerification(rec);
           saveVerification(rec);
+          setVerifyTimedOut(false);
           return;
         }
         // No server row (or the read failed): push the device copy
@@ -101,64 +119,88 @@ function Shell() {
         // even though the server just created a pending row. When
         // the read itself failed (offline), the re-read also fails
         // and the device copy stays as the fallback, as before.
+        // Milestone 22: only ever push up a device copy that belongs
+        // to THIS signer. On a shared phone the record may be the
+        // previous student's — their university, student ID, student
+        // email, invite code and ID-photo paths must never be filed
+        // as this signer's verification row (the team could then
+        // approve this account on another student's ID). A record
+        // with no userId is from before userId was stored and cannot
+        // be proven to belong to this signer, so it is dropped too —
+        // the student re-submits through Verify. The in-memory copy
+        // is cleared as well: without that, the stale foreign record
+        // would still open the full app below.
         const local = getVerification();
         if (local?.university) {
-          await saveVerificationRow(user.id, local).catch(() => false);
-          const fresh = await fetchVerificationRow(user.id).catch(() => null);
-          if (!cancelled && fresh) {
-            const rec = { ...fresh, email: user.email };
-            setVerification(rec);
-            saveVerification(rec);
+          if (local.userId === user.id) {
+            await saveVerificationRow(user.id, local).catch(() => false);
+            const fresh = await fetchVerificationRow(user.id).catch(() => null);
+            if (!cancelled && fresh) {
+              const rec = { ...fresh, email: user.email };
+              setVerification(rec);
+              saveVerification(rec);
+              setVerifyTimedOut(false);
+            }
+          } else {
+            saveVerification(null);
+            if (!cancelled) {
+              setVerification(null);
+              setVerifyTimedOut(false);
+            }
           }
+        } else if (!cancelled) {
+          // No server row and no device copy: the check has answered
+          // — this student is unverified. Clear the timeout flag so
+          // a slow check does not leave them stuck on the retry
+          // screen below.
+          setVerifyTimedOut(false);
         }
       } finally {
-        if (!cancelled) setVerifying(false);
+        if (!cancelled) {
+          clearTimeout(timer);
+          setVerifying(false);
+        }
       }
     })();
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
-  }, [user]);
-
-  // Milestone 17: a student waiting for approval can ask for a fresh
-  // server check instead of signing out and back in — the team may
-  // have approved them since this page loaded. A fresh 'approved'
-  // row unlocks the full app at once; anything else leaves this
-  // screen exactly as it is. A failed check changes nothing.
-  async function refreshVerification() {
-    if (!user || checking) return;
-    setChecking(true);
-    try {
-      const row = await fetchVerificationRow(user.id);
-      if (row) {
-        const rec = { ...row, email: user.email };
-        setVerification(rec);
-        saveVerification(rec);
-      }
-    } catch {
-      // Server hiccup — stay on the under-review screen; the student
-      // can try again, and the next sign-in re-checks anyway.
-    } finally {
-      setChecking(false);
-    }
-  }
+  }, [user, verifyNonce]);
 
   // Milestone 10: app-side 48h auto-release — once per sign-in, release
   // any of this student's delivered orders whose 48h window has passed.
   // Fire-and-forget; runAutoReleaseCheck never throws. It also re-runs
   // hourly while the student stays signed in: the old code only ran
   // once per sign-in, so money sat past its 48 hours for anyone who
-  // never signed out and back in again.
+  // never signed out and back in again. Milestone 20 (D-4): the
+  // reservation-expiry sweep runs on the same sign-in + hourly
+  // schedule — a 'reserved' order older than 48h is cancelled and
+  // the listing freed, so a ghosted reservation cannot brick the
+  // listing. It never throws either; each sweep has its own guard
+  // so a slow one never overlaps the next tick.
   useEffect(() => {
     if (!user) return;
     const runOnce = () => {
-      if (autoReleaseRunning.current) return;
-      autoReleaseRunning.current = true;
-      runAutoReleaseCheck(user)
-        .catch(() => {})
-        .finally(() => {
-          autoReleaseRunning.current = false;
-        });
+      // Each sweep has its own guard and runs independently: the old
+      // early-return meant a slow auto-release check skipped the
+      // reservation sweep for that whole hour.
+      if (!autoReleaseRunning.current) {
+        autoReleaseRunning.current = true;
+        runAutoReleaseCheck(user)
+          .catch(() => {})
+          .finally(() => {
+            autoReleaseRunning.current = false;
+          });
+      }
+      if (!reservationSweepRunning.current) {
+        reservationSweepRunning.current = true;
+        runReservationExpirySweep(user)
+          .catch(() => {})
+          .finally(() => {
+            reservationSweepRunning.current = false;
+          });
+      }
     };
     runOnce();
     const timer = setInterval(() => {
@@ -174,9 +216,11 @@ function Shell() {
     let cancelled = false;
     const refresh = () => {
       if (document.hidden) return;
-      fetchUnreadCount(user.id).then((n) => {
-        if (!cancelled) setUnreadCount(n);
-      });
+      fetchUnreadCount(user.id)
+        .then((n) => {
+          if (!cancelled) setUnreadCount(n);
+        })
+        .catch(() => {});
     };
     refresh();
     const timer = setInterval(refresh, 60000);
@@ -194,6 +238,27 @@ function Shell() {
       <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
         <Logo size={56} />
         <p className="text-sm text-neutral-500">Loading PulseMarket…</p>
+      </div>
+    );
+  }
+
+  // Milestone 20 (APP-16): the verification check took longer than
+  // ~15s — usually a bad connection. Offer a retry instead of
+  // leaving the student on the loading screen for ever.
+  if (user && verifyTimedOut) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-white px-4 text-center text-neutral-900 dark:bg-black dark:text-neutral-100">
+        <Logo size={56} />
+        <p className="text-sm font-semibold">Could not check your verification</p>
+        <p className="max-w-sm text-sm text-neutral-500">
+          The server took too long to answer. Check your connection and try again.
+        </p>
+        <button
+          onClick={() => setVerifyNonce((n) => n + 1)}
+          className="rounded-full bg-brown px-4 py-2 text-sm font-semibold text-white"
+        >
+          Try again
+        </button>
       </div>
     );
   }
@@ -242,31 +307,17 @@ function Shell() {
   }
 
   // 2b) Milestone 17: submitted, waiting for the team. Only a status of
-  // 'approved' is verified — a student under review sees this plain
-  // state and cannot post or chat, because the full app and its routes
-  // are never mounted for them. Grandfathered students are 'approved'
-  // in the database, so they never see this screen.
+  // 'approved' is verified — a student under review sees the Verify
+  // page's own under-review screen (with its "Check again" and the
+  // Milestone 19 "Replace photos" flow), not a separate plain screen
+  // here: the old plain screen never mounted Verify, so the replace
+  // flow was unreachable dead code. The server-checked verification
+  // is seeded in so the page never flashes the submit form first.
   if (verification.status !== "approved") {
     return (
       <div className="min-h-screen bg-white text-neutral-900 dark:bg-black dark:text-neutral-100">
-        <main className="mx-auto max-w-2xl px-4 pb-12 pt-10">
-          <h1 className="text-2xl font-bold">Your verification is under review</h1>
-          <p className="mt-2 text-neutral-500">
-            Thanks — we have your student details and ID photos. The PulseMarket
-            team is checking them. You will be able to post items and chat with
-            sellers once you are approved.
-          </p>
-          <p className="mt-2 text-sm text-neutral-500">
-            Signed in as {user.email} · {verification.university}
-          </p>
-          <div className="mt-6 space-y-3">
-            <PrimaryButton className="w-full" disabled={checking} onClick={refreshVerification}>
-              {checking ? "Checking…" : "Check again — I may be approved now"}
-            </PrimaryButton>
-            <GhostButton className="w-full" onClick={() => signOut()}>
-              Not {user.email}? Sign out
-            </GhostButton>
-          </div>
+        <main className="mx-auto max-w-2xl px-4 pb-12 pt-4">
+          <Verify onVerified={setVerification} initialVerification={verification} />
         </main>
       </div>
     );
@@ -308,8 +359,8 @@ function Shell() {
           <Route path="/search" element={<Search />} />
           <Route path="/sell" element={<Sell verification={verification} />} />
           <Route path="/listing/:id" element={<ListingDetail />} />
-          <Route path="/chat" element={<Chat />} />
-          <Route path="/chat/:id" element={<ChatThread />} />
+          <Route path="/chat" element={<Chat verification={verification} />} />
+          <Route path="/chat/:id" element={<ChatThread verification={verification} />} />
           <Route path="/checkout/:listingId" element={<Checkout />} />
           <Route path="/order/:id" element={<OrderDetail />} />
           <Route path="/handoff/:orderId" element={<Handoff />} />
@@ -321,7 +372,7 @@ function Shell() {
           <Route path="/admin" element={<Admin />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/wallet" element={<Wallet />} />
-          <Route path="/profile" element={<Profile user={user} />} />
+          <Route path="/profile" element={<Profile user={user} verification={verification} />} />
           <Route path="/settings" element={<Settings applyAppearance={applyAppearance} />} />
           <Route path="/verify" element={<Verify onVerified={setVerification} />} />
           <Route path="*" element={<Home user={user} verification={verification} />} />

@@ -8,7 +8,12 @@
 // is 'released'. The database enforces it twice — a UNIQUE constraint
 // on ratings.order_id and the RLS INSERT policy in milestone-11.sql —
 // and this file checks the same rules up front so the buyer gets a
-// plain-English error instead of a database error.
+// plain-English error instead of a database error. Milestone 20
+// (APP-7 / M-25): a 'delivered' CASH order can be rated too — cash
+// ends at 'delivered', so cash buyers could never rate before. The
+// database policy still requires 'released' until the Milestone 20
+// SQL widens it, so a refused cash rating is caught below and shown
+// as a plain "not switched on yet" message instead of a crash.
 //
 // Referrals: invite codes look like PM-XXXXXX (same pattern as the
 // seller handoff code in handoff.js — 6 uppercase letters/digits,
@@ -72,8 +77,10 @@ async function readOrder(id) {
 // Ratings
 // ---------------------------------------------------------------------------
 
-// Buyer only, only when the order status is 'released', 1–5 stars,
-// one rating per order. Returns the inserted rating row.
+// Buyer only, only when the order status is 'released' — or when it
+// is a 'delivered' CASH order (Milestone 20, APP-7: cash ends at
+// 'delivered', so cash buyers could never rate). 1–5 stars, one
+// rating per order. Returns the inserted rating row.
 export async function submitRating(orderId, { stars, comment } = {}) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!orderId) throw new Error("Missing order.");
@@ -92,8 +99,12 @@ export async function submitRating(orderId, { stars, comment } = {}) {
   if (order.buyer_id !== userId) {
     throw new Error("Only the buyer can rate this order.");
   }
-  if (order.status !== "released") {
-    throw new Error("You can rate this seller once the order is released.");
+  const isCashDelivered =
+    order.status === "delivered" && order.payment_method === "cash";
+  if (order.status !== "released" && !isCashDelivered) {
+    throw new Error(
+      "You can rate this seller once the order is released — or once a cash order is delivered."
+    );
   }
   const existing = await fetchMyRatingForOrder(orderId);
   if (existing) {
@@ -117,6 +128,19 @@ export async function submitRating(orderId, { stars, comment } = {}) {
     if (error.code === "23505") {
       throw new Error("You have already rated this order.");
     }
+    // Milestone 20 (APP-7): the old database policy still requires
+    // 'released', so a cash-delivered rating is refused until the
+    // Milestone 20 SQL widens it. Say so plainly instead of
+    // showing a database error — nothing broke, nothing was saved.
+    // Milestone 22: only a policy refusal (42501) means "not
+    // switched on yet". Any other failure (network, a different
+    // RLS rule) used to be reported the same way, hiding the real
+    // cause — those now surface as themselves.
+    if (isCashDelivered && error.code === "42501") {
+      throw new Error(
+        "Ratings for cash orders are not switched on yet — the team is turning it on in the next update. Your rating was not saved."
+      );
+    }
     throw error;
   }
   // Milestone 10: tell the seller they were rated.
@@ -132,21 +156,26 @@ export async function submitRating(orderId, { stars, comment } = {}) {
 
 // Average (rounded to 1 decimal) + count for a seller. { average: 0,
 // count: 0 } when the seller has no ratings yet — "New seller · No
-// ratings yet", not a fake score.
+// ratings yet", not a fake score. Milestone 20 (APP-15): pages past
+// 1000 rows instead of silently averaging only the first 1000 — a
+// seller with more than 1000 ratings used to show a wrong average.
 export async function fetchSellerRating(sellerId) {
   if (!supabase || !sellerId) return { average: 0, count: 0 };
-  const { data, error } = await supabase
-    .from("ratings")
-    .select("stars")
-    .eq("rated_id", sellerId)
-    .limit(1000); // Bound: the average needs every row, but a seller with
-  // more than 1000 ratings is far beyond this app's scale; without a
-  // cap this fetch grows with every rating ever left.
-  if (error) {
-    dbError(error, "fetch seller rating");
-    return { average: 0, count: 0 };
+  const PAGE = 1000;
+  let rows = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("ratings")
+      .select("stars")
+      .eq("rated_id", sellerId)
+      .range(from, from + PAGE - 1);
+    if (error) {
+      dbError(error, "fetch seller rating");
+      return { average: 0, count: 0 };
+    }
+    rows = rows.concat(data || []);
+    if (!data || data.length < PAGE) break;
   }
-  const rows = data || [];
   if (rows.length === 0) return { average: 0, count: 0 };
   const sum = rows.reduce((total, r) => total + (r.stars || 0), 0);
   return {
@@ -238,13 +267,26 @@ export async function getOrCreateInviteCode(userId) {
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const code = generateInviteCode();
-    const { error } = await supabase
+    // Only claim the code while the row still has none: two tabs (or
+    // devices) creating a code at once used to each generate one and
+    // the last write won — the loser then showed a code that was not
+    // on the row. With the null guard the first write wins; a caller
+    // that lost the race re-reads the row and returns the code that
+    // is actually on it.
+    const { data, error } = await supabase
       .from("verifications")
       .update({ invite_code: code })
-      .eq("user_id", userId);
-    if (!error) return code;
+      .eq("user_id", userId)
+      .is("invite_code", null)
+      .select("user_id");
+    if (!error && data && data.length > 0) return code;
+    if (error && error.code !== "23505") {
+      lastError = error;
+      break;
+    }
     lastError = error;
-    if (error.code !== "23505") break;
+    const fresh = await fetchVerificationRow(userId);
+    if (fresh?.inviteCode) return String(fresh.inviteCode).trim();
   }
   dbError(lastError, "create invite code");
   return null;

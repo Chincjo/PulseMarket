@@ -87,20 +87,24 @@ function isMissingTableError(error) {
 // ANY evidence row satisfied it: a handoff photo, a receipt photo, or
 // the seller's packing video all let a dispute through with no video
 // of the actual problem.
-async function requireDisputeEvidence(orderId) {
+async function requireDisputeEvidence(orderId, buyerId) {
   const rows = await fetchEvidenceForOrder(orderId);
-  if (rows && rows.some((r) => r.kind === "dispute" && r.verified === true)) {
+  // The dispute video must be the BUYER's — a seller's clip used
+  // to satisfy the gate, because it checked kind + verified only.
+  if (rows && rows.some((r) => r.kind === "dispute" && r.verified === true && (!buyerId || r.user_id === buyerId))) {
     return rows;
   }
   // No qualifying row — find out whether the table is missing or the
-  // student simply has not recorded a dispute video yet.
-  const { data, error } = await supabase
+  // student simply has not recorded a dispute video yet. Filter by
+  // the buyer when known, so a seller's video never satisfies it.
+  let probeQuery = supabase
     .from("evidence")
     .select("id")
     .eq("order_id", orderId)
     .eq("kind", "dispute")
-    .eq("verified", true)
-    .limit(1);
+    .eq("verified", true);
+  if (buyerId) probeQuery = probeQuery.eq("user_id", buyerId);
+  const { data, error } = await probeQuery.limit(1);
   if (error && isMissingTableError(error)) {
     throw new Error(
       "Add evidence first — record a short video of the problem in the app (Evidence Locker, dispute evidence, 10–20 seconds) before reporting it. The evidence table is not set up yet, so a report cannot be filed."
@@ -188,7 +192,7 @@ export async function fileDispute(orderId, { category, explanation, email }) {
   }
 
   // Evidence first: no proof, no report. Never fails open.
-  await requireDisputeEvidence(orderId);
+  await requireDisputeEvidence(orderId, order.buyer_id);
 
   // The ticket number is built by the database (ticket_id default in
   // supabase/milestone-12.sql: 'PM-TKT-' + the dispute_ticket_seq
@@ -216,14 +220,28 @@ export async function fileDispute(orderId, { category, explanation, email }) {
 
   // Freeze the money so nothing releases while the report is open.
   // If the freeze fails, remove the report again rather than leaving
-  // an open report on unfrozen money.
+  // an open report on unfrozen money — UNLESS the order is already
+  // frozen. Milestone 21 freezes the order in the same transaction
+  // as the dispute insert, so the follow-up freeze update can fail
+  // while the order is already frozen: deleting the report then
+  // would leave a frozen order with no dispute to resolve, and the
+  // money would sit frozen until someone intervened by hand.
   const { error: freezeError } = await supabase
     .from("orders")
     .update({ frozen: true, updated_at: new Date().toISOString() })
     .eq("id", orderId);
   if (freezeError) {
-    await supabase.from("disputes").delete().eq("order_id", orderId).eq("reporter_id", user.id).eq("ticket_id", dispute.ticket_id);
-    throw freezeError;
+    const { data: fresh } = await supabase
+      .from("orders")
+      .select("frozen")
+      .eq("id", orderId)
+      .maybeSingle();
+    if (!fresh?.frozen) {
+      await supabase.from("disputes").delete().eq("order_id", orderId).eq("reporter_id", user.id).eq("ticket_id", dispute.ticket_id);
+      throw freezeError;
+    }
+    // Already frozen — the report stands; fall through to the audit
+    // log below and return the ticket.
   }
 
   // Audit trail. Best effort — a logging failure must not undo a

@@ -36,19 +36,28 @@ export async function getBalances(userId) {
       err?.message || err
     );
   }
-  const { data, error } = await supabase
-    .from("wallet_ledger")
-    .select("bucket, amount")
-    .eq("user_id", userId);
-  if (error) {
-    dbError(error, "fetch wallet balances");
-    return { held: 0, available: 0 };
-  }
+  // Milestone 20 (APP-15): the old fallback read had NO limit, so
+  // PostgREST silently stopped at its 1000-row default and the
+  // wallet summed a truncated ledger. Page in 1000-row ranges
+  // until a short page, so every row is summed.
   const balances = { held: 0, available: 0 };
-  for (const row of data || []) {
-    if (row.bucket === "held" || row.bucket === "available") {
-      balances[row.bucket] += Number(row.amount) || 0;
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("wallet_ledger")
+      .select("bucket, amount")
+      .eq("user_id", userId)
+      .range(from, from + PAGE - 1);
+    if (error) {
+      dbError(error, "fetch wallet balances");
+      return { held: 0, available: 0 };
     }
+    for (const row of data || []) {
+      if (row.bucket === "held" || row.bucket === "available") {
+        balances[row.bucket] += Number(row.amount) || 0;
+      }
+    }
+    if (!data || data.length < PAGE) break;
   }
   return balances;
 }

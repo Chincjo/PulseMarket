@@ -66,9 +66,18 @@ function isOwner(user) {
 // Single internal helper for every ledger write. `moves` is an array of
 // { userId, bucket, kind, amount, note } — paired entries (e.g. release:
 // -total out of "held", +item+shipping into "available") are written in
-// one insert so the ledger can never hold half a move.
-async function recordLedgerMove(order, moves) {
+// one insert so the ledger can never hold half a move. Milestone 20
+// (APP-17): created_by is the ACTING user — the user who made the move
+// (buyer, seller or team) — not always the buyer. Pass the actor's id
+// as the third argument; when there is no actor id (a timed system
+// call with no signed-in user behind it) it falls back to the buyer,
+// matching the old convention and the Milestone 19 release_order RPC.
+async function recordLedgerMove(order, moves, actorId) {
   if (!supabase) throw new Error("Supabase is not configured.");
+  const createdBy =
+    (typeof actorId === "string" && actorId) ||
+    actorId?.id ||
+    order.buyer_id;
   const rows = moves.map((m) => ({
     order_id: order.id,
     user_id: m.userId,
@@ -76,7 +85,7 @@ async function recordLedgerMove(order, moves) {
     kind: m.kind,
     amount: m.amount,
     note: m.note || null,
-    created_by: order.buyer_id,
+    created_by: createdBy,
   }));
   const { error } = await supabase.from("wallet_ledger").insert(rows);
   if (error) throw error;
@@ -186,6 +195,8 @@ export async function createOrder({
   shipToState,
   courier,
   buyerState,
+  agreedPrice,
+  conversationId,
 }) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!listing || !buyerId) throw new Error("Missing listing or buyer.");
@@ -237,8 +248,87 @@ export async function createOrder({
     }
   }
 
+  // An agreed price from an accepted offer replaces the listed
+  // price — the buyer pays what was agreed, not the original
+  // asking price. It must be a real number, above zero and never
+  // above the listed price (an offer above asking is not a deal).
+  // NOTE — deploy coupling: the order-insert trigger in
+  // supabase/milestone-16.sql still refuses any item_price that
+  // differs from the listing price. This code path only works live
+  // once the Milestone 20 SQL runs (it teaches the trigger to
+  // accept the conversation's agreed price). Until then an
+  // agreed-price order is refused with a plain error instead of
+  // charging the wrong price.
+  // Milestone 22: the conversation is the source of truth. Checkout
+  // used to pass whatever agreed price it had read — and when that
+  // read failed it passed nothing, so the buyer silently paid the
+  // full listing price and lost the whole negotiated discount with
+  // no sign anything went wrong. Now the agreed price is re-read
+  // here, from the conversation itself: a deal on record is always
+  // charged, and a read failure refuses the order instead of
+  // charging full price. A passed agreed price that is missing or
+  // invalid is also refused now, never silently replaced with the
+  // full price. (A seller who lowered the asking price below the
+  // agreed price still charges the lower listed price — that
+  // direction only ever helps the buyer.)
+  let price;
+  if (conversationId) {
+    const { data: conv, error: convError } = await supabase
+      .from("conversations")
+      .select("agreed_price, buyer_id, seller_id, listing_id")
+      .eq("id", conversationId)
+      .maybeSingle();
+    if (convError) {
+      throw new Error("Could not check the agreed price — try again.");
+    }
+    // The deal must be this buyer, this seller and this listing —
+    // another chat's agreed price is never this order's price (the
+    // order-insert trigger re-checks the same thing server-side).
+    if (
+      conv &&
+      (conv.buyer_id !== buyerId ||
+        conv.seller_id !== listing.seller_id ||
+        conv.listing_id !== listing.id)
+    ) {
+      throw new Error("That agreed price belongs to a different item — try again.");
+    }
+    const serverAgreed = Number(conv?.agreed_price);
+    price =
+      Number.isFinite(serverAgreed) && serverAgreed > 0
+        ? Math.min(serverAgreed, listing.price)
+        : listing.price;
+  } else if (agreedPrice !== null && agreedPrice !== undefined) {
+    const agreed = Number(agreedPrice);
+    if (!Number.isFinite(agreed) || agreed <= 0 || agreed > listing.price) {
+      throw new Error("The agreed price could not be checked — try again.");
+    }
+    price = agreed;
+  } else {
+    price = listing.price;
+  }
+  // Tier 1 — items over ₦20,000 travel with GIG or GUO only. The
+  // tier list is display-only in Tracking, so a valuable item used
+  // to be bookable with a park loader or a cheap courier. Chowdeck
+  // Relay is same-city only and never reaches this check (it is
+  // filtered out for interstate shipping before createOrder).
+  // (The same rule lives in courierTiers() in lib/shipping.js —
+  // this file cannot import it: shipping.js imports orders.js.)
+  if (
+    deliveryMethod === "shipping" &&
+    shipToState &&
+    listing.state &&
+    shipToState !== listing.state &&
+    price > 20000 &&
+    courier &&
+    !["GIG Logistics", "GUO Transport"].includes(courier)
+  ) {
+    throw new Error(
+      "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
+    );
+  }
+
   const fees = feeBreakdown(
-    listing.price,
+    price,
     paymentMethod === "cash" ? "cash" : "held"
   );
   // The shipping zone is priced from the ship-to state — the parcel
@@ -418,6 +508,14 @@ export async function confirmReceipt(orderId, user) {
   // order stuck in 'paid' for ever, so finish the move instead.
   async function finishHeld() {
     if (order.status === "held") return order;
+    // The money was held and the order has since moved on
+    // (shipped / delivered / released) — a retry of the confirm
+    // is a no-op, not an error. Before this fix a retry on a
+    // delivered order threw "already confirmed" even though
+    // nothing was wrong.
+    if (["shipped", "delivered", "released"].includes(order.status)) {
+      return order;
+    }
     if (order.status !== "paid") {
       throw new Error("This transfer was already confirmed — the money is already held.");
     }
@@ -449,7 +547,7 @@ export async function confirmReceipt(orderId, user) {
         amount: order.total,
         note: `Held for order ${order.code}`,
       },
-    ]);
+    ], user);
   } catch (err) {
     if (err?.code === "23505") {
       return finishHeld();
@@ -485,10 +583,15 @@ export async function confirmReceipt(orderId, user) {
 async function requireUnboxingEvidence(order) {
   if (!order || order.delivery_method !== "shipping") return;
   if (!supabase) return;
+  // The unboxing video must be the BUYER's — a seller's own
+  // "unboxing" clip used to satisfy the buyer's delivery gate,
+  // because the check looked at kind + verified only, never who
+  // recorded it.
   const { data, error } = await supabase
     .from("evidence")
     .select("id")
     .eq("order_id", order.id)
+    .eq("user_id", order.buyer_id)
     .eq("kind", "unboxing")
     .eq("media_type", "video")
     .eq("verified", true)
@@ -844,7 +947,7 @@ async function legacyReleaseOrder(order, user) {
         amount: availableAmount,
         note: `Released to seller for order ${order.code}`,
       },
-    ]);
+    ], user);
   } catch (err) {
     if (err?.code === "23505") {
       return finishRelease();
@@ -877,17 +980,19 @@ async function legacyReleaseOrder(order, user) {
   return updated;
 }
 
-// Owner only: refund a HELD order whose seller never ships.
-// Until now a held order had no exit at all when the seller went
-// quiet: cancel only works from reserved/paid, a return needs the
-// order shipped/delivered, and resolving a dispute only unfreezes
-// — so the buyer's money sat in hold for ever. The buyer gets the
-// item price + shipping back (same as a seller-fault return; the
-// service and secure fees stay with PulseMarket) and the listing
-// goes back to active. No shipping advance can exist while the
-// order is still held (an advance is only paid after held ->
-// shipped), so no seller debt is recorded.
-// NOTE: this needs supabase/milestone-16.sql — until it runs, the
+// Owner only: refund a HELD order whose seller never ships — or a
+// SHIPPED / DELIVERED order whose buyer never confirms (Milestone
+// 20 SQL-1: the team refund carve-out now covers shipped and
+// delivered too, so a ghosting buyer no longer strands the money
+// for ever). The buyer gets the item price + shipping fee back;
+// the service + secure fees stay with PulseMarket (owner decision
+// 2026-11-26: team refunds keep the fee — D-3's full-total refund
+// applies to seller-fault RETURNS only, not to team refunds).
+// The listing goes back to active. A shipping advance can exist
+// on a shipped/delivered order, so when one was paid it is
+// recorded as a seller debt — the seller does not keep money the
+// buyer was refunded.
+// NOTE: this needs supabase/milestone-20.sql — until it runs, the
 // database refuses a refund from a held order with no open return
 // (pm_validate_ledger_insert + pm_validate_order_update), and this
 // throws that database error. The team resolves any open dispute
@@ -907,14 +1012,63 @@ export async function refundHeldOrder(orderId, user) {
   if (order.return_status === "opened") {
     throw new Error("A return is open for this order — resolve the return instead.");
   }
-  if (order.status !== "held") {
-    throw new Error(`This order is ${order.status} — only a held order can be refunded this way.`);
+  if (!["held", "shipped", "delivered"].includes(order.status)) {
+    throw new Error(
+      `This order is ${order.status} — only a held, shipped or delivered order can be refunded this way.`
+    );
   }
+  // What the buyer is told, in plain words — a held order means
+  // the seller never shipped; a shipped/delivered one means the
+  // buyer never confirmed delivery.
+  const stuckBuyer =
+    order.status === "held"
+      ? "the seller never shipped it"
+      : "the order was never confirmed, so the held money came back to you";
+  const stuckSeller =
+    order.status === "held"
+      ? "the item never shipped"
+      : "the buyer never confirmed delivery";
   // Double-refund guard: the refund must move exactly once. A
   // refund row can exist while the order still says 'held' — the
   // money moved, then the status update never landed. Close the
   // order out instead of moving money again.
   async function closeOut(note) {
+    // (M-1 recovery, same as resolveReturn DB-16): if a shipping
+    // advance was already paid and no seller debt exists yet — the
+    // first refund moved the money but crashed before recording the
+    // debt — record it now, so the seller does not keep money the
+    // buyer was refunded. Best effort: a failed debt write never
+    // blocks closing the order out. (The advance is re-read here,
+    // not taken from the `advance` below: this also runs on the
+    // already-refunded early return, before `advance` exists.)
+    try {
+      const advanceNow = await advanceAlreadyReleased(order.id);
+      if (
+        advanceNow > 0 &&
+        !(await ledgerMoveExists(order.id, "debt", "available"))
+      ) {
+        await recordLedgerMove(
+          order,
+          [
+            {
+              userId: order.seller_id,
+              bucket: "available",
+              kind: "debt",
+              amount: -advanceNow,
+              note: `Shipping advance to pay back — team refund, order ${order.code}. The buyer was refunded item + shipping, so the advance the seller already received has to come back.`,
+            },
+          ],
+          user
+        );
+      }
+    } catch (debtErr) {
+      if (debtErr?.code !== "23505") {
+        console.error(
+          "[PulseMarket] refund: could not record seller debt for advance:",
+          debtErr?.message || debtErr
+        );
+      }
+    }
     const closed = await updateOrder(orderId, { status: "refunded" });
     try {
       await updateListing(order.listing_id, { status: "active" });
@@ -924,14 +1078,14 @@ export async function refundHeldOrder(orderId, user) {
     notifyUser(order.buyer_id, {
       kind: "dispute",
       title: "Order refunded",
-      body: `Order ${order.code} was refunded — the seller never shipped it.`,
+      body: `Order ${order.code} was refunded — ${stuckBuyer}.`,
       link: `/order/${order.id}`,
       orderId: order.id,
     });
     notifyUser(order.seller_id, {
       kind: "dispute",
       title: "Order refunded",
-      body: `Order ${order.code} was refunded — the item never shipped.`,
+      body: `Order ${order.code} was refunded — ${stuckSeller}.`,
       link: `/order/${order.id}`,
       orderId: order.id,
     });
@@ -951,8 +1105,10 @@ export async function refundHeldOrder(orderId, user) {
   }
   const advance = await advanceAlreadyReleased(order.id);
   const remainingHeld = Math.max(0, Number(order.total || 0) - advance);
-  const refundToBuyer =
-    Number(order.item_price || 0) + Number(order.shipping_fee || 0);
+  // Owner decision 2026-11-26: a TEAM refund keeps the fee — the
+  // buyer gets item + shipping back, NOT the full total (D-3's
+  // full-total refund applies to seller-fault returns only).
+  const refundToBuyer = Number(order.item_price || 0) + Number(order.shipping_fee || 0);
   try {
     await recordLedgerMove(order, [
       {
@@ -960,24 +1116,62 @@ export async function refundHeldOrder(orderId, user) {
         bucket: "held",
         kind: "refund",
         amount: -remainingHeld,
-        note: `Refund — seller never shipped, order ${order.code}`,
+        note: `Refund — team refund, order ${order.code}`,
       },
       {
         userId: order.buyer_id,
         bucket: "available",
         kind: "refund",
         amount: refundToBuyer,
-        note: `Refund — seller never shipped, order ${order.code}`,
+        note: `Refund — team refund, order ${order.code}`,
       },
-    ]);
+    ], user);
   } catch (err) {
     if (err?.code === "23505") {
       return closeOut("This order was already refunded — the refund moved once, so this just closes the order out.");
     }
     throw err;
   }
+  // Milestone 20 (M-1): on a shipped/delivered order a shipping
+  // advance may already sit with the seller. The buyer was
+  // refunded item + shipping, which includes the advance, so the
+  // advance is recorded as a seller debt — otherwise the seller
+  // keeps money the buyer was refunded.
+  // Separate from the refund legs above and best effort: if a debt
+  // already exists the unique index refuses a second one, and a
+  // failed debt write must never undo a refund that already moved.
+  if (advance > 0) {
+    try {
+      const debtExists = await ledgerMoveExists(order.id, "debt", "available");
+      if (!debtExists) {
+        await recordLedgerMove(
+          order,
+          [
+            {
+              userId: order.seller_id,
+              bucket: "available",
+              kind: "debt",
+              amount: -advance,
+              note: `Shipping advance to pay back — team refund, order ${order.code}. The buyer was refunded item + shipping, so the advance the seller already received has to come back.`,
+            },
+          ],
+          user
+        );
+      }
+    } catch (debtErr) {
+      if (debtErr?.code !== "23505") {
+        console.error(
+          "[PulseMarket] refund: could not record seller debt for advance:",
+          debtErr?.message || debtErr
+        );
+      }
+    }
+  }
   return closeOut(
-    `Refunded — the buyer gets ${refundToBuyer} naira back (item price + shipping). The listing is active again.`
+    `Refunded — the buyer gets ${refundToBuyer} naira back (item + shipping; the fees stay with PulseMarket). The listing is active again.` +
+      (advance > 0
+        ? ` The seller owes the ${advance} naira shipping advance back.`
+        : "")
   );
 }
 
@@ -993,6 +1187,24 @@ export async function fetchHeldOrders(user) {
     .select("*")
     .eq("status", "held")
     .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+// Milestone 20 (APP-9): team-only read for /admin — every order
+// still sitting in 'paid' (buyer says they transferred, the team
+// has not confirmed the money arrived yet). Oldest first, so the
+// order waiting longest is checked first.
+export async function fetchPaidOrders(user) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!isOwner(user)) {
+    throw new Error("This page is not available.");
+  }
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("status", "paid")
+    .order("created_at", { ascending: true });
   if (error) throw error;
   return data || [];
 }
@@ -1259,7 +1471,7 @@ export async function cancelOrder(orderId, user) {
               amount: -held,
               note: `Hold reversed — order ${order.code} cancelled`,
             },
-          ]);
+          ], user);
         } catch (err) {
           if (err?.code !== "23505") throw err;
           // Another device already wrote the reversal — carry on.
@@ -1268,6 +1480,19 @@ export async function cancelOrder(orderId, user) {
     }
   }
   const updated = await updateOrder(orderId, { status: "cancelled" });
+  // Milestone 20 (APP-9): cancelling a PAID order is a manual
+  // return of real money — the buyer transferred and the team
+  // returns it by hand — so it is written to the security log for
+  // the team to audit. Best-effort: logging never blocks the
+  // cancel (logSecurityEvent already swallows its own failures).
+  if (order.status === "paid") {
+    await logSecurityEvent(
+      order.id,
+      userId,
+      "paid_order_cancelled",
+      `Manual return — order ${order.code} was paid (₦${Number(order.total || 0).toLocaleString("en-NG")}) and cancelled by ${isTeam ? "the PulseMarket team" : isBuyer ? "the buyer" : "the seller"}. The team returns the transfer to the buyer by hand.`
+    );
+  }
   try {
     await updateListing(order.listing_id, { status: "active" });
   } catch (err) {

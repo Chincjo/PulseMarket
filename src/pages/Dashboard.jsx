@@ -6,6 +6,7 @@ import { formatNaira } from "../lib/fees";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
 import { BoostedBadge } from "../components/ListingCard";
 import ListingEditForm from "../components/ListingEditForm";
+import { fetchMyOrders } from "../lib/orders";
 import {
   deleteListing,
   duplicateListing,
@@ -22,6 +23,13 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [hasMoreListings, setHasMoreListings] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  // My orders (buyer + seller): a buyer who closed the app after
+  // checkout used to have no way back to the order from here — the
+  // Dashboard was listings-only, and the Evidence Locker's "My
+  // orders" button pointed at this page.
+  const [orders, setOrders] = useState([]);
+  const [hasMoreOrders, setHasMoreOrders] = useState(false);
+  const [loadingMoreOrders, setLoadingMoreOrders] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState(null);
@@ -30,17 +38,46 @@ export default function Dashboard() {
   const mounted = useRef(true);
 
   async function reload() {
-    if (!user) return;
+    // A signed-out visitor used to stare at "Loading your orders…"
+    // for ever: the early return left `loading` true, and the effect
+    // never re-ran once auth had settled on no user.
+    if (!user) {
+      if (mounted.current) setLoading(false);
+      return;
+    }
     try {
-      const rows = await fetchMyListings(user.id);
+      const [rows, myOrders] = await Promise.all([
+        fetchMyListings(user.id),
+        fetchMyOrders(user.id),
+      ]);
       if (mounted.current) {
         setListings(rows);
         setHasMoreListings(rows.hasMore === true);
+        setOrders(myOrders || []);
+        setHasMoreOrders(myOrders?.hasMore === true);
       }
     } catch (err) {
       if (mounted.current) setError(err?.message || "Could not load your listings. Try again.");
     } finally {
       if (mounted.current) setLoading(false);
+    }
+  }
+
+  async function loadMoreOrders() {
+    if (!user || loadingMoreOrders || !hasMoreOrders || orders.length === 0) return;
+    setLoadingMoreOrders(true);
+    setError("");
+    try {
+      const last = orders[orders.length - 1];
+      const rows = await fetchMyOrders(user.id, { before: last.created_at });
+      if (mounted.current) {
+        setOrders((prev) => [...prev, ...(rows || [])]);
+        setHasMoreOrders(rows?.hasMore === true);
+      }
+    } catch (err) {
+      if (mounted.current) setError(err?.message || "Could not load more orders. Try again.");
+    } finally {
+      if (mounted.current) setLoadingMoreOrders(false);
     }
   }
 
@@ -161,6 +198,44 @@ export default function Dashboard() {
           <p className="text-xs text-neutral-500">Active value</p>
         </div>
       </div>
+
+      <h2 className="text-lg font-bold">My orders</h2>
+      {loading ? (
+        <p className="text-sm text-neutral-500">Loading your orders…</p>
+      ) : orders.length === 0 ? (
+        <p className="text-sm text-neutral-500">
+          No orders yet — items you buy or sell will show up here, so you can always find them again after checkout.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {orders.map((o) => (
+            <Link
+              key={o.id}
+              to={`/order/${o.id}`}
+              className="flex items-center gap-3 rounded-2xl border border-neutral-200 p-3 dark:border-neutral-800"
+            >
+              <div className="flex-1">
+                <p className="text-sm font-semibold">
+                  Order {o.code} · {o.buyer_id === user?.id ? "You bought" : "You sold"}
+                </p>
+                <p className="text-sm text-neutral-500">
+                  {formatNaira(o.total)} · <span className="capitalize">{o.status}</span>
+                  {o.payment_method === "cash" ? " · Cash" : " · Held"}
+                </p>
+              </div>
+              <span className="text-sm font-semibold text-brown">Open →</span>
+            </Link>
+          ))}
+          {hasMoreOrders ? (
+            <div className="pt-1 text-center">
+              <p className="text-xs text-neutral-500">Showing the first {orders.length} orders.</p>
+              <GhostButton onClick={loadMoreOrders} disabled={loadingMoreOrders}>
+                {loadingMoreOrders ? "Loading…" : "Load more"}
+              </GhostButton>
+            </div>
+          ) : null}
+        </div>
+      )}
 
       <h2 className="text-lg font-bold">My listings</h2>
       {error ? (

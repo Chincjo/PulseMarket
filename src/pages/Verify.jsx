@@ -17,6 +17,7 @@ import { UNIVERSITY_NAMES } from "../lib/data";
 import { getVerification, saveVerification } from "../lib/store";
 import {
   fetchVerificationRow,
+  fetchVerificationRowChecked,
   removeVerificationIdPhotos,
   replaceVerificationPhotos,
   resubmitVerification,
@@ -68,10 +69,23 @@ function rejectionMessage(reason) {
   return REJECTION_MESSAGES[reason] || "Your verification was not approved. Check your details and take clear photos of both sides of your student ID, then submit again.";
 }
 
-export default function Verify({ onVerified }) {
+export default function Verify({ onVerified, initialVerification }) {
   const { user, configured, signUpEmail, signInGoogle, signOut } = useAuth();
   const navigate = useNavigate();
-  const [saved, setSaved] = useState(getVerification());
+  // Seeded from the app's server-checked verification when App.jsx
+  // mounts this page for a student under review — the page then
+  // shows the under-review screen (with photo replace) at once
+  // instead of flashing the submit form while its own server check
+  // runs. Falls back to the device copy as before.
+  const [saved, setSaved] = useState(initialVerification || getVerification());
+  // The device copy may belong to ANOTHER student (shared phone,
+  // account switched): its university, student ID and invite code
+  // must never be shown or reused for this account. savedForUser
+  // is null in that case, and the server check below replaces it
+  // with this account's own row. Records saved before userId was
+  // stored have no userId and keep the old behaviour.
+  const savedForUser =
+    saved && user?.id && saved.userId && saved.userId !== user.id ? null : saved;
 
   // Step 1 — account creation.
   const [email, setEmail] = useState("");
@@ -85,10 +99,10 @@ export default function Verify({ onVerified }) {
   // A rejected student submits again, so the form starts filled with
   // their saved details (university, student email, student ID and
   // invite code are kept — they are never changed on a re-submit).
-  const [university, setUniversity] = useState(saved?.university || UNIVERSITY_NAMES[0]);
-  const [studentEmail, setStudentEmail] = useState(saved?.studentEmail || "");
-  const [studentId, setStudentId] = useState(saved?.studentId || "");
-  const [referralCode, setReferralCode] = useState(saved?.referredBy || "");
+  const [university, setUniversity] = useState(savedForUser?.university || UNIVERSITY_NAMES[0]);
+  const [studentEmail, setStudentEmail] = useState(savedForUser?.studentEmail || "");
+  const [studentId, setStudentId] = useState(savedForUser?.studentId || "");
+  const [referralCode, setReferralCode] = useState(savedForUser?.referredBy || "");
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
   // The picked files themselves (the previews above are data URLs for
@@ -119,38 +133,56 @@ export default function Verify({ onVerified }) {
   // A failed check changes nothing: the device copy stays.
   useEffect(() => {
     if (!user?.id) return;
+    // Another student's device copy on this phone: drop it now —
+    // fields, state and storage — before it can pre-fill this
+    // student's form or lend them the other student's invite code.
+    // The server fetch below then loads this account's own row.
+    if (saved && !savedForUser) {
+      saveVerification(null);
+      setSaved(null);
+      setUniversity(UNIVERSITY_NAMES[0]);
+      setStudentEmail("");
+      setStudentId("");
+      setReferralCode("");
+    }
     let cancelled = false;
-    fetchVerificationRow(user.id).then((row) => {
-      if (cancelled || !row) return;
-      const rec = {
-        userId: row.userId,
-        email: user.email,
-        university: row.university,
-        studentEmail: row.studentEmail,
-        studentId: row.studentId,
-        status: row.status,
-        inviteCode: row.inviteCode,
-        submittedAt: row.submittedAt,
-        idFrontUrl: row.idFrontUrl || null,
-        idBackUrl: row.idBackUrl || null,
-        // Milestone 19: why the team rejected this student, if they
-        // did, and their note — carried on the device copy so the
-        // form below can show it without another server round trip.
-        rejectionReason: row.rejectionReason || null,
-        rejectionNote: row.rejectionNote || null,
-        // The server row carries no referrer — keep the device copy's.
-        referredBy: saved?.referredBy ?? null,
-      };
-      saveVerification(rec);
-      setSaved(rec);
-      if (row.status === "rejected") {
-        // Pre-fill the form for the re-submit — only where the
-        // student has not already typed something.
-        setUniversity((prev) => (prev === UNIVERSITY_NAMES[0] ? row.university : prev));
-        setStudentEmail((prev) => prev || row.studentEmail || "");
-        setStudentId((prev) => prev || row.studentId || "");
-      }
-    });
+    fetchVerificationRow(user.id)
+      .then((row) => {
+        if (cancelled || !row) return;
+        const rec = {
+          userId: row.userId,
+          email: user.email,
+          university: row.university,
+          studentEmail: row.studentEmail,
+          studentId: row.studentId,
+          status: row.status,
+          inviteCode: row.inviteCode,
+          submittedAt: row.submittedAt,
+          idFrontUrl: row.idFrontUrl || null,
+          idBackUrl: row.idBackUrl || null,
+          // Milestone 19: why the team rejected this student, if they
+          // did, and their note — carried on the device copy so the
+          // form below can show it without another server round trip.
+          rejectionReason: row.rejectionReason || null,
+          rejectionNote: row.rejectionNote || null,
+          // The server row carries no referrer — keep the device copy's,
+          // but only when that copy is this student's own.
+          referredBy: savedForUser?.referredBy ?? null,
+        };
+        saveVerification(rec);
+        setSaved(rec);
+        if (row.status === "rejected") {
+          // Pre-fill the form for the re-submit — only where the
+          // student has not already typed something.
+          setUniversity((prev) => (prev === UNIVERSITY_NAMES[0] ? row.university : prev));
+          setStudentEmail((prev) => prev || row.studentEmail || "");
+          setStudentId((prev) => prev || row.studentId || "");
+        }
+      })
+      // Milestone 20 (APP-13): a failed server check changes
+      // nothing — the device copy stays — but the rejection must
+      // be caught, or the failed check is an unhandled rejection.
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -162,12 +194,14 @@ export default function Verify({ onVerified }) {
     if (f.type && !f.type.startsWith("image/")) {
       setFormError("That file is not a photo — take a photo of your student ID.");
       e.target.value = "";
+      setPreview(null);
       setFile(null);
       return;
     }
     if (f.size > MAX_FILE_MB * 1024 * 1024) {
       setFormError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
       e.target.value = "";
+      setPreview(null);
       setFile(null);
       return;
     }
@@ -200,7 +234,7 @@ export default function Verify({ onVerified }) {
     setBusy(true);
     try {
       const data = await signUpEmail(email.trim(), password);
-      if (!data.session) setAwaitingConfirmation(true);
+      if (!data?.session) setAwaitingConfirmation(true);
       // With a session (confirmation off), the auth listener signs the
       // student in and this page re-renders into step 2 automatically.
     } catch (err) {
@@ -264,13 +298,24 @@ export default function Verify({ onVerified }) {
       // Fresh server check first: the device copy can be stale, and
       // the right path depends on the server status — a first submit,
       // a re-submit after a rejection, or nothing at all because the
-      // student is already approved or already under review. A failed
-      // check (null) falls back to the device copy below.
+      // student is already approved or already under review.
+      // Milestone 22: a FAILED check must never look like "no row".
+      // It used to fall through as a first-time submitter, so an
+      // already-approved student could upload new photos and end up
+      // "pending review" on the device while the team still saw the
+      // old row. Refuse plainly instead — the student tries again
+      // once the check works.
       let serverRow = null;
       try {
-        serverRow = await fetchVerificationRow(user.id);
+        const checked = await fetchVerificationRowChecked(user.id);
+        if (checked.failed) {
+          setFormError("Could not check your verification — check your connection and try again.");
+          return;
+        }
+        serverRow = checked.row;
       } catch {
-        serverRow = null;
+        setFormError("Could not check your verification — check your connection and try again.");
+        return;
       }
       const serverStatus = serverRow?.status || null;
       if (serverStatus === "approved") {
@@ -284,7 +329,7 @@ export default function Verify({ onVerified }) {
           studentId: serverRow.studentId,
           status: "approved",
           inviteCode: serverRow.inviteCode,
-          referredBy: saved?.referredBy ?? null,
+          referredBy: savedForUser?.referredBy ?? null,
           submittedAt: serverRow.submittedAt,
           idFrontUrl: serverRow.idFrontUrl || null,
           idBackUrl: serverRow.idBackUrl || null,
@@ -308,7 +353,7 @@ export default function Verify({ onVerified }) {
           studentId: serverRow.studentId,
           status: "pending review",
           inviteCode: serverRow.inviteCode,
-          referredBy: saved?.referredBy ?? null,
+          referredBy: savedForUser?.referredBy ?? null,
           submittedAt: serverRow.submittedAt,
           idFrontUrl: serverRow.idFrontUrl || null,
           idBackUrl: serverRow.idBackUrl || null,
@@ -328,8 +373,8 @@ export default function Verify({ onVerified }) {
       // submit — a re-submit never changes who the student is or who
       // invited them.
       const isResubmit =
-        serverStatus === "rejected" || (!serverRow && saved?.status === "rejected");
-      const keptCode = serverRow?.inviteCode || saved?.inviteCode || null;
+        serverStatus === "rejected" || (!serverRow && savedForUser?.status === "rejected");
+      const keptCode = serverRow?.inviteCode || savedForUser?.inviteCode || null;
       const inviteCode =
         isResubmit && keptCode ? keptCode : generateInviteCode();
       // Milestone 11: a referral code is accepted only in the real
@@ -343,7 +388,7 @@ export default function Verify({ onVerified }) {
         return;
       }
       const referredBy = isResubmit
-        ? saved?.referredBy || null
+        ? savedForUser?.referredBy || null
         : /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral)
           ? cleanReferral
           : null;
@@ -447,7 +492,7 @@ export default function Verify({ onVerified }) {
         studentId: row.studentId,
         status: row.status,
         inviteCode: row.inviteCode,
-        referredBy: saved?.referredBy ?? null,
+        referredBy: savedForUser?.referredBy ?? null,
         submittedAt: row.submittedAt,
         idFrontUrl: row.idFrontUrl || null,
         idBackUrl: row.idBackUrl || null,
@@ -472,12 +517,14 @@ export default function Verify({ onVerified }) {
     if (f.type && !f.type.startsWith("image/")) {
       setReplaceError("That file is not a photo — take a photo of your student ID.");
       e.target.value = "";
+      setPreview(null);
       setFile(null);
       return;
     }
     if (f.size > MAX_FILE_MB * 1024 * 1024) {
       setReplaceError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
       e.target.value = "";
+      setPreview(null);
       setFile(null);
       return;
     }
@@ -535,8 +582,11 @@ export default function Verify({ onVerified }) {
     }
   }
 
-  // Verification already submitted on this device.
-  if (saved) {
+  // Verification already submitted on this device, for this
+  // student — a copy belonging to another student never renders
+  // here (see savedForUser above).
+  if (savedForUser) {
+    const saved = savedForUser;
     if (!user) {
       return (
         <div className="space-y-4 pt-10 text-center">
@@ -648,7 +698,7 @@ export default function Verify({ onVerified }) {
   // Step 2 — signed in, not verified yet (or rejected and submitting
   // again): the verification form.
   if (user) {
-    const isResubmitForm = saved?.status === "rejected";
+    const isResubmitForm = savedForUser?.status === "rejected";
     return (
       <div className="space-y-5">
         <h1 className="text-2xl font-bold">
@@ -691,7 +741,7 @@ export default function Verify({ onVerified }) {
         </label>
         <label className="block text-sm font-semibold">
           Invite code (optional) — if a friend invited you
-          <input value={referralCode} onChange={(e) => setReferralCode(e.target.value)} maxLength={9} placeholder="e.g. PM-AB12CD" className={`${inputCls} mt-1`} />
+          <input value={referralCode} onChange={(e) => setReferralCode(e.target.value)} maxLength={9} placeholder="e.g. PM-AB12CD" disabled={isResubmitForm} className={`${inputCls} mt-1`} />
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">

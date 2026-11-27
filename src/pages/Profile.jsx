@@ -1,11 +1,9 @@
 import { Link } from "react-router-dom";
-import { getVerification } from "../lib/store";
 import { GhostButton, PrimaryButton } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
-export default function Profile({ user }) {
+export default function Profile({ user, verification }) {
   const { signOut } = useAuth();
-  const verification = getVerification();
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-3">
@@ -19,7 +17,10 @@ export default function Profile({ user }) {
             {verification ? ` · ${verification.status}` : ""}
           </p>
         </div>
-        {verification ? (
+        {/* The badge means APPROVED only — a student still under
+            review or rejected used to see "Verified student" too,
+            while the line below already showed their real status. */}
+        {verification?.status === "approved" ? (
           <span className="rounded-full bg-brown-soft px-2.5 py-1 text-xs font-bold text-brown-dark">
             Verified student
           </span>

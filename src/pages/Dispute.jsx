@@ -21,6 +21,7 @@ import {
   fetchEvidenceForOrder,
   recordVideo,
   uploadEvidence,
+  useSignedEvidenceUrls,
 } from "../lib/evidence";
 import { DISPUTE_CATEGORIES, fileDispute, fetchMyDisputes } from "../lib/disputes";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
@@ -45,6 +46,10 @@ export default function Dispute() {
   const { user, loading: authLoading } = useAuth();
   const [order, setOrder] = useState(null);
   const [evidence, setEvidence] = useState([]);
+  // Milestone 20 (M-6): evidence media renders through short-lived
+  // signed URLs (the bucket goes private) — the stored URL is the
+  // fallback until then.
+  const signedEvidenceUrls = useSignedEvidenceUrls(evidence.map((e) => e.url));
   const [existingTicket, setExistingTicket] = useState(null);
   const [category, setCategory] = useState(DISPUTE_CATEGORIES[0]);
   const [explanation, setExplanation] = useState("");
@@ -71,8 +76,11 @@ export default function Dispute() {
       recorderRef.current?.stop?.();
       if (clipUrl) URL.revokeObjectURL(clipUrl);
     };
+    // Runs on clipUrl change too: the old clip's blob URL is freed
+    // when a new clip replaces it (and on unmount). With [] deps
+    // the cleanup closed over the initial "" and never freed a clip.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [clipUrl]);
 
   const load = useCallback(async () => {
     if (!user || !orderId) {
@@ -115,6 +123,9 @@ export default function Dispute() {
   }
 
   async function startRecording() {
+    // No guard before: a double-tap opened two camera streams and
+    // the second overwrote recorderRef, leaking the first stream.
+    if (recording) return;
     setClipError("");
     setClipNotice("");
     resetClip();
@@ -144,6 +155,9 @@ export default function Dispute() {
 
   async function uploadClip() {
     if (!clip) return;
+    // No in-flight guard before: a double-tap saved the same clip
+    // twice (the disabled button only helps after a re-render).
+    if (clipBusy) return;
     // A clip outside 10–20s can never count as evidence — refuse the
     // save plainly instead of storing an unverified video.
     if (clip.durationSeconds < DISPUTE_RULE.minSeconds || clip.durationSeconds > DISPUTE_RULE.maxSeconds) {
@@ -176,6 +190,16 @@ export default function Dispute() {
 
   async function handleSubmit(e) {
     e.preventDefault();
+    // No guard before: a double-tap filed the report twice, and
+    // pressing Enter in a field submits the form even while the
+    // Send button is disabled — bypassing the canSend gate (20-char
+    // explanation, valid email, verified dispute video) and leaving
+    // the refusal to the server. Enforce both checks here.
+    if (submitting) return;
+    if (!canSend) {
+      setError(`To send this report, ${sendBlockers.join("; ")}.`);
+      return;
+    }
     setError("");
     setSubmitting(true);
     try {
@@ -196,7 +220,7 @@ export default function Dispute() {
   if (sentTicket || existingTicket) {
     const ticket = sentTicket || existingTicket;
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Report sent — under review</h1>
         <p className="mt-4 text-sm">
           Your ticket ID is <span className="font-bold">{ticket}</span>
@@ -204,21 +228,21 @@ export default function Dispute() {
         <p className="mt-2 text-sm text-neutral-500">
           The PulseMarket team will review it.
         </p>
-      </main>
+      </div>
     );
   }
 
   if (authLoading || loading) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <p className="text-sm text-neutral-500">Loading…</p>
-      </main>
+      </div>
     );
   }
 
   if (!user) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Report a problem</h1>
         <div className="mt-4">
           <EmptyState
@@ -231,27 +255,27 @@ export default function Dispute() {
             }
           />
         </div>
-      </main>
+      </div>
     );
   }
 
   if (!order) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Report a problem</h1>
         <p className="mt-4 text-sm text-red-600">{error || "Order not found."}</p>
-      </main>
+      </div>
     );
   }
 
   if (order.buyer_id !== user.id) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Report a problem</h1>
         <p className="mt-4 text-sm text-neutral-500">
           Only the buyer of this order can report a problem with it.
         </p>
-      </main>
+      </div>
     );
   }
 
@@ -262,7 +286,7 @@ export default function Dispute() {
   const DISPUTABLE_STATUSES = ["paid", "held", "shipped", "delivered"];
   if (!DISPUTABLE_STATUSES.includes(order.status)) {
     return (
-      <main className="mx-auto max-w-2xl px-4 py-6">
+      <div className="mx-auto max-w-2xl px-4 py-6">
         <h1 className="text-xl font-bold">Report a problem</h1>
         <p className="mt-4 text-sm text-neutral-500">
           {order.status === "reserved"
@@ -274,7 +298,7 @@ export default function Dispute() {
             <GhostButton>Back to order</GhostButton>
           </Link>
         </div>
-      </main>
+      </div>
     );
   }
 
@@ -296,7 +320,7 @@ export default function Dispute() {
   ].filter(Boolean);
 
   return (
-    <main className="mx-auto max-w-2xl px-4 py-6">
+    <div className="mx-auto max-w-2xl px-4 py-6">
       <h1 className="text-xl font-bold">Report a problem</h1>
       <p className="mt-1 text-sm text-neutral-500">
         Order {order.code} · {order.status}
@@ -385,14 +409,14 @@ export default function Dispute() {
                 >
                   {item.media_type === "video" ? (
                     <video
-                      src={item.url}
+                      src={signedEvidenceUrls.get(item.url) || item.url}
                       controls
                       preload="metadata"
                       className="h-20 w-28 shrink-0 rounded-lg bg-black object-cover"
                     />
                   ) : (
                     <img
-                      src={item.url}
+                      src={signedEvidenceUrls.get(item.url) || item.url}
                       alt={item.kind}
                       className="h-20 w-28 shrink-0 rounded-lg bg-neutral-100 object-cover dark:bg-neutral-900"
                     />
@@ -499,6 +523,6 @@ export default function Dispute() {
       <p className="mt-8 text-center text-xs text-neutral-500">
         Questions? Email pulsemarketsupport@gmail.com
       </p>
-    </main>
+    </div>
   );
 }

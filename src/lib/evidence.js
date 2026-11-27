@@ -17,7 +17,9 @@
 //   - The verified tick is what gates money: confirmDelivery in
 //     orders.js refuses a shipping order until the buyer has a verified
 //     unboxing video for it.
+import { useEffect, useState } from "react";
 import { supabase } from "./supabase";
+import { assertRealPhoto } from "./shipping";
 
 export const EVIDENCE_BUCKET = "evidence-media";
 
@@ -465,6 +467,21 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob }) {
   if (order.buyer_id !== user.id && order.seller_id !== user.id) {
     throw new Error("Only the buyer or seller of this order can add evidence for it.");
   }
+  // Who may record what: the buyer records the unboxing, dispute
+  // and return videos; the seller records the packing video and the
+  // shipping photos. Either side could upload any kind before, so a
+  // seller's "unboxing" clip satisfied the buyer's delivery gate
+  // (the gates in orders.js / disputes.js now check the recorder
+  // too — this is the backstop at the source). Handoff photos go
+  // through handoff.js, not here, so that kind stays open to both.
+  const BUYER_KINDS = ["unboxing", "dispute", "return"];
+  const SELLER_KINDS = ["packing", "waybill", "receipt"];
+  if (BUYER_KINDS.includes(kind) && order.buyer_id !== user.id) {
+    throw new Error("Only the buyer can record this evidence.");
+  }
+  if (SELLER_KINDS.includes(kind) && order.seller_id !== user.id) {
+    throw new Error("Only the seller can record this evidence.");
+  }
 
   const blob = await toBlob(fileOrBlob);
   // A giant file stalls the upload and the storage bill — refuse it
@@ -476,17 +493,29 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob }) {
         : "That video is too big — keep evidence videos under 100MB."
     );
   }
+  // Milestone 20 (APP-11): a file with NO MIME type at all is
+  // refused, not skipped past the check — an empty blob.type used
+  // to bypass the photo/video check entirely, so anything could be
+  // stored as "evidence".
+  if (!blob || !blob.type) {
+    throw new Error(
+      "Could not tell what kind of file this is — take the photo or record the video again in the app."
+    );
+  }
   // The file must be what the kind claims it is — a photo renamed
   // .webm (or a video file passed as a photo) never counts, whatever
-  // its name or extension says. Browsers that report no MIME type
-  // (empty blob.type) skip this check.
-  if (blob && blob.type) {
-    if (mediaType === "photo" && !blob.type.startsWith("image/")) {
-      throw new Error("That file is not a photo — take a photo in the app.");
-    }
-    if (mediaType === "video" && !blob.type.startsWith("video/")) {
-      throw new Error("That file is not a video — record a video in the app.");
-    }
+  // its name or extension says.
+  if (mediaType === "photo" && !blob.type.startsWith("image/")) {
+    throw new Error("That file is not a photo — take a photo in the app.");
+  }
+  if (mediaType === "video" && !blob.type.startsWith("video/")) {
+    throw new Error("That file is not a video — record a video in the app.");
+  }
+  // Milestone 20 (APP-11): a photo must also pass the magic-byte
+  // check — a renamed document with an image MIME type used to sail
+  // through on the prefix alone. Same check as the waybill photos.
+  if (mediaType === "photo") {
+    await assertRealPhoto(blob, kind);
   }
   // Video length is measured from the file itself (see
   // measureVideoDuration) and NOTHING else counts. When the file
@@ -589,6 +618,46 @@ export async function deleteEvidence(id) {
   if (row.user_id !== user.id) {
     throw new Error("Only the student who recorded this can delete it.");
   }
+  // Milestone 22: evidence that a live case depends on cannot be
+  // deleted. A buyer used to be able to file a dispute — which
+  // needs a verified dispute video and freezes the money — and then
+  // delete that video, leaving the team with a frozen order and no
+  // proof. Refuse while the order is frozen, while a return is open,
+  // or while a dispute video backs an open report. (Deleting an
+  // unboxing video after delivery stays allowed: the delivery gate
+  // re-checks it at confirm time, so it cannot be used to undo a
+  // delivery.)
+  if (row.order_id) {
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .select("id, frozen, return_status")
+      .eq("id", row.order_id)
+      .maybeSingle();
+    if (orderError) {
+      throw new Error("Could not check this order — try again.");
+    }
+    if (order?.frozen) {
+      throw new Error("This order has an open dispute — its evidence stays until the team resolves it.");
+    }
+    if (order?.return_status === "opened") {
+      throw new Error("This order has an open return — its evidence stays until the return is resolved.");
+    }
+    if (row.kind === "dispute") {
+      const { data: openDispute, error: disputeError } = await supabase
+        .from("disputes")
+        .select("id")
+        .eq("order_id", row.order_id)
+        .in("status", ["open", "under_review"])
+        .limit(1)
+        .maybeSingle();
+      if (disputeError) {
+        throw new Error("Could not check this order — try again.");
+      }
+      if (openDispute) {
+        throw new Error("This video backs an open dispute — it stays until the team resolves it.");
+      }
+    }
+  }
   const path = storagePathFromUrl(row.url);
   if (path) {
     const { error: storageError } = await supabase.storage
@@ -607,11 +676,98 @@ export async function deleteEvidence(id) {
 
 // Public bucket URLs look like
 // .../storage/v1/object/public/evidence-media/<user-id>/evidence-....jpg
-// — the part after the bucket name is the storage path.
+// — the part after the bucket name is the storage path. Signed URLs
+// look like .../object/sign/evidence-media/<path>?token=... — the
+// path is the part after the bucket name, before the query. A bare
+// path (no URL at all) is returned as-is, so callers that already
+// hold a path can use the same helper.
 export function storagePathFromUrl(url) {
   if (!url) return null;
-  const marker = `/object/public/${EVIDENCE_BUCKET}/`;
-  const idx = String(url).indexOf(marker);
-  if (idx === -1) return null;
-  return String(url).slice(idx + marker.length) || null;
+  const str = String(url);
+  for (const marker of [
+    `/object/public/${EVIDENCE_BUCKET}/`,
+    `/object/sign/${EVIDENCE_BUCKET}/`,
+  ]) {
+    const idx = str.indexOf(marker);
+    if (idx !== -1) {
+      const rest = str.slice(idx + marker.length).split("?")[0];
+      return rest || null;
+    }
+  }
+  if (!str.includes("://") && str.includes("/")) return str;
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Signed URLs (Milestone 20, M-6) — mirror of verificationIdPhotoUrl
+// in listings.js: the evidence-media bucket goes private in the
+// Milestone 20 SQL, so public URLs stop working and every render of
+// an evidence / handoff / waybill / receipt / checkpoint photo must
+// mint a short-lived signed URL instead. Signed URLs also work while
+// the bucket is still public, so this is safe to ship before the SQL
+// runs. Links live for 1 hour and are re-minted when older than
+// ~50 minutes; a mint failure falls back to the stored URL, which
+// still works until the bucket goes private.
+// ---------------------------------------------------------------------------
+
+const signedUrlCache = new Map(); // path -> { url, mintedAt }
+
+export async function evidenceSignedUrl(storedUrl) {
+  if (!supabase || !storedUrl) return storedUrl || null;
+  const path = storagePathFromUrl(storedUrl);
+  if (!path) return storedUrl;
+  const cached = signedUrlCache.get(path);
+  if (cached && Date.now() - cached.mintedAt < 50 * 60 * 1000) {
+    return cached.url;
+  }
+  try {
+    const { data, error } = await supabase.storage
+      .from(EVIDENCE_BUCKET)
+      .createSignedUrl(path, 3600);
+    if (error) throw error;
+    const url = data?.signedUrl || null;
+    if (url) signedUrlCache.set(path, { url, mintedAt: Date.now() });
+    return url || storedUrl;
+  } catch (err) {
+    dbError(err, "mint evidence signed URL");
+    return storedUrl;
+  }
+}
+
+// Mint signed URLs for a list of stored URLs at once. Returns a Map
+// (stored URL -> signed URL, or the stored URL when minting failed).
+export async function resolveEvidenceUrls(urls) {
+  const out = new Map();
+  const list = [...new Set((urls || []).filter(Boolean))];
+  await Promise.all(
+    list.map(async (url) => {
+      out.set(url, (await evidenceSignedUrl(url)) || url);
+    })
+  );
+  return out;
+}
+
+// React hook for pages that render stored evidence-media URLs: pass
+// the URLs on screen and get back a Map (stored URL -> signed URL).
+// URLs with no signed URL yet (still minting, or minting failed)
+// fall back to the stored URL, so the page never shows a broken
+// image while the bucket is still public.
+export function useSignedEvidenceUrls(urls) {
+  const [map, setMap] = useState(new Map());
+  const key = (urls || []).join("|");
+  useEffect(() => {
+    let alive = true;
+    const list = [...new Set((urls || []).filter(Boolean))];
+    if (list.length === 0) return;
+    resolveEvidenceUrls(list).then((m) => {
+      if (alive) setMap(m);
+    });
+    return () => {
+      alive = false;
+    };
+    // The joined key is the dependency: re-mint only when the set
+    // of URLs actually changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return map;
 }

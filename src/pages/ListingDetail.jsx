@@ -1,10 +1,10 @@
 // Listing detail — photos, seller card, delivery, automatic fee breakdown,
-// watchlist save, and boost (owner only). Chat and Make Offer arrive with
-// the next build, so this page says so honestly instead of a dead button.
+// watchlist save, and boost (owner only). Chat and Make Offer live here
+// too — the buyer opens a chat or makes an offer from this page.
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { SHIPPING_ZONES } from "../lib/data";
-import { feeBreakdown, formatNaira } from "../lib/fees";
+import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
 import {
   BOOST_TIERS,
   boostListing,
@@ -12,6 +12,7 @@ import {
   deleteListing,
   duplicateListing,
   fetchListing,
+  fetchOpenOrderCount,
   fetchWatchlistIds,
   isBoosted,
   reactivateListing,
@@ -54,9 +55,13 @@ export default function ListingDetail() {
   useEffect(() => {
     if (!listing?.seller_id) return;
     let cancelled = false;
-    fetchSellerRating(listing.seller_id).then((r) => {
-      if (!cancelled) setSellerRating(r);
-    });
+    // A failed rating read must not leave an unhandled rejection —
+    // the card just falls back to "No ratings yet".
+    fetchSellerRating(listing.seller_id)
+      .then((r) => {
+        if (!cancelled) setSellerRating(r);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -100,9 +105,11 @@ export default function ListingDetail() {
         }
       });
     if (user) {
-      fetchWatchlistIds(user.id).then((ids) => {
-        if (!cancelled) setSaved(ids.includes(id));
-      });
+      fetchWatchlistIds(user.id)
+        .then((ids) => {
+          if (!cancelled) setSaved(ids.includes(id));
+        })
+        .catch(() => {});
     }
     return () => {
       cancelled = true;
@@ -126,9 +133,20 @@ export default function ListingDetail() {
       const updated = await boostListing(id, amount);
       setListing(updated);
       setShowBoost(false);
-      setNotice(
-        `Boosted — your listing ranks first until ${new Date(updated.boosted_until).toLocaleString("en-NG", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}.`
-      );
+      // Milestone 20 (M-2): when the RPC path ran, the boost is
+      // only REQUESTED — the team confirms payment first — so show
+      // the plain "requested" message, not "Boosted until …".
+      if (updated.boostMessage) {
+        setNotice(updated.boostMessage);
+      } else if (updated.boosted_until) {
+        setNotice(
+          `Boosted — your listing ranks first until ${new Date(updated.boosted_until).toLocaleString("en-NG", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}.`
+        );
+      } else {
+        // Boost applied but no expiry came back — never show
+        // "until Invalid Date".
+        setNotice("Boosted — your listing ranks first.");
+      }
     } catch (err) {
       setError(err?.message || "Could not boost this listing. Try again.");
     } finally {
@@ -142,6 +160,16 @@ export default function ListingDetail() {
     setStatusBusy(true);
     setError("");
     try {
+      // Milestone 22: "Mark sold" / "Mark reserved" used to check
+      // nothing — the buttons only show while the listing is active,
+      // but a direct call could flip it to 'sold' while a paid/held
+      // order was open, and a later cancel would silently flip it
+      // back to 'active'. Refuse while any order is open (same count
+      // reactivateListing uses); the order flows move the status
+      // themselves.
+      if ((status === "sold" || status === "reserved") && (await fetchOpenOrderCount(id)) > 0) {
+        throw new Error("This item has an open order on it — its status moves with the order, not by hand.");
+      }
       const updated = await updateListing(id, { status });
       setListing(updated);
       setNotice(
@@ -188,6 +216,9 @@ export default function ListingDetail() {
       await deleteListing(id);
       navigate("/dashboard");
     } catch (err) {
+      // A failed delete must re-arm the two-tap confirm — otherwise
+      // the next tap deletes with no confirm at all.
+      setConfirmDelete(false);
       setError(err?.message || "Could not delete the listing. Try again.");
     } finally {
       setStatusBusy(false);
@@ -346,14 +377,12 @@ export default function ListingDetail() {
         <p className="flex justify-between text-neutral-500">
           <span>
             Service fee{" "}
-            {listing.price < 5000
-              ? "(flat ₦150 under ₦5,000)"
-              : "(5%, capped at ₦2,000)"}
+            {serviceFeeLabel(listing.price)}
           </span>
           <span>{formatNaira(held.serviceFee)}</span>
         </p>
         <p className="flex justify-between text-neutral-500">
-          <span>Secure payment fee (1.5% + ₦100)</span>
+          <span>Secure payment fee {FEE_LABELS.secure}</span>
           <span>{formatNaira(held.secureFee)}</span>
         </p>
         <p className="mt-1 flex justify-between font-bold">

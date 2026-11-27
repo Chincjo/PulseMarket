@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
-import { getVerification } from "../lib/store";
 import { useAuth } from "../lib/auth";
 import { fetchConversations, fetchParticipantsVerified } from "../lib/chat";
 import { formatNaira } from "../lib/fees";
@@ -15,9 +14,8 @@ function timeAgo(iso) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-export default function Chat() {
+export default function Chat({ verification }) {
   const { user } = useAuth();
-  const verification = getVerification();
   const [conversations, setConversations] = useState([]);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -95,18 +93,24 @@ export default function Chat() {
         }
         // Milestone 19: one batch check for the sellers in the
         // buyer-side conversations. An unknown answer (RPC not
-        // run yet, or no row back) leaves the note off.
+        // run yet, or no row back) leaves the note off. A failure
+        // of this secondary check must never wipe the chat list
+        // below — it is caught here, not by the outer catch.
         const sellerIds = [...new Set(
           rows.filter((c) => c.buyer_id === user.id && c.seller_id).map((c) => c.seller_id)
         )];
         if (sellerIds.length > 0) {
-          const verified = await fetchParticipantsVerified(sellerIds);
-          if (!cancelled) {
-            const bad = {};
-            for (const id of sellerIds) {
-              if (id in verified && verified[id] !== true) bad[id] = true;
+          try {
+            const verified = await fetchParticipantsVerified(sellerIds);
+            if (!cancelled) {
+              const bad = {};
+              for (const id of sellerIds) {
+                if (id in verified && verified[id] !== true) bad[id] = true;
+              }
+              setUnverifiedSellerIds(bad);
             }
-            setUnverifiedSellerIds(bad);
+          } catch {
+            // Secondary check failed — leave the note off, keep chats.
           }
         } else if (!cancelled) {
           setUnverifiedSellerIds({});

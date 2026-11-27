@@ -1379,16 +1379,17 @@ create trigger pm_validate_ledger_insert_trg
   for each row execute function public.pm_validate_ledger_insert();
 
 -- ---------------------------------------------------------------------------
--- 10) GRANDFATHER — THIS MUST STAY THE LAST STATEMENT IN THE FILE.
---     Every student who is already in stays in: all existing
---     'pending review' rows become 'approved', so nobody who
---     posted, chatted or ordered before this file has to re-submit
---     or re-verify anything. Idempotent: a second run updates zero
---     rows, because no 'pending review' rows are left (new rows
---     always start as 'pending review' and are reviewed from
---     there). Rows the team already rejected stay rejected — only
---     'pending review' is grandfathered. (In the SQL Editor
---     auth.uid() is null, so the update trigger in section 4 steps
---     aside for this statement.)
+-- 10) GRANDFATHER — RAN ONCE, 2026-11-25. DO NOT RUN AGAIN.
+--     Every student who was already in stayed in: all existing
+--     'pending review' rows became 'approved' on that one run.
+--     The old header claimed a second run "updates zero rows" —
+--     that is FALSE: any student who signed up and went pending
+--     AFTER the first run would be mass-approved here with no ID
+--     review. The statement below is commented out on purpose.
+--     New students are reviewed from 'pending review' through
+--     review_verification() only. (In the SQL Editor auth.uid()
+--     is null, so the update trigger in section 4 steps aside for
+--     this statement — that is why the original was dangerous.)
 -- ---------------------------------------------------------------------------
-update public.verifications set status = 'approved' where status = 'pending review';
+-- update public.verifications set status = 'approved' where status = 'pending review';
+-- ^^^ DISABLED — see above. Never uncomment this line.

@@ -5,7 +5,7 @@ import { EmptyState, PrimaryButton } from "../components/ui";
 import { ListingCard } from "../components/ListingCard";
 import { fetchActiveListings, sortListings, visibleTo } from "../lib/listings";
 
-export default function Home({ user, verification }) {
+export default function Home({ verification }) {
   const navigate = useNavigate();
   const [listings, setListings] = useState([]);
   const [loadingListings, setLoadingListings] = useState(true);
@@ -44,7 +44,11 @@ export default function Home({ user, verification }) {
   // states never appear here.
   const visible = listings.filter((l) => visibleTo(l, myState));
   const nearYou = sortListings(visible.filter((l) => l.state === myState));
-  const justDropped = sortListings(visible);
+  // Milestone 20 (APP-16): "Just dropped" must not repeat the
+  // near-you items above it — the same listing used to show twice
+  // on one screen.
+  const nearYouIds = new Set(nearYou.map((l) => l.id));
+  const justDropped = sortListings(visible.filter((l) => !nearYouIds.has(l.id)));
 
   return (
     <div className="space-y-8">
@@ -74,18 +78,6 @@ export default function Home({ user, verification }) {
             Search
           </button>
         </form>
-        {!user ? (
-          <div className="mt-4 flex flex-wrap gap-2">
-            <Link to="/verify">
-              <PrimaryButton>Join — get verified</PrimaryButton>
-            </Link>
-            <Link to="/signin">
-              <span className="inline-flex items-center rounded-full border border-neutral-300 px-4 py-2.5 text-sm font-semibold dark:border-neutral-700">
-                Sign in
-              </span>
-            </Link>
-          </div>
-        ) : null}
       </section>
 
       <section>

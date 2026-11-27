@@ -7,7 +7,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
-import { getVerification } from "../lib/store";
 import { useAuth } from "../lib/auth";
 import { SAFE_MEETUP_SPOTS } from "../lib/data";
 import { formatNaira } from "../lib/fees";
@@ -22,6 +21,7 @@ import {
   fetchParticipantsVerified,
   fetchPickupTickets,
   getLastChatError,
+  hasOpenOrderForConversation,
   markRead,
   respondOffer,
   schedulePickup,
@@ -41,10 +41,9 @@ function timeAgo(iso) {
   });
 }
 
-export default function ChatThread() {
+export default function ChatThread({ verification }) {
   const { id } = useParams();
   const { user } = useAuth();
-  const verification = getVerification();
   const [conversation, setConversation] = useState(null);
   const [messages, setMessages] = useState([]);
   const [tickets, setTickets] = useState([]);
@@ -55,6 +54,11 @@ export default function ChatThread() {
   // the seller's own view of a buyer — and never while the seller
   // is still approved.
   const [sellerNoLongerVerified, setSellerNoLongerVerified] = useState(false);
+  // Milestone 20 (D-1): true when an open order exists between the
+  // two participants for this conversation's listing. Plain messages
+  // stay open for that order (the note below says so, and the
+  // message box stays enabled); offers and meetups stay paused.
+  const [hasOpenOrder, setHasOpenOrder] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [draft, setDraft] = useState("");
@@ -111,6 +115,10 @@ export default function ChatThread() {
           setLoading(false);
           return;
         }
+        // A transient fetch failure above sets notFound — clear it
+        // on a good fetch, or one bad poll latches "Chat not found"
+        // forever even after later polls succeed.
+        setNotFound(false);
         setConversation(conv);
         setLoading(false);
         if (conv.buyer_id !== user.id && conv.seller_id !== user.id) return;
@@ -129,15 +137,22 @@ export default function ChatThread() {
         // unknown answer (RPC not run yet, or no row back) leaves
         // the note off — the send/offer/pickup gates still refuse
         // the write, and the database triggers are the backstop.
+        // Milestone 20 (D-1): also ask whether an open order
+        // exists for this chat — plain messages stay open for it.
         if (conv.buyer_id === user.id && conv.seller_id) {
-          const verified = await fetchParticipantsVerified([conv.seller_id]);
+          const [verified, openOrder] = await Promise.all([
+            fetchParticipantsVerified([conv.seller_id]),
+            hasOpenOrderForConversation(id, user.id),
+          ]);
           if (!cancelled) {
             setSellerNoLongerVerified(
               conv.seller_id in verified && verified[conv.seller_id] !== true
             );
+            setHasOpenOrder(openOrder);
           }
         } else if (!cancelled) {
           setSellerNoLongerVerified(false);
+          setHasOpenOrder(await hasOpenOrderForConversation(id, user.id));
         }
         const newestId = msgs.length ? msgs[msgs.length - 1].id : null;
         if (newestId !== lastMarkedId.current) {
@@ -159,8 +174,16 @@ export default function ChatThread() {
   }, [user, id]);
 
   async function refreshMessages() {
-    setMessages(await fetchMessages(id));
-    markRead(id, user.id).catch(() => {});
+    // Milestone 20 (APP-13): a failed refresh after a send must
+    // never throw out of the send handler — the message was already
+    // sent, so the refresh failing only means the list is stale
+    // until the next 10s poll.
+    try {
+      setMessages(await fetchMessages(id));
+      markRead(id, user.id).catch(() => {});
+    } catch {
+      // Stale list until the next poll — nothing to show.
+    }
   }
 
   async function handleSend(e) {
@@ -187,6 +210,9 @@ export default function ChatThread() {
 
   async function handleOffer(e) {
     e.preventDefault();
+    // No in-flight guard before: a double-tap sent the same offer
+    // twice (the disabled button only helps after a re-render).
+    if (sending) return;
     const amount = Math.round(Number(offerAmount) || 0);
     if (amount <= 0) {
       setError("Enter an offer amount above ₦0.");
@@ -224,7 +250,11 @@ export default function ChatThread() {
         setError(getLastChatError() || "Could not update the offer. Try again.");
         return;
       }
-      const conv = await fetchConversation(id);
+      // A failed re-read after a successful response used to throw
+      // out of this handler (unhandled rejection, no message shown)
+      // even though the offer had already been updated — the next
+      // 10s poll repairs the display, so swallow it here.
+      const conv = await fetchConversation(id).catch(() => null);
       if (conv) setConversation(conv);
       refreshMessages();
     } finally {
@@ -238,7 +268,10 @@ export default function ChatThread() {
       setError("Pick a spot, a date and a time for the meetup.");
       return;
     }
-    // A meetup in the past used to save without complaint.
+    // A meetup in the past used to save without complaint — and the
+    // old check only compared the DATE: "today at 08:00" saved fine
+    // at 15:00. Compare the full date + time against now.
+    const now = new Date();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const picked = new Date(`${date}T00:00:00`);
@@ -248,6 +281,11 @@ export default function ChatThread() {
     }
     if (picked < today) {
       setError("That date is in the past — pick a date from today onwards.");
+      return;
+    }
+    const pickedAt = new Date(`${date}T${time}:00`);
+    if (!Number.isNaN(pickedAt.getTime()) && pickedAt < now) {
+      setError("That time is in the past — pick a later time today or another day.");
       return;
     }
     if (picked.getTime() - today.getTime() > 90 * 24 * 60 * 60 * 1000) {
@@ -394,15 +432,17 @@ export default function ChatThread() {
       {/* Milestone 19: buyer-only. Shown only when the other party
           is the seller and that seller is no longer a verified
           student (rejected later, or flagged). Never shown for a
-          buyer, and never while the seller is still approved. New
-          messages, offers and meetups are paused for this chat;
-          any order already placed still runs to completion. */}
+          buyer, and never while the seller is still approved.
+          Milestone 20 (D-1): when an open order exists for this
+          chat, plain messages still work for that order — only new
+          offers and meetups are paused. */}
       {sellerNoLongerVerified ? (
         <div className="rounded-2xl border border-neutral-300 bg-neutral-100 p-4 text-sm dark:border-neutral-700 dark:bg-neutral-900">
           <p className="font-bold">This seller is no longer verified</p>
           <p className="mt-1 text-neutral-500">
-            New messages, offers and meetups are paused for this chat. Any order you already
-            placed will still run to completion.
+            {hasOpenOrder
+              ? "Messages still work for your open order, so you can arrange delivery with the seller. New offers and meetups are paused for this chat."
+              : "New messages, offers and meetups are paused for this chat. Any order you already placed will still run to completion."}
           </p>
         </div>
       ) : null}
@@ -492,7 +532,10 @@ export default function ChatThread() {
         ))}
       </div>
 
-      {/* Message input */}
+      {/* Message input — Milestone 20 (D-1): stays open while an
+          open order exists for this chat, even when the seller is
+          no longer verified, so delivery can still be coordinated.
+          Offers and meetups below stay paused. */}
       <form onSubmit={handleSend} className="flex gap-2">
         <input
           className={inputCls}
@@ -500,9 +543,9 @@ export default function ChatThread() {
           onChange={(e) => setDraft(e.target.value.slice(0, MAX_MESSAGE_LENGTH))}
           placeholder="Write a message…"
           maxLength={MAX_MESSAGE_LENGTH}
-          disabled={isBlocked || sellerNoLongerVerified}
+          disabled={isBlocked || (sellerNoLongerVerified && !hasOpenOrder)}
         />
-        <PrimaryButton type="submit" disabled={sending || !draft.trim() || isBlocked || sellerNoLongerVerified}>
+        <PrimaryButton type="submit" disabled={sending || !draft.trim() || isBlocked || (sellerNoLongerVerified && !hasOpenOrder)}>
           Send
         </PrimaryButton>
       </form>

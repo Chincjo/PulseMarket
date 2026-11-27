@@ -154,6 +154,46 @@ export async function fetchParticipantsVerified(userIds) {
   return out;
 }
 
+// Milestone 20 (D-1): is there an OPEN order between these two
+// students for this conversation's listing? Open = reserved, paid,
+// held, shipped or delivered — an order already placed, in either
+// direction (the buyer/seller roles are fixed per order, but the
+// caller may be either side). RLS lets a participant read their own
+// orders, so this query only ever sees orders the caller is part of.
+// Used by the verification gate (plain messages stay open) and by
+// ChatThread (the note + the message box) — never for offers,
+// offer answers or pickup tickets, which stay blocked.
+export const OPEN_ORDER_STATUSES = [
+  "reserved",
+  "paid",
+  "held",
+  "shipped",
+  "delivered",
+];
+
+export async function hasOpenOrderForConversation(conversationId, userId) {
+  if (!supabase || !conversationId || !userId) return false;
+  const conv = await fetchConversation(conversationId);
+  if (!conv || !conv.listing_id) return false;
+  const otherId =
+    conv.buyer_id === userId ? conv.seller_id : conv.buyer_id;
+  if (!otherId || otherId === userId) return false;
+  const { data, error } = await supabase
+    .from("orders")
+    .select("id")
+    .eq("listing_id", conv.listing_id)
+    .in("status", OPEN_ORDER_STATUSES)
+    .or(
+      `and(buyer_id.eq.${userId},seller_id.eq.${otherId}),and(buyer_id.eq.${otherId},seller_id.eq.${userId})`
+    )
+    .limit(1);
+  if (error) {
+    dbError(error, "check open order for chat");
+    return false;
+  }
+  return (data || []).length > 0;
+}
+
 // Milestone 19 gate: the plain reason new activity in this
 // conversation must stop, or null when it may go ahead. Refuses
 // when EITHER participant's verification is not status='approved'
@@ -165,13 +205,27 @@ export async function fetchParticipantsVerified(userIds) {
 // yet) does NOT refuse here — the database triggers are the
 // backstop for that side, and refusing on "unknown" would block
 // every chat until the Milestone 19 SQL runs.
-async function verificationGateRefusal(conversationId, userId) {
+//
+// Milestone 20 (D-1): when `plainMessage` is true (a kind='text'
+// message only — never an offer) AND an open order exists between
+// the two participants for this conversation's listing, the gate
+// does NOT refuse: the buyer and seller still need to coordinate
+// delivery of an order already placed. Offers, offer answers and
+// pickup tickets never pass plainMessage, so they stay blocked.
+async function verificationGateRefusal(
+  conversationId,
+  userId,
+  { plainMessage = false } = {}
+) {
   if (!conversationId || !userId) return null;
   const conv = await fetchConversation(conversationId);
   if (!conv) return null;
   const otherId =
     conv.buyer_id === userId ? conv.seller_id : conv.buyer_id;
   if (!otherId || otherId === userId) return null;
+  if (plainMessage && (await hasOpenOrderForConversation(conversationId, userId))) {
+    return null;
+  }
   const mine = await fetchVerification(userId);
   if (!mine) {
     return "Only verified students can chat. Get verified first.";
@@ -248,24 +302,18 @@ export async function startConversation(listing) {
   }
 
   // Seller chose verified-only chat: the buyer must be verified.
-  // (The buyer is verified by the check above, but keep the rule explicit
-  // so it still holds if the checks are ever reordered.)
-  const sellerVerification = await fetchVerification(listing.seller_id);
-  // A flagged seller is under team review too: no new chats with
-  // them either, matching the database rule (which refuses a new
-  // conversation when either side is flagged).
-  if (sellerVerification?.flagged) {
-    return {
-      conversation: null,
-      error: "This seller's account is under review — contact support before starting a new chat.",
-    };
-  }
-  if (sellerVerification?.chat_verified_only && !buyerVerification) {
-    return {
-      conversation: null,
-      error: "This seller only chats with verified students.",
-    };
-  }
+  // That is enforced by the approved check above (this function
+  // already returned unless the buyer is approved), so there is no
+  // separate check here — the old one tested !buyerVerification,
+  // which is always truthy at this point and could never fire.
+  // The seller's side (flagged / later-rejected) is enforced
+  // server-side by the conversation-insert trigger — the app cannot
+  // read another student's verification row at all (the SELECT
+  // policy only lets a student read their own row, so
+  // fetchVerification(seller) always comes back empty; the old
+  // flagged check here could never fire either). Do not "fix" it
+  // back in: use fetchParticipantsVerified() if the seller's status
+  // is ever needed in the app.
 
   if (await isBlockedBetween(buyerId, listing.seller_id)) {
     return {
@@ -429,7 +477,7 @@ export async function fetchConversationForListing(listingId, userId) {
   if (!supabase || !listingId || !userId) return null;
   const { data, error } = await supabase
     .from("conversations")
-    .select("id")
+    .select("id, agreed_price")
     .eq("listing_id", listingId)
     .or(`buyer_id.eq.${userId},seller_id.eq.${userId}`)
     .order("last_message_at", { ascending: false, nullsFirst: false })
@@ -487,14 +535,25 @@ async function insertMessage(conversationId, row) {
   // logged, matching the blocked refusal above. The 1000-char cap
   // and the 2s throttle below are untouched. This is the shared
   // choke point for sendMessage AND sendOffer (both insert here).
-  const gateRefusal = await verificationGateRefusal(conversationId, senderId);
+  // Milestone 20 (D-1): a PLAIN text message (kind 'text') is
+  // exempt from the gate while an open order exists between the two
+  // participants for this conversation's listing, so delivery can
+  // still be coordinated. Offers (kind 'offer') never get the
+  // exemption — they stay blocked.
+  const gateRefusal = await verificationGateRefusal(conversationId, senderId, {
+    plainMessage: row.kind === "text",
+  });
   if (gateRefusal) {
     lastGateError = gateRefusal;
     return dbError(gateRefusal, "send message");
   }
   // Spam throttle: one send per device every 2 seconds. The clock only
   // moves after a send succeeds, so a failed send never blocks a retry.
+  // Milestone 20 (APP-15): the refusal is kept for ChatThread
+  // (getLastChatError) like the gate refusal above, instead of only
+  // being logged — a refused send used to show a generic failure.
   if (Date.now() - lastSendAt < SEND_THROTTLE_MS) {
+    lastGateError = "Too fast — wait a moment before sending again.";
     console.error("[PulseMarket] send message: too fast — wait a moment before sending again.");
     return null;
   }
@@ -522,6 +581,10 @@ export async function sendMessage(conversationId, body) {
   const text = String(body || "").trim();
   if (!text) return null;
   if (text.length > MAX_MESSAGE_LENGTH) {
+    // Milestone 20 (APP-15): keep the reason for ChatThread
+    // (getLastChatError) — a too-long message used to show only a
+    // generic "could not send".
+    lastGateError = `Message is too long — keep it under ${MAX_MESSAGE_LENGTH} characters.`;
     return dbError(
       `Message is too long — keep it under ${MAX_MESSAGE_LENGTH} characters.`,
       "send message"
@@ -532,7 +595,9 @@ export async function sendMessage(conversationId, body) {
   // Blocked in either direction: startConversation() only stops NEW
   // chats, so without this a blocked student could keep messaging in
   // a chat that already exists. Refuse before anything is inserted.
+  // Milestone 20 (APP-15): keep the reason for ChatThread.
   if (await blockedWithOther(conversationId, senderId)) {
+    lastGateError = "You cannot message this student.";
     return dbError("You cannot message this student.", "send message");
   }
   const sent = await insertMessage(conversationId, { body: text, kind: "text" });
@@ -591,6 +656,7 @@ export async function sendOffer(conversationId, amount) {
   const senderId = await currentUserId();
   if (!senderId) return null;
   if (await blockedWithOther(conversationId, senderId)) {
+    lastGateError = "You cannot message this student.";
     return dbError("You cannot message this student.", "send offer");
   }
   const sent = await insertMessage(conversationId, {
@@ -647,6 +713,7 @@ export async function respondOffer(messageId, decision) {
   // stopping a blocked student from answering an offer — if the
   // check itself errors, refuse rather than let the answer through.
   if (await blockedWithOther(msg.conversation_id, me, { failClosed: true })) {
+    lastGateError = "You cannot message this student.";
     dbError("You cannot message this student.", "respond to offer");
     return false;
   }
@@ -662,23 +729,42 @@ export async function respondOffer(messageId, decision) {
     dbError(gateRefusal, "respond to offer");
     return false;
   }
-  const { error } = await supabase
-    .from("messages")
-    .update({ offer_status: decision })
-    .eq("id", messageId);
-  if (error) {
-    dbError(error, "respond to offer");
-    return false;
-  }
-  if (decision === "accepted" && msg.offer_amount) {
-    const { error: convError } = await supabase
-      .from("conversations")
-      .update({ agreed_price: msg.offer_amount })
-      .eq("id", msg.conversation_id);
-    if (convError) {
-      dbError(convError, "set agreed price");
+  // Milestone 20 (M-24): answer the offer in ONE database move —
+  // the respond_offer RPC flips the offer and sets (or clears)
+  // conversations.agreed_price in a single transaction, so an
+  // accepted offer can never end up with no agreed price. The RPC
+  // lives in the Milestone 20 SQL; until that SQL runs it does not
+  // exist, so fall back to the legacy two-step path below — but
+  // ONLY when the RPC is missing (PGRST202 / 42883). Any other
+  // error — including a gate refusal from inside the RPC — is a
+  // real refusal and is returned as-is, never retried as a legacy
+  // write.
+  let usedRpc = false;
+  try {
+    const { error: rpcError } = await supabase.rpc("respond_offer", {
+      p_message_id: messageId,
+      p_status: decision,
+    });
+    if (rpcError) throw rpcError;
+    usedRpc = true;
+  } catch (err) {
+    const code = String(err?.code || "");
+    const message = String(err?.message || "");
+    const rpcMissing =
+      code === "PGRST202" ||
+      code === "42883" ||
+      /could not find the function/i.test(message) ||
+      /function .*respond_offer.* does not exist/i.test(message);
+    if (!rpcMissing) {
+      lastGateError = message || "Could not update the offer. Try again.";
+      dbError(err, "respond to offer");
       return false;
     }
+    // RPC not switched on yet — the legacy path below runs instead.
+  }
+  if (!usedRpc) {
+    const legacyOk = await respondOfferLegacy(msg, decision);
+    if (!legacyOk) return false;
   }
   // Milestone 10: tell the student who made the offer.
   if (msg.sender_id) {
@@ -691,6 +777,85 @@ export async function respondOffer(messageId, decision) {
     });
   }
   lastGateError = "";
+  return true;
+}
+
+// The pre-Milestone-20 two-step answer: flip the offer (guarded so
+// only the first of two racing answers lands), then set or clear
+// the agreed price. Used only while the respond_offer RPC does not
+// exist yet — see respondOffer above.
+async function respondOfferLegacy(msg, decision) {
+  const messageId = msg.id;
+  const { data: updated, error } = await supabase
+    .from("messages")
+    .update({ offer_status: decision })
+    .eq("id", messageId)
+    .eq("offer_status", "pending")
+    .select("id");
+  if (error) {
+    dbError(error, "respond to offer");
+    return false;
+  }
+  // The pending guard above is the race guard: two answers racing
+  // each other — only the first one updates a row. Zero rows means
+  // the offer was already answered (or withdrawn) before this tap.
+  if (!updated || updated.length === 0) {
+    dbError("This offer was already answered.", "respond to offer");
+    return false;
+  }
+  if (decision === "accepted" && msg.offer_amount) {
+    // The offer is accepted already — the agreed price must follow.
+    // Retry the price write once: a single failed write used to
+    // leave an accepted offer with no agreed price and no way to
+    // retry (the offer is no longer pending). A still-failing write
+    // is a real problem, so say so plainly instead of pretending
+    // the price was set.
+    let convError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await supabase
+        .from("conversations")
+        .update({ agreed_price: msg.offer_amount })
+        .eq("id", msg.conversation_id);
+      convError = res.error || null;
+      if (!convError) break;
+    }
+    if (convError) {
+      dbError(convError, "set agreed price");
+      return false;
+    }
+  }
+  // (M21 §13, legacy mirror of the respond_offer RPC) Accepting one
+  // offer answers the other pending offers the other student sent
+  // in this conversation, so only one offer can stand accepted at
+  // a time. Best effort: the accept already landed, so a failed
+  // cleanup is logged, never thrown. Only the other student's
+  // offers are declined — the message trigger refuses answering
+  // your own offer.
+  if (decision === "accepted") {
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (user?.id) {
+        await supabase
+          .from("messages")
+          .update({ offer_status: "declined" })
+          .eq("conversation_id", msg.conversation_id)
+          .eq("kind", "offer")
+          .eq("offer_status", "pending")
+          .neq("id", messageId)
+          .neq("sender_id", user.id);
+      }
+    } catch (err) {
+      console.error(
+        "[PulseMarket] Could not decline other pending offers:",
+        err?.message || err
+      );
+    }
+  }
+  // A decline flips the message only. A pending offer never set the
+  // agreed price, so nothing is cleared: an agreed price equal to
+  // this amount belongs to a different accepted offer and must stay.
   return true;
 }
 
@@ -755,6 +920,7 @@ export async function schedulePickup(conversationId, { spot, date, time }) {
     return dbError("You can only plan a meetup for your own chat.", "schedule pickup");
   }
   if (await blockedWithOther(conversationId, me)) {
+    lastGateError = "You cannot message this student.";
     return dbError("You cannot message this student.", "schedule pickup");
   }
   // Milestone 19: a meetup cannot be planned in a chat where

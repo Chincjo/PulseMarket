@@ -4,6 +4,7 @@
 // shows an honest "not switched on yet" message instead of crashing.
 import { supabase } from "./supabase";
 import { OWNER_EMAIL } from "./payments";
+import { assertRealPhoto } from "./shipping";
 import {
   CATEGORIES,
   CONDITIONS,
@@ -45,13 +46,6 @@ const LISTING_COURIERS = [
   "DHL Domestic",
   "Bus Park Waybill",
 ];
-
-async function currentUserId() {
-  if (!supabase) return null;
-  const { data, error } = await supabase.auth.getUser();
-  if (error) return null;
-  return data?.user?.id || null;
-}
 
 // Validate the VALUES of listing fields present in `patch` and return
 // a cleaned copy (price normalised to a whole number). Throws a plain
@@ -183,32 +177,50 @@ function dbError(err, where) {
 // ---------------------------------------------------------------------------
 
 export async function fetchVerificationRow(userId) {
-  if (!supabase || !userId) return null;
+  const { row } = await fetchVerificationRowChecked(userId);
+  return row;
+}
+
+// Milestone 22: same read as fetchVerificationRow, but the caller can
+// tell a failed read apart from "no row". That matters before a
+// submit: a failed read used to look exactly like a first-time
+// submitter, so an already-approved student could re-submit photos
+// and end up "pending review" on the device while the team still saw
+// the old row. Callers that only need the row keep using
+// fetchVerificationRow above.
+export async function fetchVerificationRowChecked(userId) {
+  if (!supabase || !userId) return { row: null, failed: true };
   const { data, error } = await supabase
     .from("verifications")
     .select("*")
     .eq("user_id", userId)
     .maybeSingle();
-  if (error) return dbError(error, "fetch verification");
-  if (!data) return null;
+  if (error) {
+    dbError(error, "fetch verification");
+    return { row: null, failed: true };
+  }
+  if (!data) return { row: null, failed: false };
   return {
-    userId: data.user_id,
-    email: null,
-    university: data.university,
-    studentEmail: data.student_email,
-    studentId: data.student_id,
-    status: data.status,
-    inviteCode: data.invite_code,
-    submittedAt: data.created_at,
-    // Storage paths in the private verification-ids bucket (see
-    // VERIFICATION_IDS_BUCKET above), or null when no photos are on
-    // file — e.g. a student who verified before Milestone 17.
-    idFrontUrl: data.id_front_url || null,
-    idBackUrl: data.id_back_url || null,
-    // Milestone 19: why the team rejected this student (fixed list)
-    // and their optional short note — null unless rejected.
-    rejectionReason: data.rejection_reason || null,
-    rejectionNote: data.rejection_note || null,
+    row: {
+      userId: data.user_id,
+      email: null,
+      university: data.university,
+      studentEmail: data.student_email,
+      studentId: data.student_id,
+      status: data.status,
+      inviteCode: data.invite_code,
+      submittedAt: data.created_at,
+      // Storage paths in the private verification-ids bucket (see
+      // VERIFICATION_IDS_BUCKET above), or null when no photos are on
+      // file — e.g. a student who verified before Milestone 17.
+      idFrontUrl: data.id_front_url || null,
+      idBackUrl: data.id_back_url || null,
+      // Milestone 19: why the team rejected this student (fixed list)
+      // and their optional short note — null unless rejected.
+      rejectionReason: data.rejection_reason || null,
+      rejectionNote: data.rejection_note || null,
+    },
+    failed: false,
   };
 }
 
@@ -348,6 +360,42 @@ export async function uploadVerificationIdPhotos(userId, frontFile, backFile) {
     if (file.size > MAX_VERIFICATION_PHOTO_MB * 1024 * 1024) {
       throw new Error(
         `That photo is too big — keep ID photos under ${MAX_VERIFICATION_PHOTO_MB}MB.`
+      );
+    }
+    // The MIME check above is skipped when a file carries no type
+    // at all, so a renamed document could sail through as an ID
+    // photo. The magic-byte check catches it — same check as the
+    // listing and waybill photos.
+    await assertRealPhoto(file, `ID ${side}`);
+  }
+  // Milestone 20 (APP-12): the front and back photos must be two
+  // different files — the same photo twice used to sail through
+  // (the server RPC only compares the stored URLs, which are always
+  // different paths). Same object, or byte-for-byte the same file,
+  // is refused before anything is uploaded.
+  if (frontFile === backFile) {
+    throw new Error(
+      "The front and back photos must be different files — add a photo of each side of your ID."
+    );
+  }
+  if (
+    frontFile.size === backFile.size &&
+    typeof frontFile.arrayBuffer === "function" &&
+    typeof backFile.arrayBuffer === "function"
+  ) {
+    const [frontBytes, backBytes] = await Promise.all([
+      frontFile.arrayBuffer(),
+      backFile.arrayBuffer(),
+    ]);
+    const a = new Uint8Array(frontBytes);
+    const b = new Uint8Array(backBytes);
+    let same = a.length === b.length;
+    for (let i = 0; same && i < a.length; i++) {
+      if (a[i] !== b[i]) same = false;
+    }
+    if (same) {
+      throw new Error(
+        "The front and back photos must be different files — add a photo of each side of your ID."
       );
     }
   }
@@ -613,7 +661,7 @@ export async function createListingRow(row) {
   // unchecked.
   const { data: verification, error: verificationError } = await supabase
     .from("verifications")
-    .select("user_id, status, flagged")
+    .select("user_id, university, status, flagged")
     .eq("user_id", row.seller_id)
     .maybeSingle();
   if (verificationError) {
@@ -704,6 +752,19 @@ export async function createListingRow(row) {
   if (!UNIVERSITY_NAMES.includes(clean.university)) {
     throw new Error("Choose your university from the list.");
   }
+  // Milestone 22: the university is locked at verification. A
+  // UNIPORT-verified student used to be able to post as "University
+  // of Lagos" — the listing then showed the wrong state, state
+  // filtering and same-state rules broke, and the shipping zone was
+  // priced from the spoofed state. The database trigger is the
+  // backstop (milestone-22.sql); this refuses it in the app first.
+  if (clean.university !== verification.university) {
+    throw new Error(
+      "A listing must use your verified university — you verified as a student of " +
+        verification.university +
+        "."
+    );
+  }
   if (universityState(clean.university) !== clean.state) {
     throw new Error("The state does not match that university.");
   }
@@ -726,6 +787,57 @@ export async function createListingRow(row) {
     .single();
   if (error) throw error;
   return data;
+}
+
+// How many orders are still open on a listing (reserved, paid,
+// held, shipped or delivered). Count, don't fetch: the old code
+// fetched the first 100 orders, so a listing with more than 100
+// orders could be put back to active while a live order sat past
+// the first page.
+export async function fetchOpenOrderCount(listingId) {
+  if (!supabase || !listingId) return 0;
+  const { count, error } = await supabase
+    .from("orders")
+    .select("id", { count: "exact", head: true })
+    .eq("listing_id", listingId)
+    .in("status", ["reserved", "paid", "held", "shipped", "delivered"]);
+  if (error) throw error;
+  return count || 0;
+}
+
+// Whether a non-seller participant may move a listing's status, for
+// the status-only path in updateListing() (Milestone 22). The move
+// must match the caller's own order on this listing: 'reserved'
+// while their order is reserved/paid (placing the order), 'sold'
+// once it is delivered/released (confirming delivery / releasing
+// the money), and 'active' once it is cancelled/refunded — and
+// only when no other open order sits on the listing, so a past
+// buyer cannot free a listing while another buyer's order is open.
+// A caller with no order on the listing may not move it at all.
+async function statusMoveAllowedForParticipant(listingId, callerId, targetStatus) {
+  if (!supabase || !listingId || !callerId) return false;
+  const { data, error } = await supabase
+    .from("orders")
+    .select("id, status")
+    .eq("listing_id", listingId)
+    .eq("buyer_id", callerId);
+  if (error) return false;
+  const statuses = (data || []).map((o) => o.status);
+  if (targetStatus === "reserved") {
+    return statuses.some((s) => s === "reserved" || s === "paid");
+  }
+  if (targetStatus === "sold") {
+    return statuses.some((s) => s === "delivered" || s === "released");
+  }
+  if (targetStatus === "active") {
+    if (!statuses.some((s) => s === "cancelled" || s === "refunded")) return false;
+    try {
+      return (await fetchOpenOrderCount(listingId)) === 0;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 export async function updateListing(id, patch, opts = {}) {
@@ -772,16 +884,47 @@ export async function updateListing(id, patch, opts = {}) {
   // paid, delivered or cancelled) made by whichever side the order
   // flow runs as — the database trigger and the listing policies
   // still decide who may move it. Any other change is an edit, and
-  // only the seller makes those: before this fix any caller could
-  // rewrite another student's price, university or state, or set a
-  // free boost, straight through this helper.
+  // only the seller — or the PulseMarket team, who fix listings by
+  // hand — makes those: before this fix any caller could rewrite
+  // another student's price, university or state, or set a free
+  // boost, straight through this helper. (Milestone 20, APP-10:
+  // the team account is now allowed too; order participants still
+  // only move the status through the order flows, never edit.)
+  // Milestone 22: a status-only patch by anyone who is NOT the
+  // seller or the team used to skip the ownership check entirely,
+  // so a buyer from a cancelled order months ago could flip a live
+  // listing to 'sold' (or a reserved one back to 'active') just by
+  // calling this helper. The move must now match the caller's own
+  // order on this listing: 'reserved' only while their order is
+  // reserved/paid, 'sold' only once it is delivered/released, and
+  // 'active' only once it is cancelled/refunded with no other open
+  // order on the listing. The database trigger enforces the same
+  // mapping (milestone-22.sql); this refuses it in the app first.
   const keys = Object.keys(clean);
   const isStatusOnly = keys.length === 1 && keys[0] === "status";
+  if (isStatusOnly) {
+    const listing = await fetchListing(id);
+    if (!listing) throw new Error("Listing not found.");
+    const { data: authData } = await supabase.auth.getUser();
+    const caller = authData?.user || null;
+    const isOwner = caller?.email === OWNER_EMAIL;
+    if (caller && (isOwner || caller.id === listing.seller_id)) {
+      // Seller / team: any status move the trigger allows.
+    } else {
+      if (!caller) throw new Error("Sign in first to change a listing.");
+      const allowed = await statusMoveAllowedForParticipant(id, caller.id, clean.status);
+      if (!allowed) {
+        throw new Error("Only the seller can change a listing's status.");
+      }
+    }
+  }
   if (!isStatusOnly) {
     const listing = await fetchListing(id);
     if (!listing) throw new Error("Listing not found.");
-    const userId = await currentUserId();
-    if (!userId || userId !== listing.seller_id) {
+    const { data: authData } = await supabase.auth.getUser();
+    const caller = authData?.user || null;
+    const isOwner = caller?.email === OWNER_EMAIL;
+    if (!caller || (!isOwner && caller.id !== listing.seller_id)) {
       throw new Error("Only the seller can edit this listing.");
     }
   }
@@ -804,16 +947,10 @@ export async function updateListing(id, patch, opts = {}) {
 // the order cancelled first, so no open order remains by then).
 export async function reactivateListing(id) {
   if (!supabase || !id) throw new Error("Missing listing.");
-  const { data: orders, error } = await supabase
-    .from("orders")
-    .select("id, status")
-    .eq("listing_id", id)
-    .limit(100);
-  if (error) throw error;
-  const open = (orders || []).filter((o) =>
-    ["reserved", "paid", "held", "shipped", "delivered"].includes(o.status)
-  );
-  if (open.length > 0) {
+  // Count, don't fetch (see fetchOpenOrderCount): a listing with
+  // more than 100 orders could otherwise be put back to active
+  // while a live order sat past the first page.
+  if ((await fetchOpenOrderCount(id)) > 0) {
     throw new Error(
       "This item has an open order on it — it stays reserved until that order is cancelled, delivered or refunded."
     );
@@ -827,15 +964,17 @@ export async function deleteListing(id) {
   // (and their handoff, checkpoints and evidence) is deleted too.
   // Refuse while any live order history exists — a seller with an
   // order on the listing marks it sold instead. Only a listing whose
-  // orders were all cancelled may be deleted.
-  const { data: orders, error: ordersError } = await supabase
+  // orders were all cancelled may be deleted. Count, don't fetch:
+  // the old code fetched the first 100 orders, so a listing with
+  // more than 100 orders could be deleted while a live order sat
+  // past the first page.
+  const { count, error: ordersError } = await supabase
     .from("orders")
-    .select("id, status")
+    .select("id", { count: "exact", head: true })
     .eq("listing_id", id)
-    .limit(100);
+    .neq("status", "cancelled");
   if (ordersError) throw ordersError;
-  const blocking = (orders || []).filter((o) => o.status !== "cancelled");
-  if (blocking.length > 0) {
+  if ((count || 0) > 0) {
     throw new Error(
       "This listing has orders on it — mark it sold instead of deleting it, so the order history stays."
     );
@@ -848,7 +987,11 @@ export async function duplicateListing(listing) {
   const copy = {
     seller_id: listing.seller_id,
     seller_label: listing.seller_label,
-    title: `${listing.title} (copy)`,
+    // "(copy)" is 7 characters — a title of 114+ characters would
+    // push the copy over the 120-character limit and
+    // createListingRow would refuse it. Truncate so a long-titled
+    // listing can still be duplicated.
+    title: `${listing.title} (copy)`.slice(0, 120),
     description: listing.description,
     price: listing.price,
     condition: listing.condition,
@@ -870,17 +1013,59 @@ export async function duplicateListing(listing) {
 
 export async function bumpViews(listing) {
   if (!supabase || !listing?.id) return;
+  // Read the live count first: the views number the caller passes
+  // in is whatever the page last rendered, and a crafted call could
+  // pass views=999999 and jump the count in one write. (Two viewers
+  // at the same instant can still lose one increment — views are
+  // cosmetic, not money.)
+  const fresh = await fetchListing(listing.id);
+  const current = fresh?.views ?? listing.views ?? 0;
   await supabase
     .from("listings")
-    .update({ views: (listing.views || 0) + 1 })
+    .update({ views: (current || 0) + 1 })
     .eq("id", listing.id);
 }
 
 // Boost: records the tier and the expiry. No money moves yet — boost
 // payment is demo until real payments go live (Milestone 6).
+//
+// Milestone 20 (M-2): a boost is no longer self-granted. The
+// purchase_boost RPC records a pending boost_purchases row (the team
+// confirms the payment in /admin, then the boost is applied), so a
+// seller can no longer set a free 72h boost by direct API and renew
+// it forever. The RPC lives in the Milestone 20 SQL; until that SQL
+// runs it does not exist, so fall back to the old direct update —
+// but ONLY when the RPC is missing (PGRST202 / 42883). Any other
+// error is re-thrown. On RPC success the listing is NOT boosted yet:
+// the plain message says so, and ListingDetail shows it instead of
+// "Boosted until …".
 export async function boostListing(id, tierAmount) {
   const tier = BOOST_TIERS.find((t) => t.amount === tierAmount);
   if (!tier) throw new Error("Unknown boost tier.");
+  try {
+    const { error: rpcError } = await supabase.rpc("purchase_boost", {
+      p_listing_id: id,
+      p_tier: tier.amount,
+    });
+    if (rpcError) throw rpcError;
+    const listing = await fetchListing(id);
+    return {
+      ...(listing || { id }),
+      boostRequested: true,
+      boostMessage:
+        "Boost requested — the team will confirm once payment is received.",
+    };
+  } catch (err) {
+    const code = String(err?.code || "");
+    const message = String(err?.message || "");
+    const rpcMissing =
+      code === "PGRST202" ||
+      code === "42883" ||
+      /could not find the function/i.test(message) ||
+      /function .*purchase_boost.* does not exist/i.test(message);
+    if (!rpcMissing) throw err;
+    // RPC not switched on yet — the old direct update runs instead.
+  }
   const boostedUntil = new Date(
     Date.now() + tier.hours * 60 * 60 * 1000
   ).toISOString();
@@ -892,6 +1077,101 @@ export async function boostListing(id, tierAmount) {
     },
     { allowBoost: true }
   );
+}
+
+// Milestone 20 (M-2): the team's boost queue — pending
+// boost_purchases rows, oldest first, so the earliest request is
+// confirmed first. Team only; the table and the RPC arrive with
+// the Milestone 20 SQL, so until then this throws and /admin shows
+// a plain note instead of a queue.
+export async function fetchBoostRequests() {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  await requireOwner();
+  const { data, error } = await supabase
+    .from("boost_purchases")
+    .select("*")
+    .eq("status", "pending_payment")
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+// Milestone 20 (M-2): confirm a pending boost purchase. Marks the
+// row 'paid', then applies the boost to the listing (same tier and
+// expiry the old direct path set). No bank details anywhere — the
+// team confirms the payment arrived by hand outside the app. If the
+// boost itself fails after the row is marked paid, the error says so
+// plainly and confirming again retries the boost (the row is
+// already paid, so it is not marked twice).
+export async function confirmBoostPurchase(row) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!row?.id) throw new Error("Missing boost request.");
+  await requireOwner();
+  const tierAmount =
+    row.boost_tier ?? row.tier ?? row.amount ?? row.tier_amount ?? null;
+  const tier = BOOST_TIERS.find((t) => t.amount === Number(tierAmount));
+  if (!tier || !row.listing_id) {
+    throw new Error(
+      "Boost request is missing its tier or listing — apply the boost by hand."
+    );
+  }
+  // Marking paid is the claim on this request: it must match a row
+  // still 'pending_payment', or a second confirm (double-tap, or two
+  // team members at once) would silently pass and re-apply the boost
+  // below. A retry after a FAILED apply still works: the row is
+  // already paid, so this update matches nothing — but the listing
+  // then carries no trace of this tier, so the apply runs again.
+  const { data: markedPaid, error: paidError } = await supabase
+    .from("boost_purchases")
+    .update({ status: "paid" })
+    .eq("id", row.id)
+    .eq("status", "pending_payment")
+    .select("id");
+  if (paidError) throw paidError;
+  const claimed = (markedPaid?.length || 0) > 0;
+  // A second confirm of the same request (double-tap, or two team
+  // members at once) must not extend the boost: the row is already
+  // 'paid', so the update above matched nothing — but the boost may
+  // already be live from the first confirm. Skip re-applying when
+  // the same tier is still running. A retry after a FAILED apply
+  // still works: the listing is not boosted then, so it applies.
+  const listing = await fetchListing(row.listing_id);
+  if (
+    listing &&
+    listing.boost_tier === tier.amount &&
+    listing.boosted_until &&
+    new Date(listing.boosted_until).getTime() > Date.now()
+  ) {
+    return true;
+  }
+  if (!claimed && listing && listing.boost_tier === tier.amount && listing.boosted_until) {
+    // Already paid AND this tier was already applied for this
+    // listing (its boost has since expired): confirming again
+    // would grant a fresh boost for free. Refuse plainly — the
+    // team can apply a new boost by hand if one is really needed.
+    // (A failed apply leaves no such trace on the listing, so a
+    // genuine retry still reaches the apply below.)
+    throw new Error(
+      "This boost was already confirmed and its boost has ended — confirming again would grant a new boost for free. Apply a new boost by hand if one is needed."
+    );
+  }
+  try {
+    await updateListing(
+      row.listing_id,
+      {
+        boost_tier: tier.amount,
+        boosted_until: new Date(
+          Date.now() + tier.hours * 60 * 60 * 1000
+        ).toISOString(),
+      },
+      { allowBoost: true }
+    );
+  } catch (err) {
+    throw new Error(
+      `Boost marked paid, but the boost itself did not apply (${err?.message || "try confirming again"}).`
+    );
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +1191,10 @@ export async function uploadListingPhotos(userId, dataUrls) {
     if (blob.size > 10 * 1024 * 1024) {
       throw new Error("That photo is too big — keep listing photos under 10MB.");
     }
+    // Milestone 20 (APP-10): the file must actually be a photo —
+    // a renamed video or document used to sail through on its MIME
+    // type alone. Same magic-byte check as the waybill photos.
+    await assertRealPhoto(blob, "listing");
     const path = `${userId}/${Date.now()}-${i}.jpg`;
     const { error } = await supabase.storage
       .from(LISTING_PHOTOS_BUCKET)

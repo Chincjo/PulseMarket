@@ -62,9 +62,12 @@ export default function Invite() {
         title="Could not load your invite code"
         body={error}
         action={
-          <Link to="/dashboard">
-            <GhostButton>Back to dashboard</GhostButton>
-          </Link>
+          <div className="flex flex-wrap justify-center gap-2">
+            <GhostButton onClick={() => window.location.reload()}>Try again</GhostButton>
+            <Link to="/dashboard">
+              <GhostButton>Back to dashboard</GhostButton>
+            </Link>
+          </div>
         }
       />
     );

@@ -102,6 +102,9 @@ export default function Notifications() {
       return;
     }
     try {
+      // Clear a stale error from an earlier failed load, or the
+      // banner stays up forever even after a later load succeeds.
+      setError("");
       const [notes, myOrders, myListings] = await Promise.all([
         fetchNotifications(user.id),
         fetchMyOrders(user.id),
@@ -125,10 +128,17 @@ export default function Notifications() {
   async function openItem(item) {
     if (!user) return;
     if (!item.is_read) {
-      await markRead(item.id, user.id);
-      setItems((prev) =>
-        prev.map((n) => (n.id === item.id ? { ...n, is_read: true } : n))
-      );
+      // A failed markRead used to throw out of this handler, so the
+      // tap did nothing at all — the notification never opened.
+      // Marking read is best-effort; always follow the link.
+      try {
+        await markRead(item.id, user.id);
+        setItems((prev) =>
+          prev.map((n) => (n.id === item.id ? { ...n, is_read: true } : n))
+        );
+      } catch {
+        // Still navigate below.
+      }
     }
     if (item.link) navigate(item.link);
   }
@@ -245,7 +255,7 @@ export default function Notifications() {
                 <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-300">
                   {isBuyer
                     ? releaseReminder(order, hoursLeft)
-                    : `The buyer confirmed delivery. ${formatNaira(order.item_price)} + shipping releases to your available balance in ${hoursLabel(hoursLeft)} unless the buyer opens a return first.`}
+                    : `The buyer confirmed delivery. ${formatNaira(order.item_price)} + shipping releases to your available balance ${hoursLeft != null ? `in ${hoursLabel(hoursLeft)}` : "48 hours after delivery"} unless the buyer opens a return first.`}
                 </p>
                 <p className="mt-2 text-sm">
                   <Link to={`/order/${order.id}`} className="font-semibold text-brown underline">

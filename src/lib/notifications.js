@@ -249,16 +249,22 @@ export async function fetchUnreadCount(userId) {
 
 export async function markRead(id, userId) {
   if (!supabase || !id || !userId) return false;
-  const { error } = await supabase
+  // Milestone 20 (APP-15): check the updated row count — the old
+  // code returned true whenever the update did not error, even when
+  // it matched nothing (already read, or someone else's row), so
+  // the unread badge could lie. Selecting the updated rows back
+  // proves one of this student's rows was actually marked.
+  const { data, error } = await supabase
     .from("notifications")
     .update({ is_read: true })
     .eq("id", id)
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .select("id");
   if (error) {
     dbError(error, "mark notification read");
     return false;
   }
-  return true;
+  return (data || []).length > 0;
 }
 
 export async function markAllRead(userId) {

@@ -35,9 +35,10 @@
 //   - orders whose delivered_at is less than 48 hours ago;
 //   - orders that are not 'delivered' at all.
 import { supabase } from "./supabase";
-import { fetchMyOrders, releaseOrder } from "./orders";
-import { OWNER_EMAIL } from "./payments";
+import { cancelOrder, fetchMyOrders, releaseOrder } from "./orders";
+import { logSecurityEvent } from "./handoff";
 import { notifyUser } from "./notifications";
+import { OWNER_EMAIL } from "./payments";
 
 export const AUTO_RELEASE_HOURS = 48;
 
@@ -147,28 +148,107 @@ export async function runAutoReleaseCheck(user) {
     try {
       await releaseOrder(order.id, SYSTEM_CALLER);
       result.released.push(order.code);
-      // Best-effort: tell both parties. notifyUser() goes through the
-      // insert_notification RPC, which allows it because the caller
-      // is a participant of this order. A refused insert returns null
-      // and changes nothing here.
-      notifyUser(order.buyer_id, {
-        kind: "release",
-        title: "Money released",
-        body: `48 hours passed since delivery, so the held money for order ${order.code} was released to the seller.`,
-        link: `/order/${order.id}`,
-        orderId: order.id,
-      });
-      notifyUser(order.seller_id, {
-        kind: "release",
-        title: "Money released",
-        body: `48 hours passed since delivery, so the held money for order ${order.code} is now in your available balance.`,
-        link: `/order/${order.id}`,
-        orderId: order.id,
-      });
+      // No notification here: releaseOrder's finishRelease already
+      // tells both parties. Notifying again used to send every
+      // auto-release twice (4 "Money released" rows per order).
     } catch (err) {
       result.skipped.push({
         code: order.code,
         reason: err?.message || "Release failed.",
+      });
+    }
+  }
+  return result;
+}
+
+// Milestone 20 (D-4): reservation expiry, app-side — cancel every
+// 'reserved' order older than 48h and free the listing, so a buyer
+// who ghosts after reserving can no longer brick the listing until
+// someone cancels by hand. There is no pg_cron, so this sweep runs
+// on sign-in and hourly next to runAutoReleaseCheck (see App.jsx).
+//
+// This is safe to run as the signed-in user: cancelOrder() lets the
+// buyer or the seller cancel from 'reserved' (the seller only while
+// still reserved) and puts the listing back to 'active', and a
+// reserved order holds no money, so no ledger move is needed.
+// A frozen order is skipped, never cancelled. Returns
+//   { cancelled: [orderCode, ...], skipped: [{ code, reason }, ...] }
+// and never throws: a per-order failure is recorded and the rest
+// still run. Both parties are told: cancelOrder() notifies the
+// OTHER side, and the sweep notifies the signed-in user too.
+export const RESERVATION_EXPIRY_HOURS = 48;
+
+export async function runReservationExpirySweep(user) {
+  const result = { cancelled: [], skipped: [] };
+  if (!supabase) return result;
+  let currentUser = user || null;
+  if (!currentUser) {
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data?.user) return result;
+    currentUser = data.user;
+  }
+  if (!currentUser?.id) return result;
+
+  // Same paging as runAutoReleaseCheck above: every page of the
+  // user's orders, capped at 50 pages so a broken cursor can never
+  // loop for ever.
+  let orders = [];
+  try {
+    let before = null;
+    for (let page = 0; page < 50; page++) {
+      const rows = await fetchMyOrders(
+        currentUser.id,
+        before ? { before } : {}
+      );
+      orders = orders.concat(rows || []);
+      if (rows?.hasMore !== true || rows.length === 0) break;
+      before = rows[rows.length - 1]?.created_at || null;
+      if (!before) break;
+    }
+  } catch (err) {
+    console.error("[PulseMarket] reservation expiry sweep:", err?.message || err);
+    return result;
+  }
+
+  const cutoff = Date.now() - RESERVATION_EXPIRY_HOURS * 60 * 60 * 1000;
+  for (const order of orders || []) {
+    if (order.status !== "reserved") continue;
+    if (!order.created_at) continue;
+    if (new Date(order.created_at).getTime() > cutoff) continue;
+    if (order.frozen) {
+      result.skipped.push({
+        code: order.code,
+        reason: "This order is frozen — a dispute is open.",
+      });
+      continue;
+    }
+    try {
+      await cancelOrder(order.id, currentUser);
+      // Milestone 22: a buyer can transfer the money off-app and
+      // never tap "I have transferred", so a sweep-cancelled
+      // 'reserved' order may already be paid for. Unlike cancelOrder
+      // on a 'paid' order (which logs paid_order_cancelled), nothing
+      // used to be logged here — the team had no prompt to check
+      // whether a transfer arrived before treating it as unpaid.
+      // Best effort: a logging failure must not undo the cancel.
+      await logSecurityEvent(
+        order.id,
+        currentUser.id,
+        "reserved_order_expired",
+        `Reserved order ${order.code} expired after 48 hours without payment and was cancelled. Check whether the buyer transferred off-app before treating it as unpaid.`
+      );
+      await notifyUser(currentUser.id, {
+        kind: "order",
+        title: "Reserved order expired",
+        body: `Order ${order.code} was reserved for more than 48 hours without payment, so it was cancelled and the item is listed again.`,
+        link: `/order/${order.id}`,
+        orderId: order.id,
+      });
+      result.cancelled.push(order.code);
+    } catch (err) {
+      result.skipped.push({
+        code: order.code,
+        reason: err?.message || "Cancel failed.",
       });
     }
   }
