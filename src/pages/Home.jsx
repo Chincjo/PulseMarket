@@ -128,15 +128,24 @@ export default function Home({ verification }) {
           {loadingListings ? (
             <p className="text-sm text-neutral-500">Loading listings…</p>
           ) : nearYou.length === 0 ? (
-            <EmptyState
-              title="Nothing listed near you yet"
-              body="Be the first seller on your campus — post your first item and students nearby will see it here."
-              action={
-                <Link to="/sell">
-                  <PrimaryButton>Post your first item</PrimaryButton>
-                </Link>
-              }
-            />
+            // No state is known yet (verification has no university)
+            // — "nothing near you" would be a lie, because the page
+            // has no idea where "near you" is.
+            myState ? (
+              <EmptyState
+                title="Nothing listed near you yet"
+                body="Be the first seller on your campus — post your first item and students nearby will see it here."
+                action={
+                  <Link to="/sell">
+                    <PrimaryButton>Post your first item</PrimaryButton>
+                  </Link>
+                }
+              />
+            ) : (
+              <p className="text-sm text-neutral-500">
+                Listings near you will appear here once your university is set.
+              </p>
+            )
           ) : (
             <div className="grid grid-cols-2 gap-3">
               {nearYou.slice(0, 6).map((l) => (
@@ -153,13 +162,26 @@ export default function Home({ verification }) {
           {loadingListings ? (
             <p className="text-sm text-neutral-500">Loading listings…</p>
           ) : justDropped.length === 0 ? (
+            // The "Get verified" line used to show to everyone,
+            // including students already approved — only offer it
+            // to someone who is not approved yet.
             <EmptyState
               title="Fresh listings land here"
-              body="No listings yet. Get verified so you can buy and sell the moment items appear."
+              body={
+                verification?.status === "approved"
+                  ? "No listings yet. Post the item yourself and students across Nigeria will see it here."
+                  : "No listings yet. Get verified so you can buy and sell the moment items appear."
+              }
               action={
-                <Link to="/verify">
-                  <PrimaryButton>Get verified</PrimaryButton>
-                </Link>
+                verification?.status === "approved" ? (
+                  <Link to="/sell">
+                    <PrimaryButton>Sell an item</PrimaryButton>
+                  </Link>
+                ) : (
+                  <Link to="/verify">
+                    <PrimaryButton>Get verified</PrimaryButton>
+                  </Link>
+                )
               }
             />
           ) : (

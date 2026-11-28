@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
-import { fetchLedger, getBalances } from "../lib/wallet";
+import { fetchLedgerChecked, getBalancesChecked } from "../lib/wallet";
 import { OWNER_EMAIL } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
@@ -28,6 +28,13 @@ export default function Wallet() {
   const [ledgerHasMore, setLedgerHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Morning deep check 2026-11-28: a failed wallet read used to
+  // look exactly like an empty wallet — ₦0 held, ₦0 available, no
+  // error — so a funded seller could think they had nothing. The
+  // checked reads below tell a failure apart from an empty wallet.
+  const [loadFailed, setLoadFailed] = useState(false);
+  // Bumped by the retry button so the load effect runs again.
+  const [reloadKey, setReloadKey] = useState(0);
   const [showWithdraw, setShowWithdraw] = useState(false);
   const [copied, setCopied] = useState("");
 
@@ -38,21 +45,28 @@ export default function Wallet() {
       return;
     }
     setLoading(true);
-    Promise.all([getBalances(user.id), fetchLedger(user.id)])
-      .then(([b, rows]) => {
+    setLoadFailed(false);
+    Promise.all([getBalancesChecked(user.id), fetchLedgerChecked(user.id)])
+      .then(([b, l]) => {
         if (cancelled) return;
-        setBalances(b);
-        setLedger(rows);
-        setLedgerHasMore(rows.hasMore === true);
+        setBalances(b.balances);
+        setLedger(l.rows);
+        setLedgerHasMore(l.rows.hasMore === true);
+        // Either read failing means the numbers on screen cannot be
+        // trusted — say so instead of showing ₦0.
+        setLoadFailed(b.failed || l.failed);
         setLoading(false);
       })
       .catch(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoadFailed(true);
+          setLoading(false);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [user, reloadKey]);
 
   const total = balances.held + balances.available;
 
@@ -61,9 +75,13 @@ export default function Wallet() {
     if (!user || loadingMore || !ledgerHasMore || ledger.length === 0) return;
     setLoadingMore(true);
     try {
-      const rows = await fetchLedger(user.id, {
+      const { rows, failed } = await fetchLedgerChecked(user.id, {
         before: ledger[ledger.length - 1].createdAt,
       });
+      if (failed) {
+        setLoadFailed(true);
+        return;
+      }
       setLedger((prev) => [...prev, ...(rows || [])]);
       setLedgerHasMore(rows.hasMore === true);
     } finally {
@@ -85,6 +103,18 @@ export default function Wallet() {
   return (
     <div className="space-y-5">
       <h1 className="text-2xl font-bold">Wallet</h1>
+
+      {loadFailed && (
+        <div className="rounded-2xl border border-red-300 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950">
+          <p className="text-sm font-semibold">Could not load your wallet — the numbers below may be wrong.</p>
+          <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-300">
+            Your money is safe — the read itself failed, so the wallet is showing ₦0 instead of your real balance.{" "}
+            <button type="button" className="font-semibold text-brown underline" onClick={() => setReloadKey((k) => k + 1)}>
+              Try again
+            </button>
+          </p>
+        </div>
+      )}
 
       <div className="rounded-2xl border border-neutral-200 p-4 text-center dark:border-neutral-800">
         <p className="text-3xl font-bold">{formatNaira(total)}</p>

@@ -376,6 +376,9 @@ export default function Dispute() {
             className={`${inputCls} mt-1`}
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            // fileDispute refuses an email over 120 characters —
+            // stop the typing there instead of failing on send.
+            maxLength={120}
             disabled={submitting}
           />
         </div>

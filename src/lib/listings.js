@@ -4,7 +4,7 @@
 // shows an honest "not switched on yet" message instead of crashing.
 import { supabase } from "./supabase";
 import { OWNER_EMAIL } from "./payments";
-import { assertRealPhoto } from "./shipping";
+import { assertRealPhoto, assertSellerClearOfDebt } from "./shipping";
 import {
   CATEGORIES,
   CONDITIONS,
@@ -708,6 +708,13 @@ export async function createListingRow(row) {
       "Your account is under review — contact support before posting a new listing."
     );
   }
+  // Morning deep check 2026-11-28: the seller-debt gate was only
+  // wired in Sell.jsx, so a crafted call to createListingRow — or
+  // any other caller — could publish a listing while the seller
+  // still owes money from an earlier order. The gate belongs here
+  // (shipping.js exports it; listings.js already imports from
+  // shipping.js, so no cycle).
+  await assertSellerClearOfDebt(row.seller_id);
   validateListingKeys(
     row,
     new Set([
@@ -1183,6 +1190,19 @@ export async function confirmBoostPurchase(row) {
     listing.boosted_until &&
     new Date(listing.boosted_until).getTime() > Date.now()
   ) {
+    // A re-confirm of a row that is ALREADY paid (claimed is false)
+    // is harmless: the boost is already live from the first
+    // confirm, so report success. But if THIS confirm just claimed
+    // the row (claimed is true), the seller has paid for a second
+    // boost while one is live — and this confirm would mark it paid
+    // and return success without applying anything, keeping the
+    // money for a boost the seller never got. Refuse plainly so the
+    // team refunds it instead.
+    if (claimed) {
+      throw new Error(
+        "This listing already has a live boost — confirming this purchase would take the money without applying a new boost. Refund the buyer instead."
+      );
+    }
     return true;
   }
   if (!claimed && listing && listing.boost_tier === tier.amount && listing.boosted_until) {

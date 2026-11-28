@@ -145,7 +145,7 @@ export async function fileDispute(orderId, { category, explanation, email }) {
 
   const { data: order, error: orderError } = await supabase
     .from("orders")
-    .select("id, code, buyer_id, seller_id, status, frozen")
+    .select("id, code, buyer_id, seller_id, status, frozen, return_status")
     .eq("id", orderId)
     .maybeSingle();
   if (orderError) throw orderError;
@@ -165,6 +165,16 @@ export async function fileDispute(orderId, { category, explanation, email }) {
       throw new Error("This order has not started yet — cancel it from the order page if you no longer want it.");
     }
     throw new Error("This order is already closed — email pulsemarketsupport@gmail.com with the order code and the team will look into it.");
+  }
+
+  // One open case at a time: a dispute freezes the order, and
+  // resolveReturn refuses frozen orders — so a team that opened a
+  // dispute first could not resolve the return until the dispute
+  // closed, and the two cases could disagree about the same money.
+  // Finish (or close) the return first, then file a dispute if
+  // something is still wrong.
+  if (order.return_status === "opened") {
+    throw new Error("A return is already open on this order — the PulseMarket team resolves the return first. File a dispute after that if something is still wrong.");
   }
 
   // One open report per order — a second report for the same order
@@ -409,7 +419,22 @@ export async function resolveDispute(disputeId, { resolutionNote }) {
     .in("status", ["open", "under_review"])
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // Morning deep check 2026-11-28: two admins resolving one
+    // dispute at the same time used to end with the second admin
+    // seeing a raw database error — the update matched 0 rows
+    // because the first admin had already resolved it. Re-read:
+    // if it is already resolved, return that row instead of failing.
+    if (error.code === "PGRST116") {
+      const { data: again } = await supabase
+        .from("disputes")
+        .select("*")
+        .eq("id", disputeId)
+        .maybeSingle();
+      if (again && again.status === "resolved") return again;
+    }
+    throw error;
+  }
   // Unfreeze the order so the manual release/refund can run. If this
   // fails, throw — the dispute row is already resolved, and the owner
   // can resolve again (the update is idempotent) to retry the unfreeze.
@@ -442,16 +467,27 @@ export async function fetchSecurityLog(limit = 100) {
 export async function fetchFrozenOrders() {
   if (!supabase) throw new Error("Supabase is not configured.");
   await requireOwner();
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*")
-    .eq("frozen", true)
-    .order("created_at", { ascending: false });
-  if (error) {
-    // The orders.frozen column comes from supabase/milestone-12.sql.
-    // If it has not been run yet, there is nothing frozen to show.
-    if (/column .*frozen.* does not exist/i.test(String(error.message || ""))) return [];
-    throw error;
+  // Morning deep check 2026-11-28: the old read had no limit, so
+  // PostgREST silently stopped at its 1000-row default and frozen
+  // orders past that were invisible to the team. Page through
+  // every frozen order.
+  const out = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("frozen", true)
+      .order("created_at", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      // The orders.frozen column comes from supabase/milestone-12.sql.
+      // If it has not been run yet, there is nothing frozen to show.
+      if (/column .*frozen.* does not exist/i.test(String(error.message || ""))) return [];
+      throw error;
+    }
+    out.push(...(data || []));
+    if (!data || data.length < PAGE) break;
   }
-  return data || [];
+  return out;
 }

@@ -5,12 +5,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams, Link } from "react-router-dom";
 import { CATEGORIES, CONDITIONS, STATES, UNIVERSITY_NAMES, universityState } from "../lib/data";
-import { getVerification } from "../lib/store";
 import { EmptyState, PrimaryButton, inputCls } from "../components/ui";
 import { ListingCard } from "../components/ListingCard";
 import { fetchActiveListings, sortListings, visibleTo } from "../lib/listings";
 
-export default function Search() {
+// A search must never cost more than an offer can — the same
+// ₦50,000,000 ceiling as MAX_OFFER_NAIRA in src/lib/chat.js.
+const MAX_PRICE_NAIRA = 50000000;
+
+export default function Search({ verification }) {
   const [params] = useSearchParams();
   const [q, setQ] = useState(params.get("q") || "");
   const [category, setCategory] = useState(params.get("category") || "");
@@ -23,7 +26,11 @@ export default function Search() {
   const [all, setAll] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  const myState = universityState(getVerification()?.university || "");
+  // The buyer's state comes from the server-checked verification
+  // App.jsx passes in — never from the device copy in localStorage,
+  // which a student could have edited by hand to see listings
+  // from another state.
+  const myState = universityState(verification?.university || "");
 
   useEffect(() => {
     let cancelled = false;
@@ -56,10 +63,15 @@ export default function Search() {
   }, [params]);
 
   // Price bounds are sanitised: empty, negative or non-numeric input
-  // is ignored instead of silently filtering everything out.
-  const minNum = min === "" ? null : Math.max(0, Math.floor(Number(min) || 0));
-  const maxNum = max === "" ? null : Math.max(0, Math.floor(Number(max) || 0));
+  // is ignored instead of silently filtering everything out. Both
+  // ends are capped at ₦50,000,000 — the same ceiling as an offer —
+  // so a mistyped extra zero cannot hide every listing.
+  const minNum = min === "" ? null : Math.min(MAX_PRICE_NAIRA, Math.max(0, Math.floor(Number(min) || 0)));
+  const maxNum = max === "" ? null : Math.min(MAX_PRICE_NAIRA, Math.max(0, Math.floor(Number(max) || 0)));
   const priceRangeBad = minNum !== null && maxNum !== null && minNum > maxNum;
+  // A ?category= from a link that names no real category matches
+  // nothing — say so plainly instead of showing an empty page.
+  const unknownCategory = category !== "" && !CATEGORIES.includes(category);
 
   const results = useMemo(() => {
     let list = all.filter((d) => visibleTo(d, myState));
@@ -121,8 +133,8 @@ export default function Search() {
             <option key={s}>{s}</option>
           ))}
         </select>
-        <input value={min} onChange={(e) => setMin(e.target.value)} placeholder="Min ₦" type="number" className={inputCls} />
-        <input value={max} onChange={(e) => setMax(e.target.value)} placeholder="Max ₦" type="number" className={inputCls} />
+        <input value={min} onChange={(e) => setMin(e.target.value)} placeholder="Min ₦" type="number" min="0" max={MAX_PRICE_NAIRA} className={inputCls} />
+        <input value={max} onChange={(e) => setMax(e.target.value)} placeholder="Max ₦" type="number" min="0" max={MAX_PRICE_NAIRA} className={inputCls} />
         <select value={sort} onChange={(e) => setSort(e.target.value)} className={inputCls}>
           <option value="newest">Newest first</option>
           <option value="price-low">Price: low to high</option>
@@ -141,6 +153,11 @@ export default function Search() {
           </p>
         ) : null}
       </div>
+      {unknownCategory && !loading && results.length === 0 ? (
+        <p className="text-sm font-semibold text-red-700">
+          There is no category called “{category}” — pick one from the list above.
+        </p>
+      ) : null}
       {/* A state filter on another state hides that state's
           same-state-only listings (they cannot reach a buyer in a
           different state) — say so, or the search looks broken. */}

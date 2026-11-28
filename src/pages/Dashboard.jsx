@@ -33,7 +33,18 @@ export default function Dashboard() {
   const [loadingMoreOrders, setLoadingMoreOrders] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
+  // A failed reload must never overwrite an action's own outcome:
+  // reload() runs fire-and-forget after every action, so a slow
+  // connection used to paint "Could not load your listings" over a
+  // listing that had just been marked sold. Reload failures get
+  // their own banner instead.
+  const [loadError, setLoadError] = useState("");
   const [busyId, setBusyId] = useState(null);
+  // busyId is per-render state: two fast taps on different listings
+  // both read the old null and both proceed, and the first action's
+  // finally clears the second one's busy state. The ref below is
+  // checked and set synchronously, so the second tap is refused.
+  const busyRef = useRef(null);
   // reload() is called from handlers as well as the effect, so it
   // guards against setting state after unmount itself.
   const mounted = useRef(true);
@@ -56,9 +67,10 @@ export default function Dashboard() {
         setHasMoreListings(rows.hasMore === true);
         setOrders(myOrders || []);
         setHasMoreOrders(myOrders?.hasMore === true);
+        setLoadError("");
       }
     } catch (err) {
-      if (mounted.current) setError(err?.message || "Could not load your listings. Try again.");
+      if (mounted.current) setLoadError(err?.message || "Could not load your listings. Try again.");
     } finally {
       if (mounted.current) setLoading(false);
     }
@@ -117,7 +129,8 @@ export default function Dashboard() {
   async function setStatus(listing, status) {
     // No busy guard before: a double-tap fired two status updates and
     // two reloads for one tap.
-    if (busyId) return;
+    if (busyRef.current) return;
+    busyRef.current = listing.id;
     setBusyId(listing.id);
     setError("");
     try {
@@ -140,6 +153,7 @@ export default function Dashboard() {
     } catch (err) {
       setError(err?.message || "Could not update the listing. Try again.");
     } finally {
+      busyRef.current = null;
       setBusyId(null);
     }
   }
@@ -147,7 +161,8 @@ export default function Dashboard() {
   async function reactivate(listing) {
     // "Back to active" on a reserved listing with an open order
     // used to flip it live mid-order (see reactivateListing).
-    if (busyId) return;
+    if (busyRef.current) return;
+    busyRef.current = listing.id;
     setBusyId(listing.id);
     setError("");
     try {
@@ -156,6 +171,7 @@ export default function Dashboard() {
     } catch (err) {
       setError(err?.message || "Could not update the listing. Try again.");
     } finally {
+      busyRef.current = null;
       setBusyId(null);
     }
   }
@@ -164,12 +180,13 @@ export default function Dashboard() {
     // Busy check first: asking "are you sure?" and then doing
     // nothing (because another action was already running) is a
     // confusing dead end.
-    if (busyId) return;
+    if (busyRef.current) return;
     // Deleting is permanent — ask first. (The listing detail page
     // already asks with a two-tap confirm; this page had none.)
     if (!window.confirm(`Delete "${listing.title}"? This cannot be undone.`)) return;
     // No busy guard before: a double-click deleted twice, and the
     // second call's "not found" error replaced the success.
+    busyRef.current = listing.id;
     setBusyId(listing.id);
     setError("");
     try {
@@ -178,12 +195,14 @@ export default function Dashboard() {
     } catch (err) {
       setError(err?.message || "Could not delete the listing. Try again.");
     } finally {
+      busyRef.current = null;
       setBusyId(null);
     }
   }
 
   async function duplicate(listing) {
-    if (busyId) return;
+    if (busyRef.current) return;
+    busyRef.current = listing.id;
     setError("");
     setBusyId(listing.id);
     try {
@@ -192,6 +211,7 @@ export default function Dashboard() {
     } catch (err) {
       setError(err?.message || "Could not duplicate the listing. Try again.");
     } finally {
+      busyRef.current = null;
       setBusyId(null);
     }
   }
@@ -256,6 +276,11 @@ export default function Dashboard() {
       {error ? (
         <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
           {error}
+        </p>
+      ) : null}
+      {loadError ? (
+        <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+          {loadError}
         </p>
       ) : null}
       {loading ? (

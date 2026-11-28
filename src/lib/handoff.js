@@ -199,6 +199,14 @@ export async function scanSellerCode(orderId, code) {
   if (!supabase) throw new Error("Supabase is not configured.");
   const typed = String(code || "").trim().toUpperCase();
   if (!typed) throw new Error("Type the seller code shown on the seller's phone.");
+  // Morning deep check 2026-11-28: the code is always 'PM-' + 6
+  // letters/digits (no I, O, 0 or 1). A typo, a partial code or a
+  // long paste used to reach the server and burn one of the 5
+  // attempts — five ordinary typos locked the handoff. Refuse a
+  // malformed code here, before any attempt is counted.
+  if (!/^PM-[A-HJ-NP-Z2-9]{6}$/.test(typed)) {
+    throw new Error("That code does not look right — it should look like PM-ABC123. Check the seller's phone and try again.");
+  }
   const { data, error } = await supabase.rpc("verify_seller_code", {
     p_order_id: orderId,
     p_code: typed,
@@ -280,7 +288,18 @@ export async function uploadHandoffPhoto(orderId, role, dataUrl) {
     .from(EVIDENCE_MEDIA_BUCKET)
     .getPublicUrl(path);
   const field = role === "buyer" ? "handoff_photo_buyer" : "handoff_photo_seller";
-  await updateOrder(orderId, { [field]: data.publicUrl });
+  try {
+    await updateOrder(orderId, { [field]: data.publicUrl });
+  } catch (err) {
+    // The photo is already up but the order row did not take it —
+    // remove it so it does not sit orphaned in the bucket.
+    try {
+      await supabase.storage.from(EVIDENCE_MEDIA_BUCKET).remove([path]);
+    } catch {
+      // Orphaned file stays — storage hygiene only, never fatal.
+    }
+    throw err;
+  }
   return data.publicUrl;
 }
 

@@ -250,6 +250,9 @@ export default function Admin() {
   async function handleResolve(e) {
     e.preventDefault();
     if (!selectedId) return;
+    // Entry guard: the button only disables after a re-render, so
+    // a double-tap (or Enter while resolving) ran resolve twice.
+    if (resolving) return;
     // Milestone 20 (APP-16): a resolution note is required — the
     // team must say how a dispute was decided. The lib refuses a
     // note under 5 characters too; this stops the click early with
@@ -467,6 +470,9 @@ export default function Admin() {
   // reject, or the reason the student is owed would be lost.
   async function handleConfirmReject() {
     if (!rejectFor || !rejectReason) return;
+    // Entry guard: the button only disables after a re-render, so
+    // a double-tap rejected the same student twice.
+    if (busyAction) return;
     setError("");
     setNotice("");
     setBusyAction(`rejected-${rejectFor.user_id}`);
@@ -511,6 +517,9 @@ export default function Admin() {
   // it by hand (open dispute above, or the buyer opens a return
   // and the team resolves it on the tracking page).
   async function handleNudgeBuyer(order) {
+    // Entry guard: the button only disables after a re-render, so
+    // a double-tap sent the same nudge notification twice.
+    if (busyAction) return;
     setError("");
     setNotice("");
     setBusyAction(`nudge-${order.id}`);

@@ -36,13 +36,20 @@ function downscale(file) {
       // promise never settles and adding a photo hangs for ever.
       img.onerror = () => reject(new Error("That file is not a photo — choose an image file."));
       img.onload = () => {
-        const max = 600;
-        const scale = Math.min(1, max / Math.max(img.width, img.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", 0.75));
+        try {
+          const max = 600;
+          const scale = Math.min(1, max / Math.max(img.width, img.height));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/jpeg", 0.75));
+        } catch {
+          // A tainted canvas (or any draw failure) throws here —
+          // without this the promise never settles and adding the
+          // photo hangs for ever.
+          reject(new Error("Could not read that photo. Try a different one."));
+        }
       };
       img.src = reader.result;
     };
@@ -179,7 +186,7 @@ export default function Sell({ verification }) {
         setError(err?.message || "Could not read that photo. Try a different one.");
       }
     }
-    if (urls.length > 0) setPhotos([...photos, ...urls]);
+    if (urls.length > 0) setPhotos((prev) => [...prev, ...urls]);
     e.target.value = "";
   }
 
@@ -318,6 +325,7 @@ export default function Sell({ verification }) {
               <p className="flex justify-between text-neutral-500"><span>Service fee {serviceFeeLabel(fees.price)}</span><span>{formatNaira(fees.serviceFee)}</span></p>
               <p className="flex justify-between text-neutral-500"><span>Secure payment fee {FEE_LABELS.secure}</span><span>{formatNaira(fees.secureFee)}</span></p>
               <p className="mt-1 flex justify-between font-bold"><span>Buyer pays (held)</span><span>{formatNaira(fees.total)}</span></p>
+              <p className="mt-1 text-neutral-500">Shipping is charged on top at checkout when shipping is chosen — it is not part of this total.</p>
               <p className="mt-1 text-neutral-500">Cash face-to-face: no fees — buyer pays {formatNaira(fees.price)}. You keep the full price either way.</p>
             </div>
           ) : null}
@@ -395,7 +403,10 @@ export default function Sell({ verification }) {
                 <button
                   type="button"
                   aria-label={`Remove photo ${i + 1}`}
-                  onClick={() => setPhotos(photos.filter((_, j) => j !== i))}
+                  // Functional update: the stale `photos` closure
+                  // removed the wrong photo when two taps landed
+                  // before a re-render.
+                  onClick={() => setPhotos((prev) => prev.filter((_, j) => j !== i))}
                   className="absolute right-1 top-1 rounded-full bg-black/60 px-2 py-0.5 text-xs font-bold text-white"
                 >
                   ✕
@@ -435,7 +446,7 @@ export default function Sell({ verification }) {
           ) : (
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">Shipping chosen</p>
-              <p className="mt-1 text-neutral-500">Shipping is included in the held payment — the buyer pays it through the app, not to the courier. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery.</p>
+              <p className="mt-1 text-neutral-500">Shipping is added on top at checkout — the buyer pays it through the app, not to the courier. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery.</p>
             </div>
           )}
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">

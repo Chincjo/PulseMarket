@@ -2,7 +2,7 @@
 // coordinator). Manual escrow: cash is paid face to face with no fees;
 // "pay through the app" is a bank transfer to PulseMarket, held until
 // the buyer confirms delivery. No payment provider is wired in.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { SAFE_MEETUP_SPOTS, STATES } from "../lib/data";
 import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
@@ -54,6 +54,20 @@ export default function Checkout() {
   // Reserve stays disabled — a failed read used to look exactly
   // like no agreed price, so the buyer silently paid full price.
   const [convFailed, setConvFailed] = useState(false);
+  // Morning deep check 2026-11-28: whether the agreed-price read
+  // is still in flight. `loading` clears when the *listing* fetch
+  // resolves, but the conversation read runs in parallel — without
+  // this flag Reserve was live the moment the page rendered, and a
+  // fast tap reserved at full price before the agreed price had
+  // arrived (conversationId still null, so createOrder charged the
+  // listing price). Reserve stays disabled until the read settles.
+  const [convPending, setConvPending] = useState(false);
+  // Synchronous double-tap guard for reserve(): the `reserving`
+  // state only disables the button after React re-renders, so two
+  // fast taps could both fire createOrder (the second then hit the
+  // one-open-order index and wrongly reported "reserved by someone
+  // else"). A ref flips in the same tick.
+  const reservingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,6 +130,7 @@ export default function Checkout() {
       // tells a failed read apart from "no conversation": a failed
       // read sets convFailed and blocks Reserve below, instead of
       // silently charging the full listing price.
+      setConvPending(true);
       fetchConversationForListingOrThrow(listingId, user.id)
         .then((conv) => {
           if (cancelled) return;
@@ -127,6 +142,9 @@ export default function Checkout() {
         .catch(() => {
           if (cancelled) return;
           setConvFailed(true);
+        })
+        .finally(() => {
+          if (!cancelled) setConvPending(false);
         });
     }
     return () => {
@@ -191,12 +209,15 @@ export default function Checkout() {
   async function retryConversation() {
     if (!user) return;
     setConvFailed(false);
+    setConvPending(true);
     try {
       const conv = await fetchConversationForListingOrThrow(listingId, user.id);
       setConversationId(conv?.id || null);
       if (conv?.agreed_price) setAgreedPrice(Number(conv.agreed_price));
     } catch {
       setConvFailed(true);
+    } finally {
+      setConvPending(false);
     }
   }
 
@@ -208,11 +229,18 @@ export default function Checkout() {
       setError("Could not check your agreed price — check your connection and try again.");
       return;
     }
+    // Still waiting on the agreed-price read: reserving now would
+    // charge the full listing price (see convPending above).
+    if (convPending) {
+      setError("Still checking your agreed price — wait a moment and try again.");
+      return;
+    }
     // Belt and braces with the disabled button below: a double-tap
     // must never fire createOrder twice (the second call would hit
     // the one-open-order-per-listing index and report — wrongly —
     // that "someone else" just reserved the item).
-    if (reserving) return;
+    if (reserving || reservingRef.current) return;
+    reservingRef.current = true;
     setError("");
     // Shipping with no destination state used to sail through and
     // silently fall back to the buyer's state (or none at all) —
@@ -268,6 +296,7 @@ export default function Checkout() {
     } catch (err) {
       setError(err?.message || "Could not reserve this item. Please try again.");
     } finally {
+      reservingRef.current = false;
       setReserving(false);
     }
   }
@@ -524,8 +553,8 @@ export default function Checkout() {
 
       {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
 
-      <PrimaryButton onClick={reserve} disabled={reserving || !user || convFailed || (paymentMethod === "cash" && !canMeet)} className="w-full py-3 text-base">
-        {reserving ? "Reserving…" : "Reserve — Put on Hold"}
+      <PrimaryButton onClick={reserve} disabled={reserving || convPending || !user || convFailed || (paymentMethod === "cash" && !canMeet)} className="w-full py-3 text-base">
+        {reserving ? "Reserving…" : convPending ? "Checking your agreed price…" : "Reserve — Put on Hold"}
       </PrimaryButton>
       <p className="text-center text-xs text-neutral-500">
         Reserving holds this item for you. {paymentMethod === "cash" ? "You pay nothing now." : "You will get the transfer instructions on the next screen — the PulseMarket team shares the account details by email."}

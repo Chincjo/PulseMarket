@@ -673,6 +673,19 @@ export async function sendOffer(conversationId, amount) {
       "send offer"
     );
   }
+  // Morning deep check 2026-11-28: once a price is agreed, a later
+  // offer used to overwrite it — the mass-decline in M23
+  // respond_offer only declines offers pending AT accept time, so a
+  // new offer sent after the agreement could be accepted and move
+  // the agreed price. Both sides already agreed a price, so no
+  // further offers make sense: refuse them until the order is
+  // placed (or cancelled). A failed conversation read fails open —
+  // the accept is still refused server-side.
+  const convForAgreed = await fetchConversation(conversationId);
+  if (convForAgreed?.agreed_price != null) {
+    lastGateError = `You already agreed ₦${Number(convForAgreed.agreed_price).toLocaleString("en-NG")} for this item — no more offers.`;
+    return dbError(lastGateError, "send offer");
+  }
   // Night deep check 2026-11-27: an offer above the asking price
   // used to be sendable and acceptable — it set an agreed price
   // above the listing price, so the chat banner promised a price
@@ -680,7 +693,7 @@ export async function sendOffer(conversationId, amount) {
   // price). Refuse it here; the database (M23 respond_offer)
   // refuses it too. A failed price read fails open — the accept
   // is still refused server-side, so no money is at risk.
-  const convForPrice = await fetchConversation(conversationId);
+  const convForPrice = convForAgreed;
   if (convForPrice?.listing_id) {
     const { data: listingRow } = await supabase
       .from("listings")

@@ -94,6 +94,10 @@ export default function SignIn() {
   }
 
   async function forgotPassword() {
+    // No cooldown before: after a link was sent the button stayed
+    // live, so repeated taps sent the student reset email after
+    // reset email. One link is enough — the button stays sent.
+    if (resetBusy || resetSent) return;
     setError("");
     setResetSent(false);
     if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email.trim())) {
@@ -120,6 +124,9 @@ export default function SignIn() {
 
   async function submit(e) {
     e.preventDefault();
+    // Entry guard: the button only disables after a re-render, so
+    // two fast taps ran sign-in twice.
+    if (busy) return;
     setError("");
     if (!configured) {
       setError("Student accounts are being switched on — please check back shortly.");
@@ -147,15 +154,20 @@ export default function SignIn() {
   }
 
   async function google() {
+    // Entry guard: a double-tap started Google sign-in twice.
+    if (busy) return;
     setError("");
     if (!configured) {
       setError("Student accounts are being switched on — please check back shortly.");
       return;
     }
+    setBusy(true);
     try {
       await signInGoogle();
     } catch (err) {
       setError(friendlyError(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -251,17 +263,17 @@ export default function SignIn() {
         </PrimaryButton>
       </form>
 
-      <GhostButton className="w-full" onClick={google}>
+      <GhostButton className="w-full" onClick={google} disabled={busy}>
         Continue with Google
       </GhostButton>
 
       <button
         type="button"
         onClick={forgotPassword}
-        disabled={resetBusy}
+        disabled={resetBusy || resetSent}
         className="w-full text-center text-sm font-semibold text-brown underline disabled:opacity-50"
       >
-        {resetBusy ? "Sending…" : "Forgot your password?"}
+        {resetSent ? "Reset link sent ✓" : resetBusy ? "Sending…" : "Forgot your password?"}
       </button>
       {resetSent ? (
         <p className="rounded-xl bg-neutral-100 p-3 text-sm text-neutral-700 dark:bg-neutral-900 dark:text-neutral-300">

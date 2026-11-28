@@ -27,6 +27,7 @@
 import { supabase } from "./supabase";
 import { feeBreakdown } from "./fees";
 import { fetchVerificationRowChecked, updateListing } from "./listings";
+import { universityState } from "./data";
 import { handoffComplete, logSecurityEvent } from "./handoff";
 import { notifyUser } from "./notifications";
 import {
@@ -141,6 +142,29 @@ async function ledgerMoveExists(orderId, kind, bucket) {
     return false;
   }
   return (data || []).length > 0;
+}
+
+// Morning deep check 2026-11-28: the summed amount of one ledger
+// leg (kind + bucket) for an order, or null when no such leg exists
+// — null matters: a 0-amount leg is a real leg, a missing leg is a
+// half-written pair. The paired-leg recoveries below use this to
+// prove the SECOND leg exists, for the right amount, before they
+// declare a move complete (a 23505 or a held-leg hit only proves
+// the FIRST leg exists).
+async function ledgerMoveAmount(orderId, kind, bucket) {
+  if (!supabase || !orderId) return null;
+  const { data, error } = await supabase
+    .from("wallet_ledger")
+    .select("amount")
+    .eq("order_id", orderId)
+    .eq("kind", kind)
+    .eq("bucket", bucket);
+  if (error) {
+    dbError(error, "read ledger move amount");
+    return null;
+  }
+  if (!data || data.length === 0) return null;
+  return data.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
 }
 
 async function updateOrder(id, patch) {
@@ -259,11 +283,20 @@ export async function createOrder({
   }
   // A same-state-only listing never leaves the seller's state, and a
   // meetup only makes sense in the seller's state either.
+  // Morning deep check 2026-11-28: the buyer's state used to come
+  // from Checkout's own verification read, passed in as `buyerState`
+  // — when that read failed the value arrived empty and both checks
+  // below silently passed (`buyerState && ...`), so an out-of-state
+  // buyer could order a same-state-only listing. The state now comes
+  // from the checked verification row read just above (the same row
+  // that proved the buyer is approved); the passed value is only a
+  // fallback for a row with no university on file.
+  const checkedBuyerState = universityState(buyerRow?.university) || buyerState;
   if (listing.ships_to === "same_state" && listing.state) {
     if (deliveryMethod === "shipping" && shipToState && shipToState !== listing.state) {
       throw new Error(`This item only ships within ${listing.state}.`);
     }
-    if (deliveryMethod === "meetup" && buyerState && buyerState !== listing.state) {
+    if (deliveryMethod === "meetup" && checkedBuyerState && checkedBuyerState !== listing.state) {
       throw new Error(`This item is only for students in ${listing.state}.`);
     }
   }
@@ -355,6 +388,23 @@ export async function createOrder({
   ) {
     throw new Error(
       "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
+    );
+  }
+  // Morning deep check 2026-11-28: Chowdeck Relay is same-city
+  // only, at ANY price — the Tier-1 check above only constrains
+  // items over ₦20,000, so a cheaper interstate order could still
+  // ship with a courier that cannot leave the city (and the buyer
+  // paid an interstate shipping fee). Checkout already swaps it for
+  // GIG, but a direct call could still book it.
+  if (
+    deliveryMethod === "shipping" &&
+    shipToState &&
+    listing.state &&
+    shipToState !== listing.state &&
+    courier === "Chowdeck Relay"
+  ) {
+    throw new Error(
+      "Chowdeck Relay only delivers within the same city — choose GIG Logistics or GUO Transport for shipping to another state."
     );
   }
 
@@ -690,6 +740,15 @@ export async function confirmDelivery(orderId, userId) {
   if (!["held", "shipped"].includes(order.status)) {
     throw new Error(`This order is ${order.status} — delivery cannot be confirmed yet.`);
   }
+  // Morning deep check 2026-11-28: a shipping order in 'held' used
+  // to pass this check, then hit the database trigger (M21/M23:
+  // held -> delivered is the meet-in-person path only) and the buyer
+  // got a raw database error. A shipping order must pass through
+  // 'shipped' (waybill + PIN + tracking) before delivery can be
+  // confirmed — refuse here, in plain words, first.
+  if (order.delivery_method === "shipping" && order.status !== "shipped") {
+    throw new Error("This order has not shipped yet — delivery can only be confirmed once the seller ships it.");
+  }
   if (order.delivery_method === "meetup" && !handoffComplete(order)) {
     await logSecurityEvent(orderId, userId, "delivery_blocked", `Delivery confirmation blocked — handoff not complete for order ${order.code}.`);
     throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
@@ -839,12 +898,37 @@ async function legacyReleaseOrder(order, user) {
   if (!allowed) {
     throw new Error("Only the buyer or the PulseMarket team can release this order.");
   }
+  // Milestone 8 advance: part of the shipping fee may already sit in
+  // the seller's available bucket. Release only what is still held,
+  // so the seller is never paid the advance twice — same math as the
+  // Milestone 10 SQL function auto_release_overdue_orders(). These
+  // amounts are computed BEFORE the double-release guard below: the
+  // guard must prove the seller's available leg exists for exactly
+  // this amount, not just that a held leg exists.
+  const advance = await advanceAlreadyReleased(order.id);
+  const heldAmount = -Math.max(0, order.total - advance);
+  const availableAmount = Math.max(
+    0,
+    order.item_price + ((order.shipping_fee || 0) - advance)
+  );
   // The double-release check comes before the status / frozen /
   // handoff gates on purpose: a retry after a completed release
   // (money moved, order already 'released') must finish quietly —
   // including marking the listing sold — not throw "there is no held
   // money to release" for money that was already released.
+  // Morning deep check 2026-11-28: a held leg alone only proves the
+  // FIRST leg exists. A half-written pair (held leg only, no
+  // available leg) used to be finished as a completed release here,
+  // closing the order while the seller was never paid. Verify the
+  // available leg too, for the right amount — otherwise say plainly
+  // that the release is only half recorded and the team must check it.
   if (await ledgerMoveExists(order.id, "release", "held")) {
+    const paid = await ledgerMoveAmount(order.id, "release", "available");
+    if (paid === null || paid !== availableAmount) {
+      throw new Error(
+        "This release is only half recorded — the seller has not been paid yet. Ask the PulseMarket team to check it."
+      );
+    }
     return finishRelease();
   }
   // Milestone 17: release opens only after delivery is confirmed.
@@ -886,16 +970,8 @@ async function legacyReleaseOrder(order, user) {
     await logSecurityEvent(order.id, user?.id, "release_blocked", `Release blocked — handoff not complete for order ${order.code}.`);
     throw new Error("Handoff not complete — the buyer must scan the seller code and both sides must confirm with photos.");
   }
-  // Milestone 8 advance: part of the shipping fee may already sit in
-  // the seller's available bucket. Release only what is still held,
-  // so the seller is never paid the advance twice — same math as the
-  // Milestone 10 SQL function auto_release_overdue_orders().
-  const advance = await advanceAlreadyReleased(order.id);
-  const heldAmount = -Math.max(0, order.total - advance);
-  const availableAmount = Math.max(
-    0,
-    order.item_price + ((order.shipping_fee || 0) - advance)
-  );
+  // (The advance amounts were computed above, before the
+  // double-release guard, so the guard could verify the pair.)
   // Double-release guard: the money must leave hold exactly once.
   // The database refuses a second release pair too (unique indexes
   // in supabase/milestone-14.sql); this check gives the plain error
@@ -989,6 +1065,16 @@ async function legacyReleaseOrder(order, user) {
     ], user);
   } catch (err) {
     if (err?.code === "23505") {
+      // Another device paid it a moment ago — but a 23505 only
+      // proves ONE leg collided. A half-written pair (held leg
+      // only) must not be finished as a completed release: verify
+      // the seller's available leg, for the right amount, first.
+      const paid = await ledgerMoveAmount(order.id, "release", "available");
+      if (paid === null || paid !== availableAmount) {
+        throw new Error(
+          "This release is only half recorded — the seller has not been paid yet. Ask the PulseMarket team to check it."
+        );
+      }
       return finishRelease();
     }
     throw err;
@@ -1134,6 +1220,10 @@ export async function refundHeldOrder(orderId, user) {
     });
     return { order: closed, note };
   }
+  // Owner decision 2026-11-26: a TEAM refund keeps the fee — the
+  // buyer gets item + shipping back, NOT the full total (D-3's
+  // full-total refund applies to seller-fault returns only).
+  const refundToBuyer = Number(order.item_price || 0) + Number(order.shipping_fee || 0);
   if (supabase) {
     const { data: existingRefund } = await supabase
       .from("wallet_ledger")
@@ -1143,15 +1233,23 @@ export async function refundHeldOrder(orderId, user) {
       .eq("bucket", "held")
       .limit(1);
     if (existingRefund && existingRefund.length > 0) {
+      // Morning deep check 2026-11-28: a held leg alone only proves
+      // the FIRST leg exists. A half-written pair (held leg only,
+      // buyer never paid) used to be closed out as a completed
+      // refund here. Verify the buyer's available leg, for the right
+      // amount, before closing out — otherwise say plainly that the
+      // refund is only half recorded and the team must check it.
+      const paid = await ledgerMoveAmount(order.id, "refund", "available");
+      if (paid === null || paid !== refundToBuyer) {
+        throw new Error(
+          "This refund is only half recorded — the buyer has not been paid back yet. Ask the PulseMarket team to check it."
+        );
+      }
       return closeOut("This order was already refunded — the refund moved once, so this just closes the order out.");
     }
   }
   const advance = await advanceAlreadyReleased(order.id);
   const remainingHeld = Math.max(0, Number(order.total || 0) - advance);
-  // Owner decision 2026-11-26: a TEAM refund keeps the fee — the
-  // buyer gets item + shipping back, NOT the full total (D-3's
-  // full-total refund applies to seller-fault returns only).
-  const refundToBuyer = Number(order.item_price || 0) + Number(order.shipping_fee || 0);
   try {
     await recordLedgerMove(order, [
       {
@@ -1171,6 +1269,15 @@ export async function refundHeldOrder(orderId, user) {
     ], user);
   } catch (err) {
     if (err?.code === "23505") {
+      // Another device refunded a moment ago — but a 23505 only
+      // proves ONE leg collided. Verify the buyer's available leg,
+      // for the right amount, before closing out (see above).
+      const paid = await ledgerMoveAmount(order.id, "refund", "available");
+      if (paid === null || paid !== refundToBuyer) {
+        throw new Error(
+          "This refund is only half recorded — the buyer has not been paid back yet. Ask the PulseMarket team to check it."
+        );
+      }
       return closeOut("This order was already refunded — the refund moved once, so this just closes the order out.");
     }
     throw err;
@@ -1227,13 +1334,24 @@ export async function fetchHeldOrders(user) {
   if (!isOwner(user)) {
     throw new Error("This page is not available.");
   }
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*")
-    .eq("status", "held")
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-  return data || [];
+  // Morning deep check 2026-11-28: the old read had no limit, so
+  // PostgREST silently stopped at its 1000-row default and the team
+  // saw only the newest 1000 held orders. Page through all of them
+  // (same pattern as getBalances' fallback).
+  const all = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("status", "held")
+      .order("created_at", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    all.push(...(data || []));
+    if (!data || data.length < PAGE) break;
+  }
+  return all;
 }
 
 // Milestone 20 (APP-9): team-only read for /admin — every order
@@ -1245,13 +1363,22 @@ export async function fetchPaidOrders(user) {
   if (!isOwner(user)) {
     throw new Error("This page is not available.");
   }
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*")
-    .eq("status", "paid")
-    .order("created_at", { ascending: true });
-  if (error) throw error;
-  return data || [];
+  // Morning deep check 2026-11-28: same silent 1000-row cap as
+  // fetchHeldOrders above — page through all of them.
+  const all = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("status", "paid")
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    all.push(...(data || []));
+    if (!data || data.length < PAGE) break;
+  }
+  return all;
 }
 
 // Team-only read: held orders that shipped more than `olderThanDays`
@@ -1336,59 +1463,97 @@ export async function fetchStuckMoneyOrders(user) {
   if (!isOwner(user)) {
     throw new Error("This page is not available.");
   }
-  const { data: orders, error } = await supabase
-    .from("orders")
-    .select("*")
-    .in("status", ["paid", "held", "delivered"])
-    .eq("payment_method", "held")
-    .order("created_at", { ascending: false })
-    .limit(200);
-  if (error) throw error;
-  const list = orders || [];
-  if (list.length === 0) return [];
-  const ids = list.map((o) => o.id);
-  const { data: legs } = await supabase
-    .from("wallet_ledger")
-    .select("order_id, kind, bucket")
-    .in("order_id", ids)
-    .in("kind", ["hold", "release", "refund"]);
-  const kindsByOrder = new Map();
-  for (const row of legs || []) {
-    if (!kindsByOrder.has(row.order_id)) kindsByOrder.set(row.order_id, new Set());
-    kindsByOrder.get(row.order_id).add(`${row.kind}:${row.bucket}`);
-  }
+  // Morning deep check 2026-11-28: refundHeldOrder also refunds
+  // SHIPPED orders, so a refund that crashed after writing its legs
+  // left a 'shipped' order the old three-status list never saw —
+  // same blind spot as the 'delivered' shape fixed 2026-11-27. A
+  // 'held' order carrying release legs is a pre-Milestone-17
+  // leftover (release went through while held); it cannot close
+  // out here automatically — the team closes it by hand.
+  // Also: the old .limit(200) newest-first hid the oldest stuck
+  // orders past 200 open held orders. Page through every open held
+  // order, oldest first, instead.
   const stuck = [];
-  for (const order of list) {
-    const kinds = kindsByOrder.get(order.id) || new Set();
-    if (order.status === "paid" && kinds.has("hold:held")) {
-      stuck.push({
-        order: withoutPin(order, null),
-        problem: "The transfer was confirmed and the money is held, but the order still says 'paid'.",
-        action: "confirm-receipt",
-      });
-    } else if (order.status === "held" && kinds.has("refund:held")) {
-      stuck.push({
-        order: withoutPin(order, null),
-        problem: "The refund was already paid, but the order still says 'held'.",
-        action: "refund-held",
-      });
-    } else if (order.status === "delivered" && kinds.has("refund:held")) {
-      // Night deep check 2026-11-27: a team refund of a delivered
-      // order that crashed after writing the refund legs was
-      // invisible here — the order is not stuck in 'held', so the
-      // old three-shape list never matched it.
-      stuck.push({
-        order: withoutPin(order, null),
-        problem: "The refund was already paid, but the order still says 'delivered'.",
-        action: "refund-held",
-      });
-    } else if (order.status === "delivered" && kinds.has("release:held")) {
-      stuck.push({
-        order: withoutPin(order, null),
-        problem: "The money was already released to the seller, but the order still says 'delivered'.",
-        action: "release",
-      });
+  const PAGE = 200;
+  for (let from = 0; ; from += PAGE) {
+    const { data: orders, error } = await supabase
+      .from("orders")
+      .select("*")
+      .in("status", ["paid", "held", "shipped", "delivered"])
+      .eq("payment_method", "held")
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    const page = orders || [];
+    if (page.length === 0) break;
+    const ids = page.map((o) => o.id);
+    const { data: legs } = await supabase
+      .from("wallet_ledger")
+      .select("order_id, kind, bucket")
+      .in("order_id", ids)
+      .in("kind", ["hold", "release", "refund"]);
+    const kindsByOrder = new Map();
+    for (const row of legs || []) {
+      if (!kindsByOrder.has(row.order_id)) kindsByOrder.set(row.order_id, new Set());
+      kindsByOrder.get(row.order_id).add(`${row.kind}:${row.bucket}`);
     }
+    for (const order of page) {
+      const kinds = kindsByOrder.get(order.id) || new Set();
+      // SQL review 2026-11-28 (M3): a cancelled `paid` order whose
+      // reversal was written but the status flip never landed
+      // carries BOTH hold:held and refund:held legs. The refund leg
+      // must be checked FIRST — the old order checked hold first
+      // and mislabelled it "transfer confirmed", and reconciling
+      // then resurrected the cancelled order as 'held'.
+      if (order.status === "paid" && kinds.has("refund:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The order was cancelled and the hold was already reversed, but the order still says 'paid'.",
+          action: "cancel",
+        });
+      } else if (order.status === "paid" && kinds.has("hold:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The transfer was confirmed and the money is held, but the order still says 'paid'.",
+          action: "confirm-receipt",
+        });
+      } else if (order.status === "held" && kinds.has("refund:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The refund was already paid, but the order still says 'held'.",
+          action: "refund-held",
+        });
+      } else if (order.status === "shipped" && kinds.has("refund:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The refund was already paid, but the order still says 'shipped'.",
+          action: "refund-held",
+        });
+      } else if (order.status === "delivered" && kinds.has("refund:held")) {
+        // Night deep check 2026-11-27: a team refund of a delivered
+        // order that crashed after writing the refund legs was
+        // invisible here — the order is not stuck in 'held', so the
+        // old three-shape list never matched it.
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The refund was already paid, but the order still says 'delivered'.",
+          action: "refund-held",
+        });
+      } else if (order.status === "delivered" && kinds.has("release:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The money was already released to the seller, but the order still says 'delivered'.",
+          action: "release",
+        });
+      } else if (order.status === "held" && kinds.has("release:held")) {
+        stuck.push({
+          order: withoutPin(order, null),
+          problem: "The money was already released while the order was still held (an old leftover) — the team closes this one out by hand.",
+          action: "close-out-by-hand",
+        });
+      }
+    }
+    if (page.length < PAGE) break;
   }
   return stuck;
 }
@@ -1420,6 +1585,20 @@ export async function reconcileOrder(orderId, user) {
     .in("kind", ["hold", "release", "refund"]);
   const has = (kind, bucket) =>
     (legs || []).some((r) => r.kind === kind && r.bucket === bucket);
+  // SQL review 2026-11-28 (M3): a `paid` order carrying a refund
+  // leg is a cancel that crashed after writing the reversal — NOT
+  // a confirmed transfer. Check the refund leg BEFORE the hold leg:
+  // re-running the cancel finishes the status flip (cancelOrder
+  // skips re-writing the reversal), while confirmReceipt would
+  // wrongly resurrect the cancelled order as 'held'.
+  if (order.status === "paid" && has("refund", "held")) {
+    const done = await cancelOrder(orderId, user);
+    return {
+      order: withoutPin(done, user?.id),
+      action: "cancel",
+      note: "The cancel had already reversed the hold — this just finished the status update. No money moved twice.",
+    };
+  }
   if (order.status === "paid" && has("hold", "held")) {
     const done = await confirmReceipt(orderId, user);
     return {
@@ -1448,12 +1627,34 @@ export async function reconcileOrder(orderId, user) {
       note: "The refund was already paid — this just closed the order out. No money moved twice.",
     };
   }
+  // Morning deep check 2026-11-28: same half-move on a shipped
+  // order — refundHeldOrder refunds shipped orders too.
+  if (order.status === "shipped" && has("refund", "held")) {
+    const done = await refundHeldOrder(orderId, user);
+    return {
+      order: withoutPin(done.order || done, user?.id),
+      action: "refund-held",
+      note: "The refund was already paid — this just closed the order out. No money moved twice.",
+    };
+  }
   if (order.status === "delivered" && has("release", "held")) {
     const done = await releaseOrder(orderId, user);
     return {
       order: withoutPin(done, user?.id),
       action: "release",
       note: "The release was already paid — this just closed the order out. No money moved twice.",
+    };
+  }
+  // Morning deep check 2026-11-28: a release that went through
+  // while the order was still held (pre-Milestone-17 leftover).
+  // releaseOrder refuses held orders, so this cannot close out
+  // here — the team closes it out by hand instead of stranding it
+  // silently.
+  if (order.status === "held" && has("release", "held")) {
+    return {
+      order: withoutPin(order, user?.id),
+      action: "none",
+      note: "This order's release already went through while it was held — close the order out by hand. Nothing more was charged.",
     };
   }
   return {

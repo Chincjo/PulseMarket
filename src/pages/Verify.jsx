@@ -48,6 +48,17 @@ function friendlyError(err) {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_FILE_MB = 10;
 
+// Some Android browsers report no MIME type at all for a picked
+// photo (f.type is ""), so a type-only check would let any file
+// through. Fall back to the file extension when the type is empty.
+const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"];
+function isImageFile(f) {
+  if (!f) return false;
+  if (f.type) return f.type.startsWith("image/");
+  const name = (f.name || "").toLowerCase();
+  return IMAGE_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
 // Milestone 19 (Decision 3): what the team said, in plain words,
 // for each fixed rejection reason — shown to the rejected student
 // so they know exactly what to fix before submitting again. A
@@ -112,6 +123,9 @@ export default function Verify({ onVerified, initialVerification }) {
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [checking, setChecking] = useState(false);
+  // "Check again" used to go silent when the team had not approved
+  // yet — the spinner just stopped and nothing said why.
+  const [checkNote, setCheckNote] = useState("");
 
   // Milestone 19 (Decision 2): replacing ID photos while still
   // under review. Separate files from the submit form above — the
@@ -191,7 +205,7 @@ export default function Verify({ onVerified, initialVerification }) {
   function filePreview(e, setPreview, setFile) {
     const f = e.target.files?.[0];
     if (!f) return;
-    if (f.type && !f.type.startsWith("image/")) {
+    if (!isImageFile(f)) {
       setFormError("That file is not a photo — take a photo of your student ID.");
       e.target.value = "";
       setPreview(null);
@@ -214,6 +228,9 @@ export default function Verify({ onVerified, initialVerification }) {
 
   async function createAccount(e) {
     e.preventDefault();
+    // Entry guard: a double-tap fired signUpEmail twice and the
+    // second call failed misleadingly with "user already registered".
+    if (busy) return;
     setError("");
     if (!configured) {
       setError("Student accounts are being switched on — please check back shortly.");
@@ -245,15 +262,21 @@ export default function Verify({ onVerified, initialVerification }) {
   }
 
   async function google() {
+    // Entry guard, same as createAccount above: a double-tap
+    // started Google sign-in twice.
+    if (busy) return;
     setError("");
     if (!configured) {
       setError("Student accounts are being switched on — please check back shortly.");
       return;
     }
+    setBusy(true);
     try {
       await signInGoogle();
     } catch (err) {
       setError(friendlyError(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -481,9 +504,13 @@ export default function Verify({ onVerified, initialVerification }) {
   async function checkStatus() {
     if (!user?.id || checking) return;
     setChecking(true);
+    setCheckNote("");
     try {
       const row = await fetchVerificationRow(user.id);
-      if (!row) return;
+      if (!row) {
+        setCheckNote("Could not check your verification — check your connection and try again later.");
+        return;
+      }
       const rec = {
         userId: row.userId,
         email: user.email,
@@ -503,6 +530,7 @@ export default function Verify({ onVerified, initialVerification }) {
       setSaved(rec);
       onVerified?.(rec);
       if (row.status === "approved") navigate("/");
+      else setCheckNote("Still under review — the team has not approved it yet. Try again later.");
     } finally {
       setChecking(false);
     }
@@ -514,7 +542,7 @@ export default function Verify({ onVerified, initialVerification }) {
   function pickReplacePhoto(e, setPreview, setFile) {
     const f = e.target.files?.[0];
     if (!f) return;
-    if (f.type && !f.type.startsWith("image/")) {
+    if (!isImageFile(f)) {
       setReplaceError("That file is not a photo — take a photo of your student ID.");
       e.target.value = "";
       setPreview(null);
@@ -648,6 +676,11 @@ export default function Verify({ onVerified, initialVerification }) {
           <PrimaryButton className="w-full" disabled={checking} onClick={checkStatus}>
             {checking ? "Checking…" : "Check again — I may be approved now"}
           </PrimaryButton>
+          {checkNote ? (
+            <p className="rounded-xl bg-neutral-100 p-3 text-sm text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+              {checkNote}
+            </p>
+          ) : null}
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
             <p className="font-semibold">Photos not clear?</p>
             <p className="mt-1 text-neutral-500">

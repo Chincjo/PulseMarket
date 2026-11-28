@@ -146,6 +146,27 @@ async function advanceAlreadyReleased(orderId) {
   return (data || []).reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
 }
 
+// Morning deep check 2026-11-28: the summed amount of one ledger
+// leg (kind + bucket) for an order, or null when no such leg exists
+// — same helper as orders.js ledgerMoveAmount. The paired-leg
+// recoveries use it to prove the SECOND leg exists, for the right
+// amount, before declaring a move complete.
+async function ledgerMoveAmount(orderId, kind, bucket) {
+  if (!supabase || !orderId) return null;
+  const { data, error } = await supabase
+    .from("wallet_ledger")
+    .select("amount")
+    .eq("order_id", orderId)
+    .eq("kind", kind)
+    .eq("bucket", bucket);
+  if (error) {
+    dbError(error, "read ledger move amount");
+    return null;
+  }
+  if (!data || data.length === 0) return null;
+  return data.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Courier tiers
 // ---------------------------------------------------------------------------
@@ -253,6 +274,25 @@ export async function uploadEvidencePhoto(userId, orderId, fileOrDataUrl, label)
   if (error) throw error;
   const { data } = supabase.storage.from(EVIDENCE_BUCKET).getPublicUrl(path);
   return data.publicUrl;
+}
+
+// Morning deep check 2026-11-28: best-effort removal of an uploaded
+// photo by its public URL, so a failed order/checkpoint update does
+// not leave an orphaned file behind. The storage path is the part of
+// the URL after the bucket name. Never throws — cleanup must never
+// mask the real error.
+async function removeEvidencePhoto(publicUrl) {
+  if (!supabase || !publicUrl) return;
+  const marker = `/${EVIDENCE_BUCKET}/`;
+  const at = String(publicUrl).indexOf(marker);
+  if (at < 0) return;
+  const path = String(publicUrl).slice(at + marker.length).split("?")[0];
+  if (!path) return;
+  try {
+    await supabase.storage.from(EVIDENCE_BUCKET).remove([decodeURIComponent(path)]);
+  } catch {
+    // Orphaned file stays — storage hygiene only, never fatal.
+  }
 }
 
 // The delivery PIN belongs to the buyer only (they share it with the
@@ -391,6 +431,20 @@ export async function submitShippingProof(
       "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
     );
   }
+  // Morning deep check 2026-11-28: Chowdeck Relay is same-city
+  // only, at ANY price — the Tier-1 check above only constrains
+  // items over ₦20,000. createOrder refuses it too; this re-check
+  // catches an order created before that fix (or by a direct call).
+  if (
+    order.ship_to_state &&
+    listingRow?.state &&
+    order.ship_to_state !== listingRow.state &&
+    order.courier === "Chowdeck Relay"
+  ) {
+    throw new Error(
+      "Chowdeck Relay only delivers within the same city — this parcel is going to another state."
+    );
+  }
   const waybill = String(waybillNumber || "").trim();
   if (!waybill) {
     throw new Error("Type in the waybill number from the paper waybill.");
@@ -409,10 +463,14 @@ export async function submitShippingProof(
   // check below matches on courier as well as seller. Best effort
   // in the app — the orders read policy only shows the caller their
   // own orders, so a cross-seller reuse is invisible here; the hard
-  // backstop is the partial unique index on (courier, waybill_number)
-  // in milestone-23.sql. The same number with a different courier
-  // is a coincidence (couriers number parcels independently), so it
-  // does not count.
+  // backstop is the unique index on waybill_number alone
+  // (orders_waybill_number_unique_idx, milestone-18.sql) — it is
+  // STRICTER than a (courier, waybill_number) index: the same
+  // number with a different courier is also refused. Loosening it
+  // so two couriers may share a number needs Richard's decision
+  // (see the milestone-24 notes). The same number with a different
+  // courier is a coincidence (couriers number parcels
+  // independently), so it does not count.
   if (supabase) {
     const { data: reuse, error: reuseError } = await supabase
       .from("orders")
@@ -455,9 +513,17 @@ export async function submitShippingProof(
   }
 
   const waybillUrl = await uploadEvidencePhoto(user.id, order.id, waybillBlob, "waybill");
-  const receiptUrl = receiptBlob
-    ? await uploadEvidencePhoto(user.id, order.id, receiptBlob, "receipt")
-    : null;
+  let receiptUrl = null;
+  try {
+    receiptUrl = receiptBlob
+      ? await uploadEvidencePhoto(user.id, order.id, receiptBlob, "receipt")
+      : null;
+  } catch (err) {
+    // The waybill photo is already up but the proof is not saved —
+    // remove it so it does not sit orphaned in the bucket.
+    await removeEvidencePhoto(waybillUrl);
+    throw err;
+  }
 
   // The advance is earned only with a complete proof: a tracked courier
   // (GIG, GUO, DHL, Peace or ABC) AND a waybill number AND a receipt
@@ -491,12 +557,31 @@ export async function submitShippingProof(
     // is still due.
     const fresh = await readOrder(orderId);
     if (fresh && ["shipped", "delivered"].includes(fresh.status) && fresh.waybill_number) {
+      // The other device's proof is the one saved — ours would sit
+      // orphaned in the bucket. Remove it before returning.
+      await removeEvidencePhoto(waybillUrl);
+      await removeEvidencePhoto(receiptUrl);
       return {
         order: withoutDeliveryPin(fresh),
         advanceReleased: Boolean(fresh.shipping_advance_released),
         reason: "Shipping proof was already submitted for this order — the order is shipped.",
       };
     }
+    // Morning deep check 2026-11-28: the waybill number may already
+    // be used by another seller (the app-side reuse check cannot see
+    // other sellers' orders, and the unique index is the backstop).
+    // Say so plainly instead of surfacing the raw database error.
+    if (err?.code === "23505") {
+      await removeEvidencePhoto(waybillUrl);
+      await removeEvidencePhoto(receiptUrl);
+      throw new Error(
+        "That waybill number is already used for another order — check the number on the paper waybill and try again."
+      );
+    }
+    // Any other failure: the proof is not saved, so the photos just
+    // uploaded would sit orphaned in the bucket. Remove them.
+    await removeEvidencePhoto(waybillUrl);
+    await removeEvidencePhoto(receiptUrl);
     throw err;
   }
 
@@ -538,9 +623,21 @@ export async function submitShippingProof(
         reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
       } catch (err) {
         if (err?.code === "23505") {
-          // Another device paid the advance a moment ago.
-          advanceReleased = true;
-          reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
+          // Another device paid the advance a moment ago — but a
+          // 23505 only proves ONE leg collided. A half-written pair
+          // (held leg only, no available leg) must not be reported
+          // as released: verify the available leg first, mirroring
+          // retryShippingAdvance below. If it is missing, the
+          // advance is pending and the seller retries it from the
+          // tracking page (which then reports the half-move plainly).
+          if ((await advanceAlreadyReleased(order.id)) > 0) {
+            advanceReleased = true;
+            reason = `Proof complete — 50% of the shipping fee (${advanceAmount.toLocaleString("en-NG")} naira) has been released to your available balance. The rest is released when the buyer confirms delivery.`;
+          } else {
+            advancePending = true;
+            reason =
+              "Proof recorded and the order is now shipped — but the 50% shipping advance is only half recorded. Use “Retry shipping advance” on the tracking page to release it.";
+          }
         } else {
           advancePending = true;
           reason =
@@ -737,18 +834,28 @@ export async function addCheckpoint(orderId, { status, location, note, photo }) 
   if (photo) {
     photoUrl = await uploadEvidencePhoto(user.id, order.id, photo, "checkpoint");
   }
-  const { data, error } = await supabase
-    .from("shipping_checkpoints")
-    .insert({
-      order_id: order.id,
-      status,
-      location: location ? String(location).trim() : null,
-      note: note ? String(note).trim() : null,
-      photo: photoUrl,
-    })
-    .select()
-    .single();
-  if (error) throw error;
+  let inserted;
+  try {
+    const { data, error } = await supabase
+      .from("shipping_checkpoints")
+      .insert({
+        order_id: order.id,
+        status,
+        location: location ? String(location).trim() : null,
+        note: note ? String(note).trim() : null,
+        photo: photoUrl,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    inserted = data;
+  } catch (err) {
+    // The photo is already up but the checkpoint is not saved —
+    // remove it so it does not sit orphaned in the bucket.
+    await removeEvidencePhoto(photoUrl);
+    throw err;
+  }
+  const data = inserted;
   // Milestone 10: tell the buyer the parcel moved.
   notifyUser(order.buyer_id, {
     kind: "checkpoint",
@@ -891,6 +998,13 @@ export async function openReturn(orderId, { reason, fault }) {
   if (order.payment_method === "cash") {
     throw new Error("Cash orders are paid face to face — there is no held money to refund. Sort it out with the seller directly.");
   }
+  // Morning deep check 2026-11-28: returns are a shipping flow —
+  // the item has to travel back. A meetup order was handed over in
+  // person, so there is nothing to ship back; sort it out with the
+  // seller directly (or report a problem if it is wrong).
+  if (order.delivery_method === "meetup") {
+    throw new Error("Meet-in-person orders are handed over face to face — there is nothing to ship back. Sort it out with the seller directly, or report a problem if the item is wrong.");
+  }
   if (!["shipped", "delivered"].includes(order.status)) {
     throw new Error(
       `This order is ${order.status} — a return can only be opened after the item has shipped.`
@@ -939,7 +1053,7 @@ export async function openReturn(orderId, { reason, fault }) {
 //     only. The seller keeps the shipping advance, and the rest of the
 //     shipping fee is released to the seller. The buyer pays the return
 //     shipping.
-export async function resolveReturn(orderId, { fault }) {
+export async function resolveReturn(orderId, { fault, attested = false }) {
   if (!supabase) throw new Error("Supabase is not configured.");
   const user = await currentUser();
   if (!user) throw new Error("Sign in first.");
@@ -969,6 +1083,30 @@ export async function resolveReturn(orderId, { fault }) {
     throw new Error(
       `This order is ${order.status} — it can no longer be refunded this way.`
     );
+  }
+  // Morning deep check 2026-11-28: a return used to resolve (and
+  // refund) with no proof the item ever came back — the buyer could
+  // keep the item AND get the money. A refund needs either a
+  // verified return photo from the buyer (kind 'return', recorded
+  // in the app) or the team's own attestation that they saw the
+  // item come back. This gate runs before the label correction and
+  // before any money moves, so a refused resolve leaves nothing
+  // changed behind it.
+  if (!attested) {
+    const { data: returnProof, error: proofError } = await supabase
+      .from("evidence")
+      .select("id")
+      .eq("order_id", order.id)
+      .eq("user_id", order.buyer_id)
+      .eq("kind", "return")
+      .eq("verified", true)
+      .limit(1);
+    if (proofError) throw proofError;
+    if (!returnProof || returnProof.length === 0) {
+      throw new Error(
+        "No verified return photo for this order yet — ask the buyer to record one in the Evidence Locker (return photo), or tick that you have seen the item come back yourself."
+      );
+    }
   }
   // The refund legs are priced from the fault stored on the return
   // when it was opened ("Seller fault: ..." / "Buyer fault: ..."),
@@ -1049,6 +1187,21 @@ export async function resolveReturn(orderId, { fault }) {
         : /buyer fault/i.test(refundNote)
           ? false
           : fault === "seller";
+      // Morning deep check 2026-11-28: a held refund leg alone only
+      // proves the FIRST leg exists. A half-written pair (held leg
+      // only, buyer never paid) used to be closed out as a resolved
+      // return here. Verify the buyer's available leg, for the right
+      // amount for the fault the refund was actually priced for —
+      // seller fault pays the full total, buyer fault pays the item
+      // price only — before closing out. Otherwise say plainly that
+      // the refund is only half recorded and the team must check it.
+      const expectedRefund = refundWasSellerFault ? total : itemPrice;
+      const refundPaid = await ledgerMoveAmount(order.id, "refund", "available");
+      if (refundPaid === null || refundPaid !== expectedRefund) {
+        throw new Error(
+          "This refund is only half recorded — the buyer has not been paid back yet. Ask the PulseMarket team to check it."
+        );
+      }
       if (refundWasSellerFault && advance > 0) {
         const { data: existingDebt } = await supabase
           .from("wallet_ledger")
@@ -1207,6 +1360,12 @@ export async function resolveReturn(orderId, { fault }) {
       `The seller keeps the shipping advance${advance > 0 ? ` (${advance} naira)` : ""} and the rest of the shipping fee, and the buyer pays the return shipping.`;
   }
 
+  // Record how the return was proven, so the team can audit it
+  // later: a verified return photo, or the team's own attestation.
+  if (attested) {
+    note += " The team confirmed the item came back in person (no return photo on file).";
+  }
+
   const updated = await updateOrder(orderId, {
     status: "refunded",
     return_status: "resolved",
@@ -1242,6 +1401,55 @@ export async function resolveReturn(orderId, { fault }) {
     orderId: order.id,
   });
   return { order: updated, note };
+}
+
+// Morning deep check 2026-11-28 (SQL review M2): an opened return
+// had NO "reject" exit — a bogus return (buyer changed their mind
+// after opening it, or the claim does not hold up) could only be
+// resolved with a refund, or left open forever with the money
+// frozen. Rejecting is terminal: the order carries on as if the
+// return never happened (release and the 48h auto-release are
+// unblocked again), and the buyer's recourse if something is still
+// wrong is a dispute. No money moves here.
+// NOTE: the database transition opened -> rejected is added by
+// supabase/milestone-24.sql — until that file has been run, the
+// trigger refuses this update and the team sees its plain error.
+export async function rejectReturn(orderId) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const user = await currentUser();
+  if (!user) throw new Error("Sign in first.");
+  if (user.email !== OWNER_EMAIL) {
+    throw new Error("Only the PulseMarket team can reject a return.");
+  }
+  const order = await readOrder(orderId);
+  if (!order) throw new Error("Order not found.");
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
+  }
+  if (order.return_status !== "opened") {
+    throw new Error("There is no open return for this order.");
+  }
+  const updated = await updateOrder(orderId, {
+    return_status: "rejected",
+  });
+  notifyUser(order.buyer_id, {
+    kind: "dispute",
+    title: "Return rejected",
+    body: `The return for order ${order.code} was rejected — the order carries on as normal. If something is still wrong with the item, report a problem from the order page.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  notifyUser(order.seller_id, {
+    kind: "dispute",
+    title: "Return rejected",
+    body: `The return for order ${order.code} was rejected — the order carries on as normal.`,
+    link: `/order/${order.id}`,
+    orderId: order.id,
+  });
+  return {
+    order: updated,
+    note: "Return rejected — the order carries on as normal. The buyer can still report a problem if something is wrong.",
+  };
 }
 
 // Listing reactivation after a refund (APP-14). A status-only
@@ -1331,19 +1539,28 @@ export async function hasSellerDebt(sellerId) {
 
 export async function sellerDebtAmount(sellerId) {
   if (!supabase || !sellerId) return 0;
-  const { data, error } = await supabase
-    .from("wallet_ledger")
-    .select("kind, amount")
-    .eq("user_id", sellerId)
-    .in("kind", ["debt", "repayment"]);
-  if (error) {
-    dbError(error, "read seller debt");
-    return 0;
-  }
+  // Morning deep check 2026-11-28: the old read had no limit, so
+  // PostgREST silently stopped at its 1000-row default and a
+  // seller's debt was undercounted past 1000 rows. Page through
+  // every debt/repayment row (same pattern as getBalances).
   let owed = 0;
-  for (const row of data || []) {
-    if (row.kind === "debt") owed += Math.abs(Number(row.amount) || 0);
-    if (row.kind === "repayment") owed -= Number(row.amount) || 0;
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("wallet_ledger")
+      .select("kind, amount")
+      .eq("user_id", sellerId)
+      .in("kind", ["debt", "repayment"])
+      .range(from, from + PAGE - 1);
+    if (error) {
+      dbError(error, "read seller debt");
+      return 0;
+    }
+    for (const row of data || []) {
+      if (row.kind === "debt") owed += Math.abs(Number(row.amount) || 0);
+      if (row.kind === "repayment") owed -= Number(row.amount) || 0;
+    }
+    if (!data || data.length < PAGE) break;
   }
   return Math.max(0, owed);
 }

@@ -3,7 +3,7 @@
 // too — the buyer opens a chat or makes an offer from this page.
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { SHIPPING_ZONES } from "../lib/data";
+import { SHIPPING_ZONES, universityState } from "../lib/data";
 import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
 import {
   BOOST_TIERS,
@@ -13,11 +13,13 @@ import {
   duplicateListing,
   fetchListing,
   fetchOpenOrderCount,
+  fetchVerificationRowChecked,
   fetchWatchlistIds,
   isBoosted,
   reactivateListing,
   setWatchlisted,
   updateListing,
+  visibleTo,
 } from "../lib/listings";
 import { EmptyState, GhostButton, PrimaryButton } from "../components/ui";
 import { BoostedBadge } from "../components/ListingCard";
@@ -43,6 +45,14 @@ export default function ListingDetail() {
   const [notice, setNotice] = useState("");
   const [chatting, setChatting] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
+  // The signed-in buyer's state, from the server-checked
+  // verification row — Home/Search hide same-state-only listings
+  // from out-of-state buyers, but this page used to show every
+  // listing to everyone who opened a direct link (morning deep
+  // check 2026-11-28). Empty means "not known yet": visibleTo
+  // treats that as visible, and the order itself is refused
+  // server-side + in createOrder when the state really differs.
+  const [buyerState, setBuyerState] = useState("");
   const [statusBusy, setStatusBusy] = useState(false);
   const [sellerRating, setSellerRating] = useState(null);
   // bumpViews used to fire once per effect run — the effect re-runs
@@ -88,6 +98,10 @@ export default function ListingDetail() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    // A new listing starts at its first photo: without this, viewing
+    // photo 3 of one listing then opening another kept the old index
+    // and a 1-photo listing rendered a broken image.
+    setPhoto(0);
     fetchListing(id)
       .then((row) => {
         if (cancelled) return;
@@ -110,6 +124,14 @@ export default function ListingDetail() {
           if (!cancelled) setSaved(ids.includes(id));
         })
         .catch(() => {});
+      // Same-state visibility (see buyerState above): a failed read
+      // leaves the state unknown and the listing stays visible —
+      // the order is still refused when the state really differs.
+      fetchVerificationRowChecked(user.id)
+        .then(({ row }) => {
+          if (!cancelled && row?.university) setBuyerState(universityState(row.university));
+        })
+        .catch(() => {});
     }
     return () => {
       cancelled = true;
@@ -127,6 +149,10 @@ export default function ListingDetail() {
   }
 
   async function doBoost(amount) {
+    // No busy guard before: two fast taps called boostListing twice
+    // (two purchase_boost RPC calls / two pending rows). The button
+    // only disables after re-render.
+    if (boosting) return;
     setBoosting(true);
     setError("");
     try {
@@ -262,6 +288,10 @@ export default function ListingDetail() {
   const boosted = isBoosted(listing);
   const meets = (listing.delivery_methods || []).includes("meetup");
   const ships = (listing.delivery_methods || []).includes("shipping");
+  // Same-state-only listing, out-of-state buyer: hide Buy + Chat
+  // (visibleTo fails open while the buyer's state is still unknown,
+  // so this only hides once the state is known to differ).
+  const hiddenByState = !visibleTo(listing, buyerState);
 
   return (
     <div className="space-y-5">
@@ -366,10 +396,12 @@ export default function ListingDetail() {
       {/* What the buyer pays — calculated automatically from the price */}
       <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
         <p className="font-bold">What the buyer pays</p>
-        <p className="mt-2 flex justify-between">
-          <span>Cash face-to-face (no fees)</span>
-          <span className="font-bold">{formatNaira(cash.total)}</span>
-        </p>
+        {meets ? (
+          <p className="mt-2 flex justify-between">
+            <span>Cash face-to-face (no fees)</span>
+            <span className="font-bold">{formatNaira(cash.total)}</span>
+          </p>
+        ) : null}
         <p className="mt-1 flex justify-between text-neutral-500">
           <span>Item price</span>
           <span>{formatNaira(held.price)}</span>
@@ -386,7 +418,7 @@ export default function ListingDetail() {
           <span>{formatNaira(held.secureFee)}</span>
         </p>
         <p className="mt-1 flex justify-between font-bold">
-          <span>Pay through the app (held, before shipping)</span>
+          <span>Pay through the app {ships ? "(held, before shipping)" : "(held)"}</span>
           <span>{formatNaira(held.total)}</span>
         </p>
         <p className="mt-1 text-neutral-500">
@@ -412,17 +444,24 @@ export default function ListingDetail() {
           </button>
           <PrimaryButton
             onClick={() => navigate(`/checkout/${listing.id}`)}
+            disabled={hiddenByState}
             className="w-full py-3 text-base"
           >
             Buy — Reserve this item
           </PrimaryButton>
-          <GhostButton onClick={chatSeller} disabled={chatting} className="w-full py-2.5">
+          <GhostButton onClick={chatSeller} disabled={chatting || hiddenByState} className="w-full py-2.5">
             {chatting ? "Opening chat…" : "Chat Seller"}
           </GhostButton>
-          <p className="text-center text-xs text-neutral-500">
-            Chat to ask questions or make an offer. Buying puts the money on
-            hold until you confirm the item.
-          </p>
+          {hiddenByState ? (
+            <p className="rounded-xl bg-neutral-100 px-3 py-2 text-center text-sm text-neutral-600 dark:bg-neutral-900">
+              This item is only for students in {listing.state}.
+            </p>
+          ) : (
+            <p className="text-center text-xs text-neutral-500">
+              Chat to ask questions or make an offer. Buying puts the money on
+              hold until you confirm the item.
+            </p>
+          )}
         </div>
       ) : null}
 

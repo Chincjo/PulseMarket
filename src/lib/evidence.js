@@ -459,13 +459,20 @@ export async function uploadEvidence(orderId, { kind, mediaType, fileOrBlob }) {
   if (!user) throw new Error("Sign in first to upload evidence.");
   const { data: order, error: orderError } = await supabase
     .from("orders")
-    .select("id, buyer_id, seller_id")
+    .select("id, buyer_id, seller_id, frozen")
     .eq("id", orderId)
     .maybeSingle();
   if (orderError) throw orderError;
   if (!order) throw new Error("Order not found.");
   if (order.buyer_id !== user.id && order.seller_id !== user.id) {
     throw new Error("Only the buyer or seller of this order can add evidence for it.");
+  }
+  // Morning deep check 2026-11-28: no evidence may change while a
+  // dispute is open — the evidence is part of what the team is
+  // reviewing. Handoff photos already refuse when frozen; Evidence
+  // Locker uploads did not.
+  if (order.frozen) {
+    throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
   // Who may record what: the buyer records the unboxing, dispute
   // and return videos; the seller records the packing video and the
@@ -587,20 +594,48 @@ export async function fetchEvidenceForOrder(orderId) {
   return data || [];
 }
 
-// All evidence across the user's orders, newest first.
-export async function fetchMyEvidence(userId) {
-  if (!supabase || !userId) return [];
+// Morning deep check 2026-11-28: same read as
+// fetchEvidenceForOrder, but the caller can tell a failed read
+// apart from "no evidence". That matters for the delivery gate in
+// OrderDetail: the old function returned [] on ANY error, so a
+// failed read looked exactly like "no verified unboxing video" and
+// the buyer was stuck with a disabled button, no error and no retry.
+export async function fetchEvidenceForOrderChecked(orderId) {
+  if (!supabase || !orderId) return { rows: [], failed: true };
   const { data, error } = await supabase
     .from("evidence")
     .select("*")
-    .eq("user_id", userId)
+    .eq("order_id", orderId)
     .order("created_at", { ascending: false })
     .limit(100);
+  if (error) {
+    dbError(error, "fetch evidence for order");
+    return { rows: [], failed: true };
+  }
+  return { rows: data || [], failed: false };
+}
+
+// All evidence across the user's orders, newest first. Paged the
+// same way as fetchMyOrders: without a `before` cursor a student
+// with more than 100 evidence rows silently lost the older ones
+// (their order sections said "No evidence for this order yet"
+// even though the recordings existed).
+export async function fetchMyEvidence(userId, { before } = {}) {
+  if (!supabase || !userId) return [];
+  let query = supabase
+    .from("evidence")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  if (before) query = query.lt("created_at", before);
+  const { data, error } = await query.limit(100);
   if (error) {
     dbError(error, "fetch my evidence");
     return [];
   }
-  return data || [];
+  const rows = data || [];
+  rows.hasMore = rows.length === 100;
+  return rows;
 }
 
 // Owner of the row only. Also deletes the storage object, so no orphan

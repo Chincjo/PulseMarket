@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, NavLink, Route, Routes, useNavigate } from "react-router-dom";
+import { Link, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Analytics } from "@vercel/analytics/react";
 import Home from "./pages/Home.jsx";
 import Search from "./pages/Search.jsx";
@@ -51,6 +51,7 @@ function applyAppearance(s) {
 function Shell() {
   const { user, loading } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [verification, setVerification] = useState(() => getVerification());
   // Starts true: the full app must never render from the device
   // copy alone. A student under review (or rejected) can write
@@ -356,11 +357,16 @@ function Shell() {
       <main className="mx-auto max-w-2xl px-4 pb-28 pt-4 sm:pb-24">
         <Routes>
           <Route path="/" element={<Home user={user} verification={verification} />} />
-          <Route path="/search" element={<Search />} />
+          <Route path="/search" element={<Search verification={verification} />} />
           <Route path="/sell" element={<Sell verification={verification} />} />
           <Route path="/listing/:id" element={<ListingDetail />} />
           <Route path="/chat" element={<Chat verification={verification} />} />
-          <Route path="/chat/:id" element={<ChatThread verification={verification} />} />
+          {/* key remounts the thread when the chat changes, so the
+              old thread's draft, messages, offer and pickup state can
+              never leak into the new chat — a draft typed in chat A
+              could otherwise be sent to chat B. Without the key the
+              component stayed mounted and only the effect re-ran. */}
+          <Route path="/chat/:id" element={<ChatThread key={location.pathname} verification={verification} />} />
           <Route path="/checkout/:listingId" element={<Checkout />} />
           <Route path="/order/:id" element={<OrderDetail />} />
           <Route path="/handoff/:orderId" element={<Handoff />} />

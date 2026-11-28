@@ -2,12 +2,12 @@
 // coordinator). Shows the order code (the bank-transfer reference),
 // the full fee breakdown, manual-escrow payment instructions, the
 // status timeline, and the actions each role may take at each status.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
 import { autoReleaseDue } from "../lib/autoRelease";
 import { fetchListing } from "../lib/listings";
-import { fetchEvidenceForOrder } from "../lib/evidence";
+import { fetchEvidenceForOrderChecked } from "../lib/evidence";
 import {
   cancelOrder,
   confirmDelivery,
@@ -61,6 +61,13 @@ export default function OrderDetail() {
   // Whether the buyer has a verified unboxing video for this order
   // (see the Confirm delivery button below).
   const [hasVerifiedUnboxing, setHasVerifiedUnboxing] = useState(false);
+  // Whether the evidence read itself failed — a failed read is not
+  // "no video": the old code treated it as one and left the buyer
+  // stuck with a disabled button, no error and no retry.
+  const [evidenceFailed, setEvidenceFailed] = useState(false);
+  // Entry guard for run(): `busy` is only a disabled prop AFTER a
+  // re-render, so two taps in the same tick both fired.
+  const busyRef = useRef("");
 
   const isBuyer = user && order && order.buyer_id === user.id;
   const isSeller = user && order && order.seller_id === user.id;
@@ -71,7 +78,8 @@ export default function OrderDetail() {
   const unboxingMissing =
     order?.delivery_method === "shipping" &&
     ["held", "shipped"].includes(order.status) &&
-    !hasVerifiedUnboxing;
+    !hasVerifiedUnboxing &&
+    !evidenceFailed;
 
   const load = useCallback(async () => {
     try {
@@ -85,7 +93,8 @@ export default function OrderDetail() {
         // media_type 'video', verified=true) — a seller's own clip
         // does not count. Check it here so the button is disabled
         // with a hint instead of failing on tap.
-        const rows = await fetchEvidenceForOrder(row.id);
+        const { rows, failed } = await fetchEvidenceForOrderChecked(row.id);
+        setEvidenceFailed(failed);
         setHasVerifiedUnboxing(
           (rows || []).some(
             (r) =>
@@ -106,6 +115,11 @@ export default function OrderDetail() {
   }, [load]);
 
   async function run(action, fn) {
+    // Entry guard: `busy` only disables the buttons AFTER a
+    // re-render, so two taps in the same tick (or two different
+    // buttons) both used to fire the same money action twice.
+    if (busyRef.current) return;
+    busyRef.current = action;
     setError("");
     setNotice("");
     setBusy(action);
@@ -116,6 +130,7 @@ export default function OrderDetail() {
     } catch (err) {
       setError(err?.message || "Something went wrong. Please try again.");
     } finally {
+      busyRef.current = "";
       setBusy("");
     }
   }
@@ -420,11 +435,19 @@ export default function OrderDetail() {
           <>
             <PrimaryButton
               className="w-full py-3"
-              disabled={busy !== "" || unboxingMissing}
+              disabled={busy !== "" || unboxingMissing || order.frozen}
               onClick={() => run("delivered", () => confirmDelivery(order.id, user.id))}
             >
               {busy === "delivered" ? "Saving…" : "Confirm delivery — I received the item"}
             </PrimaryButton>
+            {evidenceFailed && (
+              <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
+                Could not check your unboxing video — the check itself failed.{" "}
+                <button type="button" className="font-semibold text-brown underline" onClick={() => load()}>
+                  Check again
+                </button>
+              </p>
+            )}
             {unboxingMissing && (
               <p className="rounded-xl bg-neutral-100 px-3 py-2 text-sm text-neutral-600 dark:bg-neutral-900">
                 Record your unboxing video in the{" "}
@@ -437,7 +460,7 @@ export default function OrderDetail() {
         {isBuyer && order.payment_method === "cash" && order.status === "reserved" && (
           <PrimaryButton
             className="w-full py-3"
-            disabled={busy !== ""}
+            disabled={busy !== "" || order.frozen}
             onClick={() => run("delivered", () => confirmDelivery(order.id, user.id))}
           >
             {busy === "delivered" ? "Saving…" : "Confirm meetup — I received the item"}
@@ -446,7 +469,7 @@ export default function OrderDetail() {
         {isOwner && order.status === "paid" && (
           <PrimaryButton
             className="w-full py-3"
-            disabled={busy !== ""}
+            disabled={busy !== "" || order.frozen}
             onClick={() => run("held", () => confirmReceipt(order.id, user))}
           >
             {busy === "held" ? "Saving…" : "Confirm receipt — money now held"}
@@ -490,7 +513,7 @@ export default function OrderDetail() {
         (isSeller && order.status === "reserved") ? (
           <GhostButton
             className="w-full py-3"
-            disabled={busy !== ""}
+            disabled={busy !== "" || order.frozen}
             onClick={() => run("cancelled", () => cancelOrder(order.id, user))}
           >
             {busy === "cancelled" ? "Cancelling…" : "Cancel order"}

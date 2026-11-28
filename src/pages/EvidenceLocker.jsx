@@ -66,6 +66,10 @@ function EvidenceItem({ item, onDeleted }) {
   const src = signedUrls.get(item.url) || item.url;
 
   async function handleDelete() {
+    // Entry guard: the button only disables after a re-render, so
+    // a fast double-click fired deleteEvidence twice (the second
+    // click lands after the confirm dialog closes).
+    if (deleting) return;
     if (!window.confirm("Delete this evidence? This cannot be undone.")) return;
     setError("");
     setDeleting(true);
@@ -238,6 +242,10 @@ function UploadBox({ order, defaultKind, onUploaded }) {
 
   async function uploadPhoto(file) {
     if (!file) return;
+    // Entry guard, like uploadClip above: a double-tap saved the
+    // same photo twice (the disabled button only helps after a
+    // re-render).
+    if (busy) return;
     if (file.size > 10 * 1024 * 1024) {
       setError("That photo is too big — keep evidence photos under 10MB.");
       return;
@@ -373,6 +381,15 @@ function UploadBox({ order, defaultKind, onUploaded }) {
 export default function EvidenceLocker() {
   const { user } = useAuth();
   const [orders, setOrders] = useState([]);
+  // fetchMyOrders caps at 200 rows a page — without paging, a
+  // student with more than 200 orders silently lost the older ones
+  // (and their evidence) from this page. Same before/hasMore
+  // pattern as the notifications list.
+  const [hasMoreOrders, setHasMoreOrders] = useState(false);
+  const [loadingMoreOrders, setLoadingMoreOrders] = useState(false);
+  // fetchMyEvidence caps at 100 rows a page — same paging as orders,
+  // or evidence on older orders never renders.
+  const [hasMoreEvidence, setHasMoreEvidence] = useState(false);
   const [evidence, setEvidence] = useState([]);
   const [titles, setTitles] = useState({});
   const [loading, setLoading] = useState(true);
@@ -391,7 +408,9 @@ export default function EvidenceLocker() {
         fetchMyEvidence(user.id),
       ]);
       setOrders(myOrders || []);
+      setHasMoreOrders(myOrders?.hasMore === true);
       setEvidence(myEvidence || []);
+      setHasMoreEvidence(myEvidence?.hasMore === true);
       // Item titles, in ONE query — the old code fetched one listing
       // per order (N+1), which made the locker crawl with many orders.
       const listingIds = [...new Set((myOrders || []).map((o) => o.listing_id).filter(Boolean))];
@@ -407,6 +426,47 @@ export default function EvidenceLocker() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Next page of orders, from the last row's created_at — with
+  // titles for the new rows, so the older orders show their item
+  // names instead of "Item". The next page of evidence rides along
+  // when there is one, so older recordings render too.
+  async function loadMoreOrders() {
+    if (!user || loadingMoreOrders || (!hasMoreOrders && !hasMoreEvidence)) return;
+    setLoadingMoreOrders(true);
+    setError("");
+    try {
+      if (hasMoreOrders && orders.length > 0) {
+        const last = orders[orders.length - 1];
+        const rows = await fetchMyOrders(user.id, { before: last.created_at });
+        setOrders((prev) => [...prev, ...(rows || [])]);
+        setHasMoreOrders(rows?.hasMore === true);
+        const listingIds = [...new Set((rows || []).map((o) => o.listing_id).filter(Boolean))];
+        if (listingIds.length > 0) {
+          const newRows = await fetchListingsByIds(listingIds);
+          setTitles((prev) => ({
+            ...prev,
+            ...Object.fromEntries(newRows.map((l) => [l.id, l.title || "Item"])),
+          }));
+        }
+      }
+      if (hasMoreEvidence && evidence.length > 0) {
+        const lastEvidence = evidence[evidence.length - 1];
+        const rows = await fetchMyEvidence(user.id, { before: lastEvidence.created_at });
+        // Dedupe by id: two rows stamped in the same millisecond can
+        // straddle the page boundary and come back twice.
+        setEvidence((prev) => {
+          const seen = new Set(prev.map((r) => r.id));
+          return [...prev, ...(rows || []).filter((r) => !seen.has(r.id))];
+        });
+        setHasMoreEvidence(rows?.hasMore === true);
+      }
+    } catch (err) {
+      setError(err?.message || "Could not load more orders. Try again.");
+    } finally {
+      setLoadingMoreOrders(false);
+    }
+  }
 
   function handleDeleted(id) {
     setEvidence((prev) => prev.filter((row) => row.id !== id));
@@ -477,14 +537,15 @@ export default function EvidenceLocker() {
               }
             />
           ) : (
-            orders.map((order) => {
-              const items = byOrder[order.id] || [];
-              const isBuyer = order.buyer_id === user.id;
-              return (
-                <section
-                  key={order.id}
-                  className="rounded-2xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950"
-                >
+            <>
+              {orders.map((order) => {
+                const items = byOrder[order.id] || [];
+                const isBuyer = order.buyer_id === user.id;
+                return (
+                  <section
+                    key={order.id}
+                    className="rounded-2xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950"
+                  >
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <h2 className="font-semibold">{titles[order.listing_id] || "Item"}</h2>
@@ -529,7 +590,20 @@ export default function EvidenceLocker() {
                   )}
                 </section>
               );
-            })
+            })}
+            {hasMoreOrders || hasMoreEvidence ? (
+              <div className="pt-1 text-center">
+                {hasMoreOrders ? (
+                  <p className="text-xs text-neutral-500">Showing the first {orders.length} orders.</p>
+                ) : (
+                  <p className="text-xs text-neutral-500">Showing the first {evidence.length} recordings.</p>
+                )}
+                <GhostButton onClick={loadMoreOrders} disabled={loadingMoreOrders}>
+                  {loadingMoreOrders ? "Loading…" : "Load more"}
+                </GhostButton>
+              </div>
+            ) : null}
+          </>
           )}
         </div>
       )}

@@ -64,6 +64,8 @@ export default function Handoff() {
   const [myPhotoPreview, setMyPhotoPreview] = useState("");
   const photoInputRef = useRef(null);
   const scanInputRef = useRef(null);
+  // Entry guard for run() — see below.
+  const busyRef = useRef("");
 
   const isBuyer = user && order && order.buyer_id === user.id;
   const isSeller = user && order && order.seller_id === user.id;
@@ -110,6 +112,11 @@ export default function Handoff() {
   }, [load]);
 
   async function run(action, fn) {
+    // Entry guard: `busy` only disables the buttons AFTER a
+    // re-render, so two taps in the same tick (or two different
+    // buttons) both used to fire the same action twice.
+    if (busyRef.current) return;
+    busyRef.current = action;
     setError("");
     setNotice("");
     setBusy(action);
@@ -129,6 +136,7 @@ export default function Handoff() {
     } catch (err) {
       setError(err?.message || "Something went wrong. Please try again.");
     } finally {
+      busyRef.current = "";
       setBusy("");
     }
   }
@@ -354,9 +362,15 @@ export default function Handoff() {
                 autoComplete="off"
                 disabled={locked || frozen || busy !== ""}
               />
+              {/* Morning deep check 2026-11-28: a seller code is
+                  always PM- + 6 letters/digits (no I, O, 0 or 1).
+                  A typo or a partial code used to reach the server
+                  and burn one of the 5 attempts — the button stays
+                  off until the code looks right, and the lib refuses
+                  a malformed code too. */}
               <div className="mt-3 flex gap-2">
                 <PrimaryButton
-                  disabled={locked || frozen || busy !== "" || !codeInput.trim()}
+                  disabled={locked || frozen || busy !== "" || !/^PM-[A-HJ-NP-Z2-9]{6}$/.test(codeInput.trim())}
                   onClick={() => run("scan", () => scanSellerCode(orderId, codeInput))}
                 >
                   {busy === "scan" ? "Checking…" : "Check code"}
@@ -368,6 +382,11 @@ export default function Handoff() {
                   Photograph the QR code
                 </GhostButton>
               </div>
+              {codeInput.trim() && !/^PM-[A-HJ-NP-Z2-9]{6}$/.test(codeInput.trim()) && (
+                <p className="mt-2 text-xs text-neutral-500">
+                  A seller code looks like PM-ABC123 — 6 letters or numbers after PM-, with no I, O, 0 or 1.
+                </p>
+              )}
               <p className="mt-2 text-xs text-neutral-500">
                 The photo is not decoded — read the code on the seller's phone and type it in the box above.
               </p>

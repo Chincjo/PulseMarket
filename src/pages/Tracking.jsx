@@ -9,7 +9,7 @@
 // live GPS — it shows the progress bar, the rider card and the PIN,
 // with the plain note "Live rider map arrives when a rider app is
 // connected."
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { formatNaira } from "../lib/fees";
 import { fetchListing } from "../lib/listings";
@@ -17,7 +17,7 @@ import { fetchConversationForListing } from "../lib/chat";
 import { OWNER_EMAIL } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
-import { useSignedEvidenceUrls } from "../lib/evidence";
+import { fetchEvidenceForOrderChecked, useSignedEvidenceUrls } from "../lib/evidence";
 import {
   CHECKPOINT_LABELS,
   CHECKPOINT_STATUSES,
@@ -28,6 +28,7 @@ import {
   courierTiers,
   fetchTracking,
   openReturn,
+  rejectReturn,
   resolveReturn,
   retryShippingAdvance,
   submitShippingProof,
@@ -129,12 +130,32 @@ export default function Tracking() {
   const [pinInput, setPinInput] = useState("");
   const [returnReason, setReturnReason] = useState(RETURN_REASONS[0]);
   const [returnFault, setReturnFault] = useState("seller");
+  // Team attestation for a return resolved without a verified
+  // return photo (the team saw the item come back themselves).
+  const [returnAttested, setReturnAttested] = useState(false);
+  // Whether the buyer has a verified unboxing video — the PIN
+  // confirm is gated on it in lib, so the button is disabled here
+  // with a hint instead of failing on tap. `evidenceFailed` means
+  // the check itself failed, which is not "no video".
+  const [hasVerifiedUnboxing, setHasVerifiedUnboxing] = useState(false);
+  const [evidenceFailed, setEvidenceFailed] = useState(false);
+  // Entry guard for run(): `busy` only disables the buttons AFTER a
+  // re-render, so two taps in the same tick both fired.
+  const busyRef = useRef("");
 
   const isBuyer = user && order && order.buyer_id === user.id;
   const isSeller = user && order && order.seller_id === user.id;
   const isOwner = user?.email === OWNER_EMAIL;
   const isSameCity = order?.courier === "Chowdeck Relay";
   const isInterstate = order && !isSameCity;
+  // The PIN confirm is gated on the buyer's verified unboxing video
+  // (lib rule in orders.js) — disable the button with a hint when
+  // it is missing, instead of letting the tap fail.
+  const unboxingMissing =
+    order?.delivery_method === "shipping" &&
+    order.status === "shipped" &&
+    !hasVerifiedUnboxing &&
+    !evidenceFailed;
 
   const load = useCallback(async () => {
     try {
@@ -144,6 +165,21 @@ export default function Tracking() {
         setCheckpoints(result.checkpoints || []);
         const item = await fetchListing(result.order.listing_id);
         setListing(item);
+        // The lib's PIN confirm refuses a shipping order without
+        // the BUYER's verified unboxing video — check it here so
+        // the button is disabled with a hint instead of failing on
+        // tap (same pattern as OrderDetail).
+        const { rows, failed } = await fetchEvidenceForOrderChecked(result.order.id);
+        setEvidenceFailed(failed);
+        setHasVerifiedUnboxing(
+          (rows || []).some(
+            (r) =>
+              r.kind === "unboxing" &&
+              r.media_type === "video" &&
+              r.verified === true &&
+              r.user_id === result.order.buyer_id
+          )
+        );
         if (user) {
           // One query for this order's chat — the old code loaded the
           // whole conversation list (with a last-message + unread
@@ -175,6 +211,11 @@ export default function Tracking() {
   }, [order?.id]);
 
   async function run(action, fn, onDone) {
+    // Entry guard: `busy` only disables the buttons AFTER a
+    // re-render, so two taps in the same tick (or two different
+    // buttons) both used to fire the same money action twice.
+    if (busyRef.current) return;
+    busyRef.current = action;
     setError("");
     setNotice("");
     setBusy(action);
@@ -189,6 +230,7 @@ export default function Tracking() {
     } catch (err) {
       setError(err?.message || "Something went wrong. Please try again.");
     } finally {
+      busyRef.current = "";
       setBusy("");
     }
   }
@@ -548,13 +590,30 @@ export default function Tracking() {
           />
           <PrimaryButton
             className="w-full py-3"
-            disabled={busy !== "" || pinInput.length !== 6}
+            disabled={busy !== "" || pinInput.length !== 6 || unboxingMissing}
             onClick={() =>
               run("pin", () => confirmDeliveryWithPin(order.id, pinInput, user.id), () => setPinInput(""))
             }
           >
             {busy === "pin" ? "Checking…" : "Confirm delivery — I received the item"}
           </PrimaryButton>
+          {evidenceFailed && (
+            <p className="text-sm text-neutral-500">
+              Could not check your unboxing video — the check itself failed.{" "}
+              <button type="button" className="font-semibold text-brown underline" onClick={() => load()}>
+                Check again
+              </button>
+            </p>
+          )}
+          {unboxingMissing && (
+            <p className="text-sm text-neutral-500">
+              Record your unboxing video in the{" "}
+              <Link to="/evidence" className="font-semibold text-brown underline">
+                Evidence Locker
+              </Link>{" "}
+              first — the button unlocks once it is verified.
+            </p>
+          )}
         </section>
       )}
 
@@ -839,7 +898,7 @@ export default function Tracking() {
           </p>
         </section>
       )}
-      {isBuyer && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && order.payment_method !== "cash" && (
+      {isBuyer && order.delivery_method === "shipping" && ["shipped", "delivered"].includes(order.status) && !order.frozen && order.return_status !== "opened" && order.return_status !== "resolved" && order.payment_method !== "cash" && (
         <section className="space-y-3 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
           <h2 className="text-lg font-bold">Open a return</h2>
           <p className="text-sm text-neutral-500">
@@ -886,20 +945,46 @@ export default function Tracking() {
           <p className="mt-1 text-sm text-neutral-500">
             The PulseMarket team will resolve it after looking at the evidence.
           </p>
+          {isBuyer && (
+            <p className="mt-1 text-sm">
+              Before the team can refund you, they need proof the item came back — record a return photo in the{" "}
+              <Link to="/evidence" className="font-semibold text-brown underline">
+                Evidence Locker
+              </Link>
+              .
+            </p>
+          )}
           {isOwner && (
             <div className="mt-3 flex flex-col gap-2">
               <PrimaryButton
                 disabled={busy !== ""}
-                onClick={() => run("resolve-seller", () => resolveReturn(order.id, { fault: "seller" }))}
+                onClick={() => run("resolve-seller", () => resolveReturn(order.id, { fault: "seller", attested: returnAttested }))}
               >
                 {busy === "resolve-seller" ? "Resolving…" : "Resolve — seller fault (full refund to buyer)"}
               </PrimaryButton>
               <PrimaryButton
                 disabled={busy !== ""}
-                onClick={() => run("resolve-buyer", () => resolveReturn(order.id, { fault: "buyer" }))}
+                onClick={() => run("resolve-buyer", () => resolveReturn(order.id, { fault: "buyer", attested: returnAttested }))}
               >
                 {busy === "resolve-buyer" ? "Resolving…" : "Resolve — buyer fault (item price only)"}
               </PrimaryButton>
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={returnAttested}
+                  onChange={(e) => setReturnAttested(e.target.checked)}
+                />
+                <span>
+                  I have seen the item come back myself (no return photo on file) — resolving without a verified return photo.
+                </span>
+              </label>
+              <GhostButton
+                disabled={busy !== ""}
+                onClick={() => run("reject-return", () => rejectReturn(order.id))}
+              >
+                {busy === "reject-return" ? "Rejecting…" : "Reject return — the claim does not hold up"}
+              </GhostButton>
             </div>
           )}
         </section>
