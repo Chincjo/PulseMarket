@@ -6,7 +6,7 @@
 // publishes themselves.
 //
 // EVERYTHING the form asks for is compulsory: the seller must pick a
-// condition, a category, a delivery method (and courier + ships-to for
+// condition, a category, a delivery method (and transport + ships-to for
 // shipping, or a safe meetup spot for meetups), add at least 1 photo and
 // write a description of at least 20 characters. Only "What does it cost
 // new?" is optional — it only feeds the suggested price. Each step refuses
@@ -16,8 +16,8 @@
 // bypassing this form.
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { CATEGORIES, CONDITIONS, SAFE_MEETUP_SPOTS, universityState } from "../lib/data";
-import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel, suggestPrice } from "../lib/fees";
+import { CATEGORIES, CONDITIONS, GENERIC_MEETUP_SPOTS, SAFE_MEETUP_SPOTS, currencySymbol, universityState } from "../lib/data";
+import { feeBreakdown, feeLabels, formatMoney, serviceFeeLabel, suggestPrice } from "../lib/fees";
 import { createListingRow, uploadListingPhotos } from "../lib/listings";
 import { assertSellerClearOfDebt } from "../lib/shipping";
 import { isSupabaseConfigured } from "../lib/supabase";
@@ -77,12 +77,22 @@ export default function Sell({ verification }) {
   const [publishing, setPublishing] = useState(false);
   const [error, setError] = useState("");
 
-  // The listing belongs to the seller's verified university — locked.
+  // Milestone 25: the listing belongs to the seller's verified
+  // identity — a student's university (locked) or an ordinary
+  // seller's country (locked). Prices are in the seller's locked
+  // currency.
+  const isOrdinary = verification?.accountType === "ordinary";
   const university = verification?.university || "";
-  const state = universityState(university);
+  const country = verification?.country || "Nigeria";
+  const currency = verification?.currency || "NGN";
+  const curSymbol = currencySymbol(currency);
+  const meetupSpots = isOrdinary ? GENERIC_MEETUP_SPOTS : SAFE_MEETUP_SPOTS;
+  const [region, setRegion] = useState(country);
+  const state = isOrdinary ? region.trim() : universityState(university);
 
   const suggested = newPrice && condition ? suggestPrice(newPrice, condition) : null;
-  const fees = feeBreakdown(price, "held");
+  const fees = feeBreakdown(price, "held", currency);
+  const labels = feeLabels(currency);
 
   // -------------------------------------------------------------------------
   // Compulsory-field rules. missingFor(step) names exactly what is still
@@ -100,8 +110,8 @@ export default function Sell({ verification }) {
       }
       case 1: {
         const n = Math.round(Number(price) || 0);
-        if (!price || n <= 0) return ["Your price (above ₦0)"];
-        if (n > 50000000) return ["Your price (under ₦50,000,000)"];
+        if (!price || n <= 0) return ["Your price (above 0)"];
+        if (n > 50000000) return ["Your price (under 50,000,000)"];
         return [];
       }
       case 2: {
@@ -109,14 +119,15 @@ export default function Sell({ verification }) {
         if (!delivery) {
           missing.push("Delivery choice (Meet in person or Ship it)");
         } else if (delivery === "shipping") {
-          if (!courier) missing.push("Courier");
-          if (!shipsTo) missing.push("Who can buy this (same state or anywhere in Nigeria)");
+          if (!courier.trim()) missing.push("Transport");
+          if (!shipsTo) missing.push("Who can buy this (same state or anywhere)");
         }
         return missing;
       }
       case 3:
-        // Campus is locked from verification — nothing to fill in here.
-        return [];
+        // Student: campus is locked from verification — nothing to
+        // fill in here. Ordinary: the state / region is free text.
+        return isOrdinary && !region.trim() ? ["State / region"] : [];
       case 4:
         return photos.length === 0 ? ["At least 1 photo"] : [];
       case 5:
@@ -207,8 +218,12 @@ export default function Sell({ verification }) {
       setError("Publishing is not switched on yet — the owner is setting up the listings database. Try again soon.");
       return;
     }
-    if (!university) {
+    if (!isOrdinary && !university) {
       setError("Your university is not set. Please finish verification first.");
+      return;
+    }
+    if (isOrdinary && !country) {
+      setError("Your country is not set. Please finish verification first.");
       return;
     }
     setPublishing(true);
@@ -231,11 +246,13 @@ export default function Sell({ verification }) {
         price: Math.max(0, Math.round(Number(price) || 0)),
         condition,
         category,
-        university,
+        university: isOrdinary ? null : university,
         state,
+        country,
+        currency,
         ships_to: delivery === "shipping" ? shipsTo : "same_state",
         delivery_methods: delivery === "shipping" ? ["shipping"] : ["meetup"],
-        courier: delivery === "shipping" ? courier : null,
+        courier: delivery === "shipping" ? courier.trim() : null,
         meetup_spot: delivery === "meetup" ? spot : null,
         photos: photoUrls,
         status: "active",
@@ -258,8 +275,8 @@ export default function Sell({ verification }) {
       <div className="space-y-4 pt-6 text-center">
         <p className="text-2xl font-bold">Your listing is live</p>
         <p className="text-neutral-500">
-          Students in {state} can see it now
-          {published.ships_to === "nationwide" ? " — and students anywhere in Nigeria too, because you ship nationwide" : ""}.
+          {isOrdinary ? "Buyers" : "Students"} in {state} can see it now
+          {published.ships_to === "nationwide" ? " — and buyers anywhere too, because you ship nationwide" : ""}.
           You keep the full price; the buyer pays any fees.
         </p>
         <div className="flex flex-wrap justify-center gap-2">
@@ -274,15 +291,20 @@ export default function Sell({ verification }) {
     <div className="space-y-5 pb-24">
       <h1 className="text-2xl font-bold">Sell an item</h1>
       <div className="flex flex-wrap gap-1.5">
-        {STEPS.map((s, i) => (
-          <button
-            key={s}
-            onClick={() => goToStep(i)}
-            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${i === step ? "bg-brown text-white" : "bg-neutral-100 dark:bg-neutral-900"}`}
-          >
-            {i + 1}. {s}
-          </button>
-        ))}
+        {STEPS.map((s, i) => {
+          // Milestone 25: step 3 is "Location", not "Campus", for
+          // ordinary sellers.
+          const label = isOrdinary && s === "Campus" ? "Location" : s;
+          return (
+            <button
+              key={s}
+              onClick={() => goToStep(i)}
+              className={`rounded-full px-2.5 py-1 text-xs font-semibold ${i === step ? "bg-brown text-white" : "bg-neutral-100 dark:bg-neutral-900"}`}
+            >
+              {i + 1}. {label}
+            </button>
+          );
+        })}
       </div>
 
       {step === 0 && (
@@ -312,21 +334,21 @@ export default function Sell({ verification }) {
           </label>
           {suggested !== null && suggested > 0 && (
             <p className="rounded-xl bg-brown-soft px-3 py-2 text-sm text-brown-dark">
-              Suggested price for {condition}: <b>{formatNaira(suggested)}</b> — you can change it below.
+              Suggested price for {condition}: <b>{formatMoney(suggested, currency)}</b> — you can change it below.
             </p>
           )}
-          <label className="block text-sm font-semibold">Your price (₦)
+          <label className="block text-sm font-semibold">Your price ({curSymbol})
             <input value={price} onChange={(e) => setPrice(e.target.value)} type="number" placeholder="e.g. 8500" className={`${inputCls} mt-1`} />
           </label>
           {price && Number(price) > 0 ? (
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">What the buyer pays</p>
-              <p className="mt-1 flex justify-between"><span>Item price</span><span>{formatNaira(fees.price)}</span></p>
-              <p className="flex justify-between text-neutral-500"><span>Service fee {serviceFeeLabel(fees.price)}</span><span>{formatNaira(fees.serviceFee)}</span></p>
-              <p className="flex justify-between text-neutral-500"><span>Secure payment fee {FEE_LABELS.secure}</span><span>{formatNaira(fees.secureFee)}</span></p>
-              <p className="mt-1 flex justify-between font-bold"><span>Buyer pays (held)</span><span>{formatNaira(fees.total)}</span></p>
+              <p className="mt-1 flex justify-between"><span>Item price</span><span>{formatMoney(fees.price, currency)}</span></p>
+              <p className="flex justify-between text-neutral-500"><span>Service fee {serviceFeeLabel(fees.price, currency)}</span><span>{formatMoney(fees.serviceFee, currency)}</span></p>
+              <p className="flex justify-between text-neutral-500"><span>Secure payment fee {labels.secure}</span><span>{formatMoney(fees.secureFee, currency)}</span></p>
+              <p className="mt-1 flex justify-between font-bold"><span>Buyer pays (held)</span><span>{formatMoney(fees.total, currency)}</span></p>
               <p className="mt-1 text-neutral-500">Shipping is charged on top at checkout when shipping is chosen — it is not part of this total.</p>
-              <p className="mt-1 text-neutral-500">Cash face-to-face: no fees — buyer pays {formatNaira(fees.price)}. You keep the full price either way.</p>
+              <p className="mt-1 text-neutral-500">Cash face-to-face: no fees — buyer pays {formatMoney(fees.price, currency)}. You keep the full price either way.</p>
             </div>
           ) : null}
         </div>
@@ -341,29 +363,30 @@ export default function Sell({ verification }) {
           </div>
           {delivery === "shipping" && (
             <>
-              <label className="block text-sm font-semibold">Courier
-                <select value={courier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
-                  <option value="">Choose a courier…</option>
-                  {/* Canonical courier names — the shipping advance,
-                      courier tiers and the database all match on these
-                      exact strings. The old short names ("GIG", "GUO",
-                      "DHL", "Bus Park") matched nothing, so a listing
-                      shipped with GIG could never earn its 50%
-                      shipping advance. */}
-                  {["GIG Logistics", "GUO Transport", "Peace Logistics", "ABC Transport", "DHL Domestic", "Chowdeck Relay", "Bus Park Waybill"].map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
+              <label className="block text-sm font-semibold">Transport — the company or transport you will send it with (e.g. GIG Logistics, GUO Transport, Air Peace, God is Good Motors, DHL)
+                <input
+                  value={courier}
+                  onChange={(e) => setCourier(e.target.value)}
+                  maxLength={120}
+                  placeholder="e.g. GIG Logistics"
+                  className={`${inputCls} mt-1`}
+                />
               </label>
               <div>
                 <p className="text-sm font-semibold">Who can buy this?</p>
                 <div className="mt-1 flex gap-2">
-                  <button onClick={() => setShipsTo("same_state")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${shipsTo === "same_state" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>Same state only ({state || "your state"})</button>
-                  <button onClick={() => setShipsTo("nationwide")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${shipsTo === "nationwide" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>Anywhere in Nigeria</button>
+                  <button onClick={() => setShipsTo("same_state")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${shipsTo === "same_state" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>{isOrdinary ? "Same region only" : "Same state only"} ({state || "your state"})</button>
+                  <button onClick={() => setShipsTo("nationwide")} className={`flex-1 rounded-xl border px-3 py-3 text-sm font-semibold ${shipsTo === "nationwide" ? "border-brown bg-brown-soft" : "border-neutral-300 dark:border-neutral-700"}`}>{isOrdinary ? "Anywhere in the world" : "Anywhere in Nigeria"}</button>
                 </div>
                 <p className="mt-1 text-sm text-neutral-500">
                   {shipsTo === "same_state"
-                    ? "Only students in your state will see this listing."
+                    ? isOrdinary
+                      ? "Only buyers in your region will see this listing."
+                      : "Only students in your state will see this listing."
                     : shipsTo === "nationwide"
-                      ? "Students in every state will see this listing, because you ship anywhere."
+                      ? isOrdinary
+                        ? "Buyers anywhere in the world will see this listing, because you ship anywhere."
+                        : "Students in every state will see this listing, because you ship anywhere."
                       : "Pick one so buyers know where this item can go."}
                 </p>
               </div>
@@ -373,7 +396,7 @@ export default function Sell({ verification }) {
             {delivery === "meetup"
               ? "Face-to-face: the buyer scans your seller code at handoff before any money moves."
               : delivery === "shipping"
-                ? "Shipping: GIG / GUO between states, Chowdeck Relay same-city. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery."
+                ? "Shipping: you send it with the transport you named above — a courier, a bus company or an airline. You get 50% of the shipping fee after shipping proof — a waybill number and receipt photo — the rest is released when the buyer confirms delivery."
                 : "Choose one to continue."}
           </p>
         </div>
@@ -381,10 +404,32 @@ export default function Sell({ verification }) {
 
       {step === 3 && (
         <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
-          <p className="font-bold">Your university (locked)</p>
-          <p className="mt-1">{university || "Not set — finish verification first."}</p>
-          {state ? <p className="mt-1 text-neutral-500">Your listings show first to students in {state}.</p> : null}
-          <p className="mt-1 text-neutral-500">Your university is locked from your verification — it cannot be changed here.</p>
+          {isOrdinary ? (
+            <>
+              <p className="font-bold">Your country (locked)</p>
+              <p className="mt-1">{country || "Not set — finish verification first."}</p>
+              <p className="mt-1 text-neutral-500">Currency: {currency} — your listings are priced in {currency}.</p>
+              <p className="mt-1 text-neutral-500">Your country is locked from your verification — it cannot be changed here.</p>
+              <label className="mt-3 block text-sm font-semibold">
+                State / region
+                <input
+                  value={region}
+                  onChange={(e) => setRegion(e.target.value)}
+                  maxLength={120}
+                  placeholder={country}
+                  className={`${inputCls} mt-1`}
+                />
+              </label>
+              <p className="mt-1 text-neutral-500">Where in {country} is the item? Buyers nearby see it first.</p>
+            </>
+          ) : (
+            <>
+              <p className="font-bold">Your university (locked)</p>
+              <p className="mt-1">{university || "Not set — finish verification first."}</p>
+              {state ? <p className="mt-1 text-neutral-500">Your listings show first to students in {state}.</p> : null}
+              <p className="mt-1 text-neutral-500">Your university is locked from your verification — it cannot be changed here.</p>
+            </>
+          )}
         </div>
       )}
 
@@ -440,13 +485,13 @@ export default function Sell({ verification }) {
             <label className="block text-sm font-semibold">Safe meetup spot
               <select value={spot} onChange={(e) => setSpot(e.target.value)} className={`${inputCls} mt-1`}>
                 <option value="">Choose a safe meetup spot…</option>
-                {SAFE_MEETUP_SPOTS.map((s) => <option key={s} value={s}>{s}</option>)}
+                {meetupSpots.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             </label>
           ) : (
             <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
               <p className="font-bold">Shipping chosen</p>
-              <p className="mt-1 text-neutral-500">Shipping is added on top at checkout — the buyer pays it through the app, not to the courier. You get 50% of the shipping fee after shipping proof; the rest is released when the buyer confirms delivery.</p>
+              <p className="mt-1 text-neutral-500">Shipping is added on top at checkout — the buyer pays it through the app, not to the transport. You get 50% of the shipping fee after shipping proof — a waybill number and receipt photo — the rest is released when the buyer confirms delivery.</p>
             </div>
           )}
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">

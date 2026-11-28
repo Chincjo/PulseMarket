@@ -185,7 +185,7 @@ async function currentUserId() {
 }
 
 // The delivery PIN belongs to the buyer only (they share it with the
-// courier at handover). Page-facing reads strip it from any order
+// driver at handover). Page-facing reads strip it from any order
 // the signed-in user did not buy — the PIN never sits in a seller's
 // or the team's page state. Internal money functions keep using
 // readOrder() (full row); only the buyer-only PIN check
@@ -218,7 +218,10 @@ export async function createOrder({
   meetupSpot,
   shipToState,
   courier,
+  transportRef,
   buyerState,
+  buyerCountry,
+  shipToCountry,
   agreedPrice,
   conversationId,
 }) {
@@ -249,12 +252,12 @@ export async function createOrder({
   if (deliveryMethod === "shipping" && !shipToState) {
     throw new Error("Choose the state to ship to.");
   }
-  // Night deep check 2026-11-27: a shipping order needs a courier.
-  // Without this a >₦20,000 interstate order could be created with
-  // courier: null and sail straight past the Tier 1 check below
-  // (it only fired when a courier was supplied).
-  if (deliveryMethod === "shipping" && !courier) {
-    throw new Error("Choose a courier to ship with.");
+  // A shipping order needs a transport name — free text the seller
+  // typed (a courier, bus company, airline or cargo company). There
+  // is no courier list and no tier that restricts which transport a
+  // parcel may travel with, at any price or distance.
+  if (deliveryMethod === "shipping" && !String(courier || "").trim()) {
+    throw new Error("Type the name of the transport you will send it with.");
   }
   // Night deep check 2026-11-27: only a verified student may buy.
   // The database (DB-5 trigger) is the backstop, but without this
@@ -267,7 +270,7 @@ export async function createOrder({
     throw new Error("Could not check your verification — try again.");
   }
   if (!buyerRow || buyerRow.status !== "approved") {
-    throw new Error("Only verified students can buy — finish verification first.");
+    throw new Error("Only verified users can buy — finish verification first.");
   }
   // The delivery method must be one the seller actually offers — a
   // direct call used to be able to order shipping on a meetup-only
@@ -291,13 +294,22 @@ export async function createOrder({
   // from the checked verification row read just above (the same row
   // that proved the buyer is approved); the passed value is only a
   // fallback for a row with no university on file.
+  // Milestone 25: the buyer's country comes from their own checked
+  // verification row (ordinary users have no university state); the
+  // passed value is only a fallback. A same-state-only listing never
+  // leaves the seller's country either.
+  const checkedBuyerCountry = buyerRow?.country || buyerCountry || "Nigeria";
   const checkedBuyerState = universityState(buyerRow?.university) || buyerState;
+  const sellerCountry = listing.country || "Nigeria";
+  if (listing.ships_to === "same_state" && checkedBuyerCountry !== sellerCountry) {
+    throw new Error("This item only sells within the seller's country.");
+  }
   if (listing.ships_to === "same_state" && listing.state) {
     if (deliveryMethod === "shipping" && shipToState && shipToState !== listing.state) {
       throw new Error(`This item only ships within ${listing.state}.`);
     }
     if (deliveryMethod === "meetup" && checkedBuyerState && checkedBuyerState !== listing.state) {
-      throw new Error(`This item is only for students in ${listing.state}.`);
+      throw new Error(`This item is only for buyers in ${listing.state}.`);
     }
   }
 
@@ -367,50 +379,11 @@ export async function createOrder({
   } else {
     price = listing.price;
   }
-  // Tier 1 — items over ₦20,000 travel with GIG or GUO only. The
-  // tier list is display-only in Tracking, so a valuable item used
-  // to be bookable with a park loader or a cheap courier. Chowdeck
-  // Relay is same-city only and never reaches this check (it is
-  // filtered out for interstate shipping before createOrder).
-  // (The same rule lives in courierTiers() in lib/shipping.js —
-  // this file cannot import it: shipping.js imports orders.js.)
-  // Night deep check 2026-11-27: this used to be guarded by
-  // `courier &&`, so a shipping order created with no courier
-  // skipped the rule entirely. A courier is required above now,
-  // so the check runs unconditionally for interstate orders.
-  if (
-    deliveryMethod === "shipping" &&
-    shipToState &&
-    listing.state &&
-    shipToState !== listing.state &&
-    price > 20000 &&
-    !["GIG Logistics", "GUO Transport"].includes(courier)
-  ) {
-    throw new Error(
-      "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
-    );
-  }
-  // Morning deep check 2026-11-28: Chowdeck Relay is same-city
-  // only, at ANY price — the Tier-1 check above only constrains
-  // items over ₦20,000, so a cheaper interstate order could still
-  // ship with a courier that cannot leave the city (and the buyer
-  // paid an interstate shipping fee). Checkout already swaps it for
-  // GIG, but a direct call could still book it.
-  if (
-    deliveryMethod === "shipping" &&
-    shipToState &&
-    listing.state &&
-    shipToState !== listing.state &&
-    courier === "Chowdeck Relay"
-  ) {
-    throw new Error(
-      "Chowdeck Relay only delivers within the same city — choose GIG Logistics or GUO Transport for shipping to another state."
-    );
-  }
-
+  // Milestone 25: fees in the seller's (listing's) currency.
   const fees = feeBreakdown(
     price,
-    paymentMethod === "cash" ? "cash" : "held"
+    paymentMethod === "cash" ? "cash" : "held",
+    listing.currency || "NGN"
   );
   // The shipping zone is priced from the ship-to state — the parcel
   // goes where ship_to_state says, not where the buyer's university
@@ -421,7 +394,12 @@ export async function createOrder({
   // no ship-to state was picked, matching the checkout display.
   const zone =
     deliveryMethod === "shipping"
-      ? shippingZone(shipToState || buyerState, listing.state)
+      ? shippingZone(
+          shipToState || buyerState,
+          listing.state,
+          shipToCountry || checkedBuyerCountry,
+          sellerCountry
+        )
       : null;
   const shippingFee = zone ? zone.fee : 0;
   const total = fees.total + shippingFee;
@@ -443,7 +421,22 @@ export async function createOrder({
       status: "reserved",
       meetup_spot: deliveryMethod === "meetup" ? meetupSpot : null,
       ship_to_state: deliveryMethod === "shipping" ? shipToState : null,
-      courier: deliveryMethod === "shipping" ? courier || null : null,
+      ship_to_country:
+        deliveryMethod === "shipping"
+          ? shipToCountry || checkedBuyerCountry
+          : null,
+      country: sellerCountry,
+      currency: listing.currency || "NGN",
+      // `courier` keeps its column name by design — it now stores
+      // the free-text transport name, and transport_ref the plate /
+      // flight number (null until the seller adds it at shipping
+      // proof time).
+      courier:
+        deliveryMethod === "shipping" ? String(courier || "").trim() || null : null,
+      transport_ref:
+        deliveryMethod === "shipping"
+          ? String(transportRef || "").trim() || null
+          : null,
     })
     .select()
     .single();

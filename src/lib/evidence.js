@@ -70,7 +70,7 @@ export const EVIDENCE_RULES = {
   receipt: {
     mediaType: "photo",
     label: "Receipt photo",
-    ruleText: "Photo, taken in the app — the courier receipt.",
+    ruleText: "Photo, taken in the app — the transport receipt.",
   },
   return: {
     mediaType: "photo",

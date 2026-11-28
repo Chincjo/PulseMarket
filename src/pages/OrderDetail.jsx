@@ -218,7 +218,7 @@ export default function OrderDetail() {
         <p className="text-sm text-neutral-500">
           {order.delivery_method === "meetup"
             ? `Meet in person — ${order.meetup_spot || "meetup spot to be agreed"}`
-            : `Shipping to ${order.ship_to_state || "—"} via ${order.courier || "courier to be agreed"}`}
+            : `Shipping to ${order.ship_to_state || "—"} · Sent with ${order.courier || "transport to be agreed"}${order.transport_ref ? ` · Plate / flight: ${order.transport_ref}` : ""}`}
         </p>
       </div>
 

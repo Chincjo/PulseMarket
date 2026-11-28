@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { SHIPPING_ZONES, universityState } from "../lib/data";
-import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
+import { feeBreakdown, feeLabels, formatMoney, serviceFeeLabel } from "../lib/fees";
 import {
   BOOST_TIERS,
   boostListing,
@@ -53,6 +53,8 @@ export default function ListingDetail() {
   // treats that as visible, and the order itself is refused
   // server-side + in createOrder when the state really differs.
   const [buyerState, setBuyerState] = useState("");
+  // Milestone 25: the buyer's country, for cross-country visibility.
+  const [buyerCountry, setBuyerCountry] = useState("");
   const [statusBusy, setStatusBusy] = useState(false);
   const [sellerRating, setSellerRating] = useState(null);
   // bumpViews used to fire once per effect run — the effect re-runs
@@ -130,6 +132,7 @@ export default function ListingDetail() {
       fetchVerificationRowChecked(user.id)
         .then(({ row }) => {
           if (!cancelled && row?.university) setBuyerState(universityState(row.university));
+          if (!cancelled && row?.country) setBuyerCountry(row.country);
         })
         .catch(() => {});
     }
@@ -283,15 +286,19 @@ export default function ListingDetail() {
     );
   }
 
-  const cash = feeBreakdown(listing.price, "cash");
-  const held = feeBreakdown(listing.price, "held");
+  // Milestone 25: fees and prices in the seller's currency.
+  const listingCurrency = listing.currency || "NGN";
+  const listingCountry = listing.country || "Nigeria";
+  const labels = feeLabels(listingCurrency);
+  const cash = feeBreakdown(listing.price, "cash", listingCurrency);
+  const held = feeBreakdown(listing.price, "held", listingCurrency);
   const boosted = isBoosted(listing);
   const meets = (listing.delivery_methods || []).includes("meetup");
   const ships = (listing.delivery_methods || []).includes("shipping");
   // Same-state-only listing, out-of-state buyer: hide Buy + Chat
   // (visibleTo fails open while the buyer's state is still unknown,
   // so this only hides once the state is known to differ).
-  const hiddenByState = !visibleTo(listing, buyerState);
+  const hiddenByState = !visibleTo(listing, buyerState, buyerCountry || null);
 
   return (
     <div className="space-y-5">
@@ -327,7 +334,10 @@ export default function ListingDetail() {
           <h1 className="text-2xl font-bold">{listing.title}</h1>
           {boosted ? <BoostedBadge /> : null}
         </div>
-        <p className="mt-1 text-2xl font-bold">{formatNaira(listing.price)}</p>
+        <p className="mt-1 text-2xl font-bold">{formatMoney(listing.price, listingCurrency)}</p>
+        <p className="mt-1 inline-block rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-600 dark:bg-neutral-900 dark:text-neutral-300">
+          {listingCountry}
+        </p>
         <p className="mt-1 text-sm text-neutral-500">
           {listing.condition} · {listing.category} · {listing.views || 0} views
         </p>
@@ -355,7 +365,8 @@ export default function ListingDetail() {
         <div className="flex-1">
           <p className="font-bold">{listing.seller_label}</p>
           <p className="text-sm text-neutral-500">
-            {listing.university} · {listing.state}
+            {listing.university ? `${listing.university} · ` : ""}
+            {listing.state} · {listingCountry}
           </p>
           {sellerRating && sellerRating.count > 0 ? (
             <p className="text-sm font-semibold text-brown">
@@ -366,7 +377,7 @@ export default function ListingDetail() {
           )}
         </div>
         <span className="rounded-full bg-brown-soft px-2.5 py-1 text-xs font-bold text-brown-dark">
-          Verified student
+          Verified seller
         </span>
       </div>
 
@@ -380,9 +391,9 @@ export default function ListingDetail() {
         ) : null}
         {ships ? (
           <p className="mt-1">
-            Ships by {listing.courier || "courier"} —{" "}
+            Ships with {listing.courier || "transport"} —{" "}
             {listing.ships_to === "nationwide"
-              ? "anywhere in Nigeria"
+              ? "anywhere in the world"
               : `within ${listing.state} only`}
           </p>
         ) : null}
@@ -399,30 +410,30 @@ export default function ListingDetail() {
         {meets ? (
           <p className="mt-2 flex justify-between">
             <span>Cash face-to-face (no fees)</span>
-            <span className="font-bold">{formatNaira(cash.total)}</span>
+            <span className="font-bold">{formatMoney(cash.total, listingCurrency)}</span>
           </p>
         ) : null}
         <p className="mt-1 flex justify-between text-neutral-500">
           <span>Item price</span>
-          <span>{formatNaira(held.price)}</span>
+          <span>{formatMoney(held.price, listingCurrency)}</span>
         </p>
         <p className="flex justify-between text-neutral-500">
           <span>
             Service fee{" "}
-            {serviceFeeLabel(listing.price)}
+            {serviceFeeLabel(listing.price, listingCurrency)}
           </span>
-          <span>{formatNaira(held.serviceFee)}</span>
+          <span>{formatMoney(held.serviceFee, listingCurrency)}</span>
         </p>
         <p className="flex justify-between text-neutral-500">
-          <span>Secure payment fee {FEE_LABELS.secure}</span>
-          <span>{formatNaira(held.secureFee)}</span>
+          <span>Secure payment fee {labels.secure}</span>
+          <span>{formatMoney(held.secureFee, listingCurrency)}</span>
         </p>
         <p className="mt-1 flex justify-between font-bold">
           <span>Pay through the app {ships ? "(held, before shipping)" : "(held)"}</span>
-          <span>{formatNaira(held.total)}</span>
+          <span>{formatMoney(held.total, listingCurrency)}</span>
         </p>
         <p className="mt-1 text-neutral-500">
-          The seller keeps the full {formatNaira(listing.price)}. Held money
+          The seller keeps the full {formatMoney(listing.price, listingCurrency)}. Held money
           releases only after the buyer confirms the item.
         </p>
       </div>
@@ -454,7 +465,7 @@ export default function ListingDetail() {
           </GhostButton>
           {hiddenByState ? (
             <p className="rounded-xl bg-neutral-100 px-3 py-2 text-center text-sm text-neutral-600 dark:bg-neutral-900">
-              This item is only for students in {listing.state}.
+              This item is only for buyers in {listing.state}.
             </p>
           ) : (
             <p className="text-center text-xs text-neutral-500">

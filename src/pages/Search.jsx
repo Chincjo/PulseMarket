@@ -4,7 +4,7 @@
 // from their own state, plus nationwide-shipping listings from anywhere.
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams, Link } from "react-router-dom";
-import { CATEGORIES, CONDITIONS, STATES, UNIVERSITY_NAMES, universityState } from "../lib/data";
+import { CATEGORIES, CONDITIONS, COUNTRIES, STATES, UNIVERSITY_NAMES, universityState } from "../lib/data";
 import { EmptyState, PrimaryButton, inputCls } from "../components/ui";
 import { ListingCard } from "../components/ListingCard";
 import { fetchActiveListings, sortListings, visibleTo } from "../lib/listings";
@@ -22,6 +22,8 @@ export default function Search({ verification }) {
   const [state, setState] = useState("");
   const [min, setMin] = useState("");
   const [max, setMax] = useState("");
+  // Milestone 25: country filter.
+  const [country, setCountry] = useState("");
   const [sort, setSort] = useState("newest");
   const [all, setAll] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -31,6 +33,7 @@ export default function Search({ verification }) {
   // which a student could have edited by hand to see listings
   // from another state.
   const myState = universityState(verification?.university || "");
+  const myCountry = verification?.country || (verification?.university ? "Nigeria" : "");
 
   useEffect(() => {
     let cancelled = false;
@@ -74,18 +77,19 @@ export default function Search({ verification }) {
   const unknownCategory = category !== "" && !CATEGORIES.includes(category);
 
   const results = useMemo(() => {
-    let list = all.filter((d) => visibleTo(d, myState));
+    let list = all.filter((d) => visibleTo(d, myState, myCountry || null));
     if (q) list = list.filter((d) => `${d.title} ${d.description || ""}`.toLowerCase().includes(q.toLowerCase()));
     if (category) list = list.filter((d) => d.category === category);
     if (condition) list = list.filter((d) => d.condition === condition);
     if (university) list = list.filter((d) => d.university === university);
+    if (country) list = list.filter((d) => (d.country || "Nigeria") === country);
     if (state) list = list.filter((d) => d.state === state);
     if (minNum !== null) list = list.filter((d) => d.price >= minNum);
     if (maxNum !== null) list = list.filter((d) => d.price <= maxNum);
     if (sort === "price-low") return [...list].sort((a, b) => a.price - b.price);
     if (sort === "price-high") return [...list].sort((a, b) => b.price - a.price);
     return sortListings(list);
-  }, [all, q, category, condition, university, state, minNum, maxNum, sort, myState]);
+  }, [all, q, category, condition, university, country, state, minNum, maxNum, sort, myState, myCountry]);
 
   return (
     <div className="space-y-5">
@@ -133,6 +137,12 @@ export default function Search({ verification }) {
             <option key={s}>{s}</option>
           ))}
         </select>
+        <select value={country} onChange={(e) => setCountry(e.target.value)} className={inputCls}>
+          <option value="">All countries</option>
+          {COUNTRIES.map((c) => (
+            <option key={c.code} value={c.name}>{c.name}</option>
+          ))}
+        </select>
         <input value={min} onChange={(e) => setMin(e.target.value)} placeholder="Min ₦" type="number" min="0" max={MAX_PRICE_NAIRA} className={inputCls} />
         <input value={max} onChange={(e) => setMax(e.target.value)} placeholder="Max ₦" type="number" min="0" max={MAX_PRICE_NAIRA} className={inputCls} />
         <select value={sort} onChange={(e) => setSort(e.target.value)} className={inputCls}>
@@ -169,7 +179,7 @@ export default function Search({ verification }) {
       {!loading && results.length === 0 ? (
         <EmptyState
           title="No listings match yet"
-          body="Listings from verified students across Nigeria will appear here. Try a different search or post the item yourself."
+          body="Listings from verified sellers around the world will appear here. Try a different search or post the item yourself."
           action={
             <Link to="/sell">
               <PrimaryButton>Sell an item</PrimaryButton>

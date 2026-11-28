@@ -13,15 +13,18 @@
 // again with new photos through the resubmit_verification RPC.
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { UNIVERSITY_NAMES } from "../lib/data";
+import { COUNTRIES, UNIVERSITY_NAMES, currencyForCountry } from "../lib/data";
 import { getVerification, saveVerification } from "../lib/store";
 import {
   fetchVerificationRow,
   fetchVerificationRowChecked,
   removeVerificationIdPhotos,
+  replaceFaceVerificationPhotos,
   replaceVerificationPhotos,
+  resubmitFaceVerification,
   resubmitVerification,
   saveVerificationRow,
+  uploadFaceVerificationPhotos,
   uploadVerificationIdPhotos,
 } from "../lib/listings";
 import { generateInviteCode } from "../lib/ratings";
@@ -74,10 +77,21 @@ const REJECTION_MESSAGES = {
     "The team said: expired ID — your student ID has expired. Please upload a current, valid student ID.",
   other:
     "The team said: please check your details and upload clear photos of both sides of your student ID.",
+  // Milestone 25 — face-verification reasons (ordinary users).
+  "blurry selfie":
+    "The team said: blurry selfie — please take a clearer selfie, in good light, facing the camera.",
+  "face not clear":
+    "The team said: your face is not clear in the selfie — take it again in good light, with nothing covering your face.",
+  "face does not match ID":
+    "The team said: the face in the selfie does not match the government ID — check the name and photos, then submit again.",
 };
 
-function rejectionMessage(reason) {
-  return REJECTION_MESSAGES[reason] || "Your verification was not approved. Check your details and take clear photos of both sides of your student ID, then submit again.";
+function rejectionMessage(reason, accountType) {
+  const fallback =
+    accountType === "ordinary"
+      ? "Your verification was not approved. Check your details and take a clear selfie, then submit again."
+      : "Your verification was not approved. Check your details and take clear photos of both sides of your student ID, then submit again.";
+  return REJECTION_MESSAGES[reason] || fallback;
 }
 
 export default function Verify({ onVerified, initialVerification }) {
@@ -113,6 +127,17 @@ export default function Verify({ onVerified, initialVerification }) {
   const [university, setUniversity] = useState(savedForUser?.university || UNIVERSITY_NAMES[0]);
   const [studentEmail, setStudentEmail] = useState(savedForUser?.studentEmail || "");
   const [studentId, setStudentId] = useState(savedForUser?.studentId || "");
+  // Milestone 25 — account type, picked at step 2 before the form.
+  // A rejected user keeps the type they first submitted with.
+  const [accountType, setAccountType] = useState(savedForUser?.accountType || null);
+  // Ordinary (non-student) verification fields.
+  const [fullName, setFullName] = useState(savedForUser?.fullName || "");
+  const [country, setCountry] = useState(savedForUser?.country || "Nigeria");
+  const [countrySearch, setCountrySearch] = useState("");
+  const [selfie, setSelfie] = useState(null);
+  const [govId, setGovId] = useState(null);
+  const [selfieFile, setSelfieFile] = useState(null);
+  const [govIdFile, setGovIdFile] = useState(null);
   const [referralCode, setReferralCode] = useState(savedForUser?.referredBy || "");
   const [idFront, setIdFront] = useState(null);
   const [idBack, setIdBack] = useState(null);
@@ -138,6 +163,17 @@ export default function Verify({ onVerified, initialVerification }) {
   const [replaceError, setReplaceError] = useState("");
   const [replaceDone, setReplaceDone] = useState("");
   const [replacing, setReplacing] = useState(false);
+
+  // Milestone 25 follow-up: replacing a selfie (+ optional gov ID)
+  // while an ordinary verification is under review. Separate files
+  // from the submit form above, same as the student replace flow.
+  const [replaceSelfie, setReplaceSelfie] = useState(null);
+  const [replaceGovId, setReplaceGovId] = useState(null);
+  const [replaceSelfieFile, setReplaceSelfieFile] = useState(null);
+  const [replaceGovIdFile, setReplaceGovIdFile] = useState(null);
+  const [replaceFaceError, setReplaceFaceError] = useState("");
+  const [replaceFaceDone, setReplaceFaceDone] = useState("");
+  const [replacingFace, setReplacingFace] = useState(false);
 
   // Milestone 17: the device copy can be stale — the team may have
   // approved or rejected this student since it was saved. When the
@@ -166,9 +202,15 @@ export default function Verify({ onVerified, initialVerification }) {
         const rec = {
           userId: row.userId,
           email: user.email,
+          accountType: row.accountType || "student",
           university: row.university,
           studentEmail: row.studentEmail,
           studentId: row.studentId,
+          country: row.country || null,
+          currency: row.currency || "NGN",
+          fullName: row.fullName || null,
+          facePhotoUrl: row.facePhotoUrl || null,
+          govIdFrontUrl: row.govIdFrontUrl || null,
           status: row.status,
           inviteCode: row.inviteCode,
           submittedAt: row.submittedAt,
@@ -185,12 +227,15 @@ export default function Verify({ onVerified, initialVerification }) {
         };
         saveVerification(rec);
         setSaved(rec);
+        if (row.accountType) setAccountType(row.accountType);
         if (row.status === "rejected") {
           // Pre-fill the form for the re-submit — only where the
           // student has not already typed something.
           setUniversity((prev) => (prev === UNIVERSITY_NAMES[0] ? row.university : prev));
           setStudentEmail((prev) => prev || row.studentEmail || "");
           setStudentId((prev) => prev || row.studentId || "");
+          setFullName((prev) => prev || row.fullName || "");
+          setCountry((prev) => (prev === "Nigeria" && row.country ? row.country : prev));
         }
       })
       // Milestone 20 (APP-13): a failed server check changes
@@ -214,6 +259,33 @@ export default function Verify({ onVerified, initialVerification }) {
     }
     if (f.size > MAX_FILE_MB * 1024 * 1024) {
       setFormError(`That photo is too big — keep ID photos under ${MAX_FILE_MB}MB.`);
+      e.target.value = "";
+      setPreview(null);
+      setFile(null);
+      return;
+    }
+    setFormError("");
+    setFile(f);
+    const r = new FileReader();
+    r.onload = () => setPreview(r.result);
+    r.readAsDataURL(f);
+  }
+
+  // Milestone 25: photo picker for the ordinary form (selfie /
+  // government ID). Same checks as filePreview above, with wording
+  // for a face photo instead of a student ID.
+  function pickOrdinaryPhoto(e, setPreview, setFile, label) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!isImageFile(f)) {
+      setFormError(`That file is not a photo — take a photo of ${label}.`);
+      e.target.value = "";
+      setPreview(null);
+      setFile(null);
+      return;
+    }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) {
+      setFormError(`That photo is too big — keep photos under ${MAX_FILE_MB}MB.`);
       e.target.value = "";
       setPreview(null);
       setFile(null);
@@ -280,7 +352,165 @@ export default function Verify({ onVerified, initialVerification }) {
     }
   }
 
+
+  // Milestone 25 — ordinary (non-student) verification. Mirrors the
+  // student submit above: fresh server check first, approved /
+  // pending short-circuit, re-submit after a rejection through the
+  // RPC, photos uploaded FIRST to the private verification-ids
+  // bucket, server save before the device copy, orphan cleanup on
+  // failure. The selfie is required; the government ID is optional.
+  async function submitOrdinaryVerification() {
+    if (submitting) return;
+    setFormError("");
+    const cleanName = fullName.trim();
+    if (cleanName.length < 2 || cleanName.length > 100) {
+      setFormError("Enter your full name (2–100 characters).");
+      return;
+    }
+    if (!country) {
+      setFormError("Choose your country.");
+      return;
+    }
+    if (!selfieFile) {
+      setFormError("Add a selfie photo — the team checks it before approving you.");
+      return;
+    }
+    if (!user?.id) {
+      setFormError("Sign in first, then submit your verification.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      let serverRow = null;
+      try {
+        const checked = await fetchVerificationRowChecked(user.id);
+        if (checked.failed) {
+          setFormError("Could not check your verification — check your connection and try again.");
+          return;
+        }
+        serverRow = checked.row;
+      } catch {
+        setFormError("Could not check your verification — check your connection and try again.");
+        return;
+      }
+      const serverStatus = serverRow?.status || null;
+      const currency = currencyForCountry(
+        COUNTRIES.find((c) => c.name === country)?.code
+      );
+      const baseRec = (status) => ({
+        userId: user.id,
+        email: user.email,
+        accountType: "ordinary",
+        university: null,
+        studentEmail: null,
+        studentId: null,
+        country,
+        currency,
+        fullName: cleanName,
+        status,
+        inviteCode: serverRow?.inviteCode || savedForUser?.inviteCode || null,
+        referredBy: savedForUser?.referredBy ?? null,
+        submittedAt: serverRow?.submittedAt || new Date().toISOString(),
+        idFrontUrl: null,
+        idBackUrl: null,
+        facePhotoUrl: serverRow?.facePhotoUrl || null,
+        govIdFrontUrl: serverRow?.govIdFrontUrl || null,
+        rejectionReason: null,
+        rejectionNote: null,
+      });
+      if (serverStatus === "approved") {
+        const rec = baseRec("approved");
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        navigate("/");
+        return;
+      }
+      if (serverStatus === "pending review") {
+        const rec = baseRec("pending review");
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        return;
+      }
+      const isResubmit =
+        serverStatus === "rejected" || (!serverRow && savedForUser?.status === "rejected");
+      const keptCode = serverRow?.inviteCode || savedForUser?.inviteCode || null;
+      const inviteCode =
+        isResubmit && keptCode ? keptCode : generateInviteCode();
+      const cleanReferral = referralCode.trim().toUpperCase();
+      if (cleanReferral && cleanReferral === inviteCode) {
+        setFormError("That is your own invite code — ask the person who invited you for theirs.");
+        return;
+      }
+      const referredBy = isResubmit
+        ? savedForUser?.referredBy || null
+        : /^PM-[A-HJ-NP-Z2-9]{6}$/.test(cleanReferral)
+          ? cleanReferral
+          : null;
+      let photoPaths;
+      try {
+        photoPaths = await uploadFaceVerificationPhotos(user.id, selfieFile, govIdFile);
+      } catch {
+        setFormError("Your photos could not be uploaded. Please check your connection and try again.");
+        return;
+      }
+      const rec = {
+        ...baseRec("pending review"),
+        inviteCode,
+        referredBy,
+        submittedAt: new Date().toISOString(),
+        facePhotoUrl: photoPaths.facePath,
+        govIdFrontUrl: photoPaths.govIdPath,
+      };
+      if (isResubmit) {
+        try {
+          // Milestone 25 follow-up: ordinary re-submits go through
+          // the NEW resubmit_face_verification RPC — the student
+          // resubmit_verification RPC cannot be redefined and only
+          // knows ID front/back photos.
+          await resubmitFaceVerification(photoPaths.facePath, photoPaths.govIdPath);
+        } catch (err) {
+          await removeVerificationIdPhotos(
+            [photoPaths.facePath, photoPaths.govIdPath].filter(Boolean)
+          );
+          setFormError(
+            err?.message ||
+              "Could not submit your verification again. Please check your connection and try again."
+          );
+          return;
+        }
+        saveVerification(rec);
+        setSaved(rec);
+        onVerified?.(rec);
+        navigate("/");
+        return;
+      }
+      let savedToServer = false;
+      try {
+        savedToServer = await saveVerificationRow(user.id, rec);
+      } catch {
+        savedToServer = false;
+      }
+      if (!savedToServer) {
+        await removeVerificationIdPhotos(
+          [photoPaths.facePath, photoPaths.govIdPath].filter(Boolean)
+        );
+        setFormError("Could not save your verification. Please check your connection and try again.");
+        return;
+      }
+      saveVerification(rec);
+      setSaved(rec);
+      onVerified?.(rec);
+      navigate("/");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function submitVerification() {
+    // Milestone 25: ordinary users submit through their own flow.
+    if (accountType === "ordinary") return submitOrdinaryVerification();
     // No busy guard before: a double-tap generated TWO different
     // invite codes and saved the verification twice — the local record
     // could end up holding a different invite code from the server row.
@@ -347,6 +577,7 @@ export default function Verify({ onVerified, initialVerification }) {
         const rec = {
           userId: user.id,
           email: user.email,
+          accountType: "student",
           university: serverRow.university,
           studentEmail: serverRow.studentEmail,
           studentId: serverRow.studentId,
@@ -371,6 +602,7 @@ export default function Verify({ onVerified, initialVerification }) {
         const rec = {
           userId: user.id,
           email: user.email,
+          accountType: "student",
           university: serverRow.university,
           studentEmail: serverRow.studentEmail,
           studentId: serverRow.studentId,
@@ -429,6 +661,7 @@ export default function Verify({ onVerified, initialVerification }) {
       const rec = {
         userId: user.id,
         email: user.email,
+        accountType: "student",
         // On a re-submit the university, student email and student
         // ID are locked server-side (the resubmit RPC only moves
         // status + photos), so the local record must carry the
@@ -514,9 +747,15 @@ export default function Verify({ onVerified, initialVerification }) {
       const rec = {
         userId: row.userId,
         email: user.email,
+        accountType: row.accountType || "student",
         university: row.university,
         studentEmail: row.studentEmail,
         studentId: row.studentId,
+        country: row.country || null,
+        currency: row.currency || "NGN",
+        fullName: row.fullName || null,
+        facePhotoUrl: row.facePhotoUrl || null,
+        govIdFrontUrl: row.govIdFrontUrl || null,
         status: row.status,
         inviteCode: row.inviteCode,
         referredBy: savedForUser?.referredBy ?? null,
@@ -610,6 +849,97 @@ export default function Verify({ onVerified, initialVerification }) {
     }
   }
 
+  // Milestone 25 follow-up: pick one replacement selfie / gov ID
+  // photo while under review. Same checks as the ordinary submit
+  // form: a photo, under the size limit. A bad pick clears that side
+  // only. The gov ID is optional, so its picker never errors when
+  // nothing is picked.
+  function pickReplaceFacePhoto(e, setPreview, setFile, label) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!isImageFile(f)) {
+      setReplaceFaceError(`That file is not a photo — take a photo of ${label}.`);
+      e.target.value = "";
+      setPreview(null);
+      setFile(null);
+      return;
+    }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) {
+      setReplaceFaceError(`That photo is too big — keep photos under ${MAX_FILE_MB}MB.`);
+      e.target.value = "";
+      setPreview(null);
+      setFile(null);
+      return;
+    }
+    setReplaceFaceError("");
+    setReplaceFaceDone("");
+    setFile(f);
+    const r = new FileReader();
+    r.onload = () => setPreview(r.result);
+    r.readAsDataURL(f);
+  }
+
+  // Milestone 25 follow-up: replace the selfie (+ optional gov ID)
+  // while still under review. Same guards as the student flow:
+  // double-tap guard, server-check-first (only a row still
+  // 'pending review' may replace — a failed check refuses plainly
+  // instead of looking like a first-timer), and orphan cleanup on
+  // failure (inside replaceFaceVerificationPhotos: upload first,
+  // RPC second, new photos removed again if the RPC fails).
+  async function replaceFacePhotos() {
+    if (replacingFace) return;
+    setReplaceFaceError("");
+    setReplaceFaceDone("");
+    if (!replaceSelfieFile) {
+      setReplaceFaceError("Add a selfie photo.");
+      return;
+    }
+    if (!user?.id) {
+      setReplaceFaceError("Sign in first, then replace your photos.");
+      return;
+    }
+    setReplacingFace(true);
+    try {
+      const checked = await fetchVerificationRowChecked(user.id);
+      if (checked.failed || !checked.row) {
+        setReplaceFaceError("Could not check your verification — check your connection and try again.");
+        return;
+      }
+      if (checked.row.status !== "pending review") {
+        setReplaceFaceError(
+          checked.row.status === "approved"
+            ? "Your verification is already approved — nothing to replace."
+            : "Your verification is no longer under review — submit again from the form instead."
+        );
+        return;
+      }
+      const photoPaths = await replaceFaceVerificationPhotos(
+        user.id,
+        replaceSelfieFile,
+        replaceGovIdFile
+      );
+      const rec = {
+        ...saved,
+        status: "pending review",
+        facePhotoUrl: photoPaths.facePath,
+        govIdFrontUrl: photoPaths.govIdPath ?? saved?.govIdFrontUrl ?? null,
+      };
+      saveVerification(rec);
+      setSaved(rec);
+      setReplaceSelfie(null);
+      setReplaceGovId(null);
+      setReplaceSelfieFile(null);
+      setReplaceGovIdFile(null);
+      setReplaceFaceDone("Photos replaced — the team will review your new photos. You are still in the queue.");
+    } catch (err) {
+      setReplaceFaceError(
+        err?.message || "Could not replace your photos. Please check your connection and try again."
+      );
+    } finally {
+      setReplacingFace(false);
+    }
+  }
+
   // Verification already submitted on this device, for this
   // student — a copy belonging to another student never renders
   // here (see savedForUser above).
@@ -620,7 +950,9 @@ export default function Verify({ onVerified, initialVerification }) {
         <div className="space-y-4 pt-10 text-center">
           <h1 className="text-2xl font-bold">Welcome back</h1>
           <p className="text-neutral-500">
-            Your verification for {saved.university} is saved on this device.
+            {saved.accountType === "ordinary"
+              ? `Your verification for ${saved.fullName || "your account"} (${saved.country || ""}) is saved on this device.`
+              : `Your verification for ${saved.university} is saved on this device.`}{" "}
             Sign in to continue to the app.
           </p>
           <Link to="/signin" className="inline-block">
@@ -635,14 +967,30 @@ export default function Verify({ onVerified, initialVerification }) {
         <div className="space-y-4 pt-4">
           <h1 className="text-2xl font-bold">Verification approved</h1>
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
-            <p><b>University:</b> {saved.university}</p>
-            <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
-            <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
-            <p className="mt-2 text-neutral-500">
-              Your university is now locked to {saved.university}. Your details
-              are saved on PulseMarket&apos;s server, so they follow you to any
-              phone you sign in on.
-            </p>
+            {saved.accountType === "ordinary" ? (
+              <>
+                <p><b>Name:</b> {saved.fullName}</p>
+                <p className="mt-1"><b>Country:</b> {saved.country}</p>
+                <p className="mt-1"><b>Currency:</b> {saved.currency || "NGN"}</p>
+                <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
+                <p className="mt-2 text-neutral-500">
+                  Your country and currency are now locked to {saved.country}. Your details
+                  are saved on PulseMarket&apos;s server, so they follow you to any
+                  phone you sign in on.
+                </p>
+              </>
+            ) : (
+              <>
+                <p><b>University:</b> {saved.university}</p>
+                <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
+                <p className="mt-1"><b>Invite code:</b> {saved.inviteCode}</p>
+                <p className="mt-2 text-neutral-500">
+                  Your university is now locked to {saved.university}. Your details
+                  are saved on PulseMarket&apos;s server, so they follow you to any
+                  phone you sign in on.
+                </p>
+              </>
+            )}
           </div>
           <PrimaryButton className="w-full" onClick={() => navigate("/")}>
             Continue to the app
@@ -657,7 +1005,10 @@ export default function Verify({ onVerified, initialVerification }) {
     // Milestone 19 (Decision 2): a student still waiting CAN
     // replace their ID photos — e.g. they realised the first ones
     // were blurry. The new photos go up first and the server swaps
-    // them in; status stays 'pending review'.
+    // them in; status stays 'pending review'. Milestone 25
+    // follow-up: an ordinary user still waiting can replace their
+    // selfie (+ optional gov ID) the same way, through the new
+    // replace_face_verification_photos RPC.
     // A rejected student does NOT land here: they fall through to
     // the form below and submit again with new photos.
     if (saved.status !== "rejected") {
@@ -665,13 +1016,27 @@ export default function Verify({ onVerified, initialVerification }) {
         <div className="space-y-4 pt-4">
           <h1 className="text-2xl font-bold">Your verification is under review</h1>
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
-            <p><b>University:</b> {saved.university}</p>
-            <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
-            <p className="mt-2 text-neutral-500">
-              Thanks — we have your student details and ID photos. The
-              PulseMarket team is checking them. You will be able to post
-              items and chat with sellers once you are approved.
-            </p>
+            {saved.accountType === "ordinary" ? (
+              <>
+                <p><b>Name:</b> {saved.fullName}</p>
+                <p className="mt-1"><b>Country:</b> {saved.country}</p>
+                <p className="mt-2 text-neutral-500">
+                  Thanks — we have your details and selfie. The
+                  PulseMarket team is checking them. You will be able to post
+                  items and chat with sellers once you are approved.
+                </p>
+              </>
+            ) : (
+              <>
+                <p><b>University:</b> {saved.university}</p>
+                <p className="mt-1"><b>Student ID:</b> {saved.studentId || "—"}</p>
+                <p className="mt-2 text-neutral-500">
+                  Thanks — we have your student details and ID photos. The
+                  PulseMarket team is checking them. You will be able to post
+                  items and chat with sellers once you are approved.
+                </p>
+              </>
+            )}
           </div>
           <PrimaryButton className="w-full" disabled={checking} onClick={checkStatus}>
             {checking ? "Checking…" : "Check again — I may be approved now"}
@@ -681,6 +1046,44 @@ export default function Verify({ onVerified, initialVerification }) {
               {checkNote}
             </p>
           ) : null}
+{saved.accountType === "ordinary" ? (
+          <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+            <p className="font-semibold">Selfie not clear?</p>
+            <p className="mt-1 text-neutral-500">
+              You can replace your selfie while you wait — the team
+              will review the new one. A government ID photo is optional.
+            </p>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+                Selfie
+                <input type="file" accept="image/*" capture="user" onChange={(e) => pickReplaceFacePhoto(e, setReplaceSelfie, setReplaceSelfieFile, "your face")} className="mt-2 block w-full text-xs" />
+                {replaceSelfie ? <img src={replaceSelfie} alt="New selfie" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+              </label>
+              <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+                Government ID (optional)
+                <input type="file" accept="image/*" onChange={(e) => pickReplaceFacePhoto(e, setReplaceGovId, setReplaceGovIdFile, "your government ID")} className="mt-2 block w-full text-xs" />
+                {replaceGovId ? <img src={replaceGovId} alt="New government ID" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+              </label>
+            </div>
+            {replaceFaceError ? (
+              <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+                {replaceFaceError}
+              </p>
+            ) : null}
+            {replaceFaceDone ? (
+              <p className="mt-3 rounded-xl bg-neutral-100 p-3 text-sm text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+                {replaceFaceDone}
+              </p>
+            ) : null}
+            <button
+              className="mt-3 w-full rounded-xl border border-neutral-300 px-4 py-2 text-sm font-semibold dark:border-neutral-700"
+              disabled={!replaceSelfieFile || replacingFace}
+              onClick={replaceFacePhotos}
+            >
+              {replacingFace ? "Replacing…" : "Replace photos"}
+            </button>
+          </div>
+        ) : (
           <div className="rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
             <p className="font-semibold">Photos not clear?</p>
             <p className="mt-1 text-neutral-500">
@@ -717,6 +1120,7 @@ export default function Verify({ onVerified, initialVerification }) {
               {replacing ? "Replacing…" : "Replace photos"}
             </button>
           </div>
+          )}
           <button
             className="w-full text-center text-sm text-neutral-500 underline"
             onClick={() => signOut()}
@@ -732,6 +1136,201 @@ export default function Verify({ onVerified, initialVerification }) {
   // again): the verification form.
   if (user) {
     const isResubmitForm = savedForUser?.status === "rejected";
+    // Milestone 25: pick the account type first (unless this is a
+    // re-submit, which keeps the type from the first submit).
+    if (!isResubmitForm && !accountType) {
+      return (
+        <div className="space-y-5">
+          <h1 className="text-2xl font-bold">Verify who you are</h1>
+          <p className="text-neutral-500">
+            Signed in as {user.email}. PulseMarket is open to everyone —
+            students and anyone else. Pick the one that fits you.
+          </p>
+          <div className="space-y-3">
+            <button
+              type="button"
+              onClick={() => setAccountType("student")}
+              className="w-full rounded-2xl border border-neutral-300 p-4 text-left dark:border-neutral-700"
+            >
+              <p className="font-bold">I am a student</p>
+              <p className="mt-1 text-sm text-neutral-500">
+                Verify with your university, student email and student ID.
+              </p>
+            </button>
+            <button
+              type="button"
+              onClick={() => setAccountType("ordinary")}
+              className="w-full rounded-2xl border border-neutral-300 p-4 text-left dark:border-neutral-700"
+            >
+              <p className="font-bold">I am not a student</p>
+              <p className="mt-1 text-sm text-neutral-500">
+                Verify with your full name, country and a selfie photo.
+                A government ID photo is optional.
+              </p>
+            </button>
+          </div>
+          <button
+            className="w-full text-center text-sm text-neutral-500 underline"
+            onClick={() => signOut()}
+          >
+            Not {user.email}? Sign out
+          </button>
+        </div>
+      );
+    }
+    // Milestone 25: the ordinary (non-student) form.
+    if (accountType === "ordinary") {
+      const countryOptions = COUNTRIES.filter((c) =>
+        !countrySearch ||
+        c.name.toLowerCase().includes(countrySearch.toLowerCase())
+      );
+      const ordinaryCurrency = currencyForCountry(
+        COUNTRIES.find((c) => c.name === country)?.code
+      );
+      return (
+        <div className="space-y-5">
+          <h1 className="text-2xl font-bold">
+            {isResubmitForm ? "Submit your verification again" : "Verify who you are"}
+          </h1>
+          {isResubmitForm ? (
+            <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+              {rejectionMessage(saved?.rejectionReason, "ordinary")}
+              {saved?.rejectionNote ? (
+                <>
+                  <br />
+                  Note from the team: &ldquo;{saved.rejectionNote}&rdquo;
+                </>
+              ) : null}
+              <br />
+              Check your details and take a clear selfie, then submit again.
+              Your name, country and invite code stay the same.
+            </p>
+          ) : (
+            <p className="text-neutral-500">
+              Signed in as {user.email}. Your country and currency lock
+              after verification.
+            </p>
+          )}
+          <label className="block text-sm font-semibold">
+            Full name
+            <input
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              maxLength={100}
+              placeholder="e.g. Adaeze Okafor"
+              disabled={isResubmitForm}
+              className={`${inputCls} mt-1`}
+            />
+          </label>
+          <label className="block text-sm font-semibold">
+            Country
+            <input
+              value={countrySearch || country}
+              onChange={(e) => {
+                setCountrySearch(e.target.value);
+                setCountry(e.target.value);
+              }}
+              onBlur={() => {
+                // Keep only a real country from the list — a free
+                // typo must not become the locked country.
+                const match = COUNTRIES.find(
+                  (c) => c.name.toLowerCase() === country.trim().toLowerCase()
+                );
+                if (match) {
+                  setCountry(match.name);
+                  setCountrySearch("");
+                } else {
+                  setFormError("Choose your country from the list.");
+                }
+              }}
+              list="country-list"
+              placeholder="Start typing your country…"
+              disabled={isResubmitForm}
+              className={`${inputCls} mt-1`}
+            />
+            <datalist id="country-list">
+              {countryOptions.map((c) => (
+                <option key={c.code} value={c.name} />
+              ))}
+            </datalist>
+          </label>
+          <p className="text-sm text-neutral-500">
+            Currency: {ordinaryCurrency} — prices you list are in {ordinaryCurrency}.
+            Buyers see an approximate conversion into their own currency, labelled as an estimate.
+          </p>
+          <label className="block text-sm font-semibold">
+            Invite code (optional) — if a friend invited you
+            <input
+              value={referralCode}
+              onChange={(e) => setReferralCode(e.target.value)}
+              maxLength={9}
+              placeholder="e.g. PM-AB12CD"
+              disabled={isResubmitForm}
+              className={`${inputCls} mt-1`}
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+              Selfie photo (required)
+              <input
+                type="file"
+                accept="image/*"
+                capture="user"
+                onChange={(e) => pickOrdinaryPhoto(e, setSelfie, setSelfieFile, "your face")}
+                className="mt-2 block w-full text-xs"
+              />
+              {selfie ? <img src={selfie} alt="Selfie" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+            </label>
+            <label className="block rounded-2xl border border-dashed border-neutral-300 p-4 text-center text-sm dark:border-neutral-700">
+              Government ID (optional)
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => pickOrdinaryPhoto(e, setGovId, setGovIdFile, "your government ID")}
+                className="mt-2 block w-full text-xs"
+              />
+              {govId ? <img src={govId} alt="Government ID" className="mt-2 h-20 w-full rounded-lg object-cover" /> : null}
+            </label>
+          </div>
+          {!selfieFile ? (
+            <p className="text-sm text-neutral-500">
+              A selfie is needed — the team checks it before approving you.
+              Your photos stay private; only the PulseMarket team sees them.
+            </p>
+          ) : null}
+          {formError ? (
+            <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
+              {formError}
+            </p>
+          ) : null}
+          <PrimaryButton
+            className="w-full"
+            disabled={!fullName.trim() || !country || !selfieFile || submitting}
+            onClick={submitVerification}
+          >
+            {submitting ? "Submitting…" : isResubmitForm ? "Submit again" : "Review & submit"}
+          </PrimaryButton>
+          {!isResubmitForm ? (
+            <button
+              className="w-full text-center text-sm text-neutral-500 underline"
+              onClick={() => setAccountType(null)}
+            >
+              I picked the wrong one — go back
+            </button>
+          ) : null}
+          <button
+            className="w-full text-center text-sm text-neutral-500 underline"
+            onClick={() => signOut()}
+          >
+            Not {user.email}? Sign out
+          </button>
+          <p className="text-center text-xs text-neutral-400">
+            By joining you agree to meet in safe places and never pay outside the
+            app for shipped items.
+          </p>
+        </div>
+      );
+    }
     return (
       <div className="space-y-5">
         <h1 className="text-2xl font-bold">
@@ -739,7 +1338,7 @@ export default function Verify({ onVerified, initialVerification }) {
         </h1>
         {isResubmitForm ? (
           <p className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-200">
-            {rejectionMessage(saved?.rejectionReason)}
+            {rejectionMessage(saved?.rejectionReason, saved?.accountType)}
             {saved?.rejectionNote ? (
               <>
                 <br />
@@ -843,8 +1442,9 @@ export default function Verify({ onVerified, initialVerification }) {
     <div className="space-y-5">
       <h1 className="text-2xl font-bold">Join & verify</h1>
       <p className="text-neutral-500">
-        Create your account, then prove you are a real student. Your university
-        and currency lock after verification.
+        Create your account, then verify who you are. Your university
+        (students) or country (everyone else) and currency lock after
+        verification.
       </p>
 
       <form onSubmit={createAccount} className="space-y-3">

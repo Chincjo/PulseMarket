@@ -8,6 +8,7 @@ import { assertRealPhoto, assertSellerClearOfDebt } from "./shipping";
 import {
   CATEGORIES,
   CONDITIONS,
+  GENERIC_MEETUP_SPOTS,
   SAFE_MEETUP_SPOTS,
   UNIVERSITY_NAMES,
   universityState,
@@ -35,17 +36,10 @@ export const MAX_VERIFICATION_PHOTO_MB = 10;
 // checks price > 0).
 export const MAX_LISTING_PRICE = 50000000;
 
-// Canonical courier names — keep in sync with COURIERS in
-// src/lib/shipping.js and the courier list in src/pages/Sell.jsx.
-const LISTING_COURIERS = [
-  "GIG Logistics",
-  "GUO Transport",
-  "Chowdeck Relay",
-  "Peace Logistics",
-  "ABC Transport",
-  "DHL Domestic",
-  "Bus Park Waybill",
-];
+// The transport name on a listing (listings.courier, column name
+// unchanged) is free text the seller types — a courier, bus company,
+// airline or cargo company. There is no allowlist: any non-empty
+// name up to 120 characters is accepted.
 
 // Validate the VALUES of listing fields present in `patch` and return
 // a cleaned copy (price normalised to a whole number). Throws a plain
@@ -99,17 +93,18 @@ function checkListingValues(patch) {
       throw new Error("Choose how the buyer gets it: meet in person or shipping.");
     }
   }
-  if (
-    clean.courier !== undefined &&
-    clean.courier !== null &&
-    !LISTING_COURIERS.includes(clean.courier)
-  ) {
-    throw new Error("Choose a courier from the list.");
+  if (clean.courier !== undefined && clean.courier !== null) {
+    const c = String(clean.courier).trim();
+    if (c.length > 120) {
+      throw new Error("Keep the transport name under 120 characters.");
+    }
+    clean.courier = c || null;
   }
   if (
     clean.meetup_spot !== undefined &&
     clean.meetup_spot !== null &&
-    !SAFE_MEETUP_SPOTS.includes(clean.meetup_spot)
+    !SAFE_MEETUP_SPOTS.includes(clean.meetup_spot) &&
+    !GENERIC_MEETUP_SPOTS.includes(clean.meetup_spot)
   ) {
     throw new Error("Choose a safe meetup spot from the list.");
   }
@@ -162,7 +157,13 @@ export function sortListings(list) {
 
 // A listing is visible to a buyer in `buyerState` when it is in their state
 // (meet in person / same-state shipping) or the seller ships nationwide.
-export function visibleTo(listing, buyerState) {
+// Milestone 25: when the buyer's and seller's countries are known and
+// differ, only nationwide listings cross the border — a same-state-only
+// listing never reaches a buyer in another country.
+export function visibleTo(listing, buyerState, buyerCountry = null) {
+  if (buyerCountry && listing.country && listing.country !== buyerCountry) {
+    return listing.ships_to === "nationwide";
+  }
   if (!buyerState) return true;
   return listing.state === buyerState || listing.ships_to === "nationwide";
 }
@@ -215,7 +216,13 @@ export async function fetchVerificationRowChecked(userId) {
       // file — e.g. a student who verified before Milestone 17.
       idFrontUrl: data.id_front_url || null,
       idBackUrl: data.id_back_url || null,
-      // Milestone 19: why the team rejected this student (fixed list)
+      // Milestone 25: ordinary (non-student) verification fields.
+      accountType: data.account_type || "student",
+      country: data.country || null,
+      currency: data.currency || "NGN",
+      fullName: data.full_name || null,
+      facePhotoUrl: data.face_photo_url || null,
+      govIdFrontUrl: data.gov_id_front_url || null,
       // and their optional short note — null unless rejected.
       rejectionReason: data.rejection_reason || null,
       rejectionNote: data.rejection_note || null,
@@ -277,15 +284,27 @@ export async function saveVerificationRow(userId, rec) {
   // Milestone 17: the two ID photo paths go on the row too, so the
   // team can open them when they review the student. They are storage
   // paths in the private verification-ids bucket, never public URLs.
+  // Milestone 25: ordinary rows carry account_type 'ordinary' with
+  // full name + country + face photo (and optional government ID);
+  // student rows carry university + student ID as before. Status is
+  // ALWAYS "pending review" from the app, whatever the local record
+  // claims (see below).
+  const isOrdinary = rec.accountType === "ordinary";
   const { error } = await supabase.from("verifications").upsert({
     user_id: userId,
-    university: rec.university,
-    student_id: rec.studentId,
-    student_email: rec.studentEmail || null,
+    account_type: isOrdinary ? "ordinary" : "student",
+    university: isOrdinary ? null : rec.university,
+    student_id: isOrdinary ? null : rec.studentId,
+    student_email: isOrdinary ? null : rec.studentEmail || null,
+    country: isOrdinary ? rec.country : "Nigeria",
+    currency: rec.currency || "NGN",
+    full_name: isOrdinary ? rec.fullName : null,
+    face_photo_url: isOrdinary ? rec.facePhotoUrl || null : null,
+    gov_id_front_url: isOrdinary ? rec.govIdFrontUrl || null : null,
     invite_code: rec.inviteCode,
     status: "pending review",
-    id_front_url: rec.idFrontUrl || null,
-    id_back_url: rec.idBackUrl || null,
+    id_front_url: isOrdinary ? null : rec.idFrontUrl || null,
+    id_back_url: isOrdinary ? null : rec.idBackUrl || null,
   });
   if (error) {
     dbError(error, "save verification");
@@ -418,6 +437,83 @@ export async function uploadVerificationIdPhotos(userId, frontFile, backFile) {
   return { frontPath, backPath };
 }
 
+// Milestone 25 — uploads the ordinary user's selfie (required) and
+// optional government ID photo to the SAME private verification-ids
+// bucket as student ID photos. Mirrors uploadVerificationIdPhotos:
+// 10MB cap, real-photo check, and the two photos must be different
+// files when both are present. Returns { facePath, govIdPath } — the
+// storage paths to store on the verification row.
+export async function uploadFaceVerificationPhotos(userId, selfieFile, govIdFile) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!userId) throw new Error("Sign in first to upload your photos.");
+  if (!selfieFile) {
+    throw new Error("Add a selfie photo — the team checks it before approving you.");
+  }
+  const files = govIdFile
+    ? [
+        [selfieFile, "selfie"],
+        [govIdFile, "government ID"],
+      ]
+    : [[selfieFile, "selfie"]];
+  for (const [file, side] of files) {
+    if (file.type && !file.type.startsWith("image/")) {
+      throw new Error(`The ${side} photo must be a photo — take a photo in the app.`);
+    }
+    if (file.size > MAX_VERIFICATION_PHOTO_MB * 1024 * 1024) {
+      throw new Error(
+        `That photo is too big — keep verification photos under ${MAX_VERIFICATION_PHOTO_MB}MB.`
+      );
+    }
+    await assertRealPhoto(file, side);
+  }
+  if (govIdFile) {
+    if (selfieFile === govIdFile) {
+      throw new Error(
+        "The selfie and the government ID photo must be different files."
+      );
+    }
+    if (
+      selfieFile.size === govIdFile.size &&
+      typeof selfieFile.arrayBuffer === "function" &&
+      typeof govIdFile.arrayBuffer === "function"
+    ) {
+      const [aBytes, bBytes] = await Promise.all([
+        selfieFile.arrayBuffer(),
+        govIdFile.arrayBuffer(),
+      ]);
+      const a = new Uint8Array(aBytes);
+      const b = new Uint8Array(bBytes);
+      let same = a.length === b.length;
+      for (let i = 0; same && i < a.length; i++) {
+        if (a[i] !== b[i]) same = false;
+      }
+      if (same) {
+        throw new Error(
+          "The selfie and the government ID photo must be different files."
+        );
+      }
+    }
+  }
+  const stamp = Date.now();
+  const facePath = `${userId}/face-${stamp}.jpg`;
+  const { error: faceError } = await supabase.storage
+    .from(VERIFICATION_IDS_BUCKET)
+    .upload(facePath, selfieFile, { contentType: "image/jpeg", upsert: false });
+  if (faceError) throw faceError;
+  let govIdPath = null;
+  if (govIdFile) {
+    govIdPath = `${userId}/govid-${stamp}.jpg`;
+    const { error: govError } = await supabase.storage
+      .from(VERIFICATION_IDS_BUCKET)
+      .upload(govIdPath, govIdFile, { contentType: "image/jpeg", upsert: false });
+    if (govError) {
+      await supabase.storage.from(VERIFICATION_IDS_BUCKET).remove([facePath]);
+      throw govError;
+    }
+  }
+  return { facePath, govIdPath };
+}
+
 // Best-effort removal of ID photos, e.g. when the re-submit RPC
 // fails after the new photos were already uploaded. Never throws.
 export async function removeVerificationIdPhotos(paths) {
@@ -436,6 +532,10 @@ export const VERIFICATION_REJECTION_REASONS = [
   "name mismatch",
   "expired",
   "other",
+  // Milestone 25 — face-verification reasons (ordinary users).
+  "blurry selfie",
+  "face not clear",
+  "face does not match ID",
 ];
 
 // Milestone 19 (Decision 2) — a student whose verification is still
@@ -482,6 +582,10 @@ export async function replaceVerificationPhotos(userId, frontFile, backFile) {
 // (milestone-17.sql) puts their row back to 'pending review' with
 // the new photo paths. It — not the app — decides who may re-submit,
 // so a student can never re-approve themselves this way.
+//
+// Milestone 25 follow-up: this RPC assumes student ID front/back
+// photos and cannot be redefined (never-redefine list), so ordinary
+// users re-submit through resubmitFaceVerification below instead.
 export async function resubmitVerification(frontPath, backPath) {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (!frontPath || !backPath) {
@@ -493,6 +597,60 @@ export async function resubmitVerification(frontPath, backPath) {
   });
   if (error) throw error;
   return true;
+}
+
+// Milestone 25 follow-up — rejected ORDINARY user submits a new
+// selfie (+ optional government ID). The new SECURITY DEFINER RPC
+// resubmit_face_verification (milestone-25.sql) puts their row back
+// to 'pending review' with the new photo paths; it — not the app —
+// decides who may re-submit. The gov ID path may be null.
+export async function resubmitFaceVerification(facePath, govIdPath) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!facePath) {
+    throw new Error("Add a selfie photo.");
+  }
+  const { error } = await supabase.rpc("resubmit_face_verification", {
+    p_face_path: facePath,
+    p_gov_id_path: govIdPath || null,
+  });
+  if (error) throw error;
+  return true;
+}
+
+// Milestone 25 follow-up — an ordinary user still under review
+// replaces their selfie (+ optional government ID) while waiting.
+// Mirrors replaceVerificationPhotos: uploads FIRST, then calls the
+// new replace_face_verification_photos RPC; if the RPC fails, the
+// new photos are removed again so no row change happens and nothing
+// is left orphaned in the bucket. Status stays 'pending review';
+// the row's updated_at moves, so the user goes to the back of the
+// review queue. Throws a plain Error on failure.
+export async function replaceFaceVerificationPhotos(userId, selfieFile, govIdFile) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (!userId) throw new Error("Sign in first to replace your photos.");
+  let photoPaths;
+  try {
+    photoPaths = await uploadFaceVerificationPhotos(userId, selfieFile, govIdFile);
+  } catch (err) {
+    if (err instanceof Error) throw err;
+    throw new Error("Your photos could not be uploaded. Please check your connection and try again.");
+  }
+  try {
+    const { error } = await supabase.rpc("replace_face_verification_photos", {
+      p_face_path: photoPaths.facePath,
+      p_gov_id_path: photoPaths.govIdPath || null,
+    });
+    if (error) throw error;
+  } catch (err) {
+    await removeVerificationIdPhotos(
+      [photoPaths.facePath, photoPaths.govIdPath].filter(Boolean)
+    );
+    throw new Error(
+      err?.message ||
+        "Could not replace your photos. Please check your connection and try again."
+    );
+  }
+  return photoPaths;
 }
 
 // All verifications waiting for the team, longest-waiting first.
@@ -507,7 +665,7 @@ export async function fetchPendingVerifications() {
   if (!supabase) return [];
   await requireOwner();
   const selectCols =
-    "user_id, university, student_id, student_email, status, id_front_url, id_back_url, created_at, updated_at, rejection_reason, rejection_note";
+    "user_id, account_type, university, student_id, student_email, country, currency, full_name, face_photo_url, gov_id_front_url, status, id_front_url, id_back_url, created_at, updated_at, rejection_reason, rejection_note";
   const { data, error } = await supabase
     .from("verifications")
     .select(selectCols)
@@ -515,7 +673,7 @@ export async function fetchPendingVerifications() {
     .order("updated_at", { ascending: true })
     .order("created_at", { ascending: true });
   if (!error) return data || [];
-  if (/updated_at/i.test(error.message || "")) {
+  if (/updated_at|account_type|country|currency|full_name|face_photo_url|gov_id_front_url/i.test(error.message || "")) {
     const retry = await supabase
       .from("verifications")
       .select(
@@ -678,18 +836,18 @@ export async function createListingRow(row) {
   // unchecked.
   const { data: verification, error: verificationError } = await supabase
     .from("verifications")
-    .select("user_id, university, status, flagged")
+    .select("user_id, account_type, university, country, currency, status, flagged")
     .eq("user_id", row.seller_id)
     .maybeSingle();
   if (verificationError) {
     throw new Error("Could not check your verification — try again.");
   }
   if (!verification) {
-    throw new Error("Only verified students can sell — finish verification first.");
+    throw new Error("Only verified sellers can sell — finish verification first.");
   }
   if (verification.status === "rejected") {
     throw new Error(
-      "Your verification was not approved — submit it again with clear ID photos to sell."
+      "Your verification was not approved — submit it again with clear photos to sell."
     );
   }
   if (verification.status !== "approved") {
@@ -727,6 +885,8 @@ export async function createListingRow(row) {
       "category",
       "university",
       "state",
+      "country",
+      "currency",
       "ships_to",
       "delivery_methods",
       "courier",
@@ -756,17 +916,18 @@ export async function createListingRow(row) {
   // 'sold' or 'reserved' used to sail through validation and land
   // in the insert as-is.
   clean.status = "active";
-  // The whole form is compulsory — the same rules the Sell page and
-  // the database CHECKs enforce. A crafted call used to publish
-  // with a missing photo, a 2-character description, an unknown
-  // university, or a state that does not match the university.
+  // Milestone 25: a listing carries the seller's locked country and
+  // currency. Students keep university + state; ordinary sellers have
+  // no university — their country is locked instead and `state` is
+  // their free-text region. A listing must match the seller's own
+  // verification on whichever identity they verified with.
+  const isOrdinarySeller = verification.account_type === "ordinary";
   for (const field of [
     "title",
     "price",
     "condition",
     "category",
     "description",
-    "university",
     "state",
     "ships_to",
     "delivery_methods",
@@ -777,25 +938,50 @@ export async function createListingRow(row) {
       throw new Error(`A listing needs a ${field}.`);
     }
   }
-  if (!UNIVERSITY_NAMES.includes(clean.university)) {
-    throw new Error("Choose your university from the list.");
+  if (isOrdinarySeller) {
+    if (!clean.country) {
+      throw new Error("A listing needs a country.");
+    }
+    if (clean.country !== verification.country) {
+      throw new Error(
+        "A listing must use your verified country — you verified in " +
+          verification.country +
+          "."
+      );
+    }
+    if (clean.university) {
+      throw new Error("An ordinary seller's listing has no university.");
+    }
+  } else {
+    if (!clean.university) {
+      throw new Error("A listing needs a university.");
+    }
+    if (!UNIVERSITY_NAMES.includes(clean.university)) {
+      throw new Error("Choose your university from the list.");
+    }
+    // Milestone 22: the university is locked at verification. A
+    // UNIPORT-verified student used to be able to post as "University
+    // of Lagos" — the listing then showed the wrong state, state
+    // filtering and same-state rules broke, and the shipping zone was
+    // priced from the spoofed state. The database trigger is the
+    // backstop (milestone-22.sql); this refuses it in the app first.
+    if (clean.university !== verification.university) {
+      throw new Error(
+        "A listing must use your verified university — you verified as a student of " +
+          verification.university +
+          "."
+      );
+    }
+    if (universityState(clean.university) !== clean.state) {
+      throw new Error("The state does not match that university.");
+    }
+    if (clean.country && clean.country !== "Nigeria") {
+      throw new Error("A student listing is in Nigeria.");
+    }
   }
-  // Milestone 22: the university is locked at verification. A
-  // UNIPORT-verified student used to be able to post as "University
-  // of Lagos" — the listing then showed the wrong state, state
-  // filtering and same-state rules broke, and the shipping zone was
-  // priced from the spoofed state. The database trigger is the
-  // backstop (milestone-22.sql); this refuses it in the app first.
-  if (clean.university !== verification.university) {
-    throw new Error(
-      "A listing must use your verified university — you verified as a student of " +
-        verification.university +
-        "."
-    );
-  }
-  if (universityState(clean.university) !== clean.state) {
-    throw new Error("The state does not match that university.");
-  }
+  // Currency is the seller's locked currency (NGN for students).
+  clean.currency = verification.currency || "NGN";
+  clean.country = isOrdinarySeller ? verification.country : "Nigeria";
   if (
     clean.delivery_methods[0] === "meetup" &&
     (clean.meetup_spot === undefined || clean.meetup_spot === null)
@@ -804,9 +990,9 @@ export async function createListingRow(row) {
   }
   if (
     clean.delivery_methods[0] === "shipping" &&
-    (clean.courier === undefined || clean.courier === null)
+    (clean.courier === undefined || clean.courier === null || !String(clean.courier).trim())
   ) {
-    throw new Error("Choose a courier.");
+    throw new Error("Type the name of the transport you will send it with.");
   }
   const { data, error } = await supabase
     .from("listings")

@@ -132,7 +132,9 @@ function Shell() {
         // is cleared as well: without that, the stale foreign record
         // would still open the full app below.
         const local = getVerification();
-        if (local?.university) {
+        // Milestone 25: a device copy is pushed up when it carries
+        // a university (student) OR an ordinary account type.
+        if (local?.university || local?.accountType === "ordinary") {
           if (local.userId === user.id) {
             await saveVerificationRow(user.id, local).catch(() => false);
             const fresh = await fetchVerificationRow(user.id).catch(() => null);
@@ -280,7 +282,7 @@ function Shell() {
           <footer className="mt-12 border-t border-neutral-200 pt-6 text-sm text-neutral-500 dark:border-neutral-800">
             <p className="font-bold text-neutral-900 dark:text-white">PulseMarket</p>
             <p className="mt-1">
-              Buy and sell safely with verified students at universities across Nigeria.
+              Buy and sell safely with verified sellers around the world.
             </p>
             <p className="mt-2">Support: pulsemarketsupport@gmail.com</p>
             <p className="mt-3 text-xs text-neutral-400">
@@ -387,7 +389,7 @@ function Shell() {
         <footer className="mt-12 border-t border-neutral-200 pt-6 text-sm text-neutral-500 dark:border-neutral-800">
           <p className="font-bold text-neutral-900 dark:text-white">PulseMarket</p>
           <p className="mt-1">
-            Buy and sell safely with verified students at universities across Nigeria.
+            Buy and sell safely with verified sellers around the world.
           </p>
           <p className="mt-2">
             Support: pulsemarketsupport@gmail.com

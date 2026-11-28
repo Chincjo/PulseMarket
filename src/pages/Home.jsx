@@ -10,9 +10,13 @@ export default function Home({ verification }) {
   const [listings, setListings] = useState([]);
   const [loadingListings, setLoadingListings] = useState(true);
 
+  // Milestone 25: students keep the university state; ordinary
+  // users have a country instead (no state). The country is passed
+  // to visibleTo so cross-country same-state listings stay hidden.
   const myState = verification?.university
     ? universityState(verification.university)
     : "";
+  const myCountry = verification?.country || (verification?.university ? "Nigeria" : "");
 
   useEffect(() => {
     let cancelled = false;
@@ -42,7 +46,7 @@ export default function Home({ verification }) {
   // A listing is visible to this student when it is in their state, or the
   // seller ships anywhere in Nigeria. Same-state-only listings from other
   // states never appear here.
-  const visible = listings.filter((l) => visibleTo(l, myState));
+  const visible = listings.filter((l) => visibleTo(l, myState, myCountry || null));
   const nearYou = sortListings(visible.filter((l) => l.state === myState));
   // Milestone 20 (APP-16): "Just dropped" must not repeat the
   // near-you items above it — the same listing used to show twice
@@ -54,10 +58,10 @@ export default function Home({ verification }) {
     <div className="space-y-8">
       <section className="pt-2">
         <h1 className="text-3xl font-bold leading-tight sm:text-4xl">
-          Buy and sell safely with verified students.
+          Buy and sell safely with verified sellers.
         </h1>
         <p className="mt-2 text-neutral-500">
-          Across every Nigerian campus. Your money stays on hold until you
+          Across Nigeria and around the world. Your money stays on hold until you
           meet, inspect and approve.
         </p>
         <form

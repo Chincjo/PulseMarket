@@ -33,6 +33,29 @@ export function bankDetailsReady() {
   return Boolean(PULSEMARKET_BANK.bank && PULSEMARKET_BANK.accountNumber);
 }
 
+// Milestone 25 — bank details for a currency. The PulseMarket bank
+// account is NGN (Moniepoint) only and its fields stay blank on
+// purpose (never invent an account number). For any non-NGN order
+// there are no bank details in the app — the team shares payment
+// details by email instead.
+export function bankDetailsFor(currency) {
+  if (currency && currency !== "NGN") {
+    return {
+      ready: false,
+      note: "The PulseMarket team will share payment details by email.",
+    };
+  }
+  return {
+    ready: bankDetailsReady(),
+    bank: PULSEMARKET_BANK.bank,
+    accountNumber: PULSEMARKET_BANK.accountNumber,
+    accountName: PULSEMARKET_BANK.accountName,
+    note: bankDetailsReady()
+      ? null
+      : "The PulseMarket team will share payment details by email.",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Shipping zones (estimates). Same state ₦1,500, neighbouring state
 // ₦2,500, far state ₦3,500 (the low end of the "₦3,500–4,500" range in
@@ -62,7 +85,32 @@ const NEIGHBOURING_STATES = {
   Ogun: ["Lagos", "Oyo", "Ondo"],
 };
 
-export function shippingZone(buyerState, sellerState) {
+// Milestone 25 — Nigeria keeps the state zones below. Same-country
+// shipping outside Nigeria, and any cross-country (international)
+// shipping, has no fixed fee in the app: the team confirms it, so the
+// fee is 0 here and the caller labels it an estimate / team-confirmed
+// instead of inventing a number.
+export function shippingZone(buyerState, sellerState, buyerCountry = "Nigeria", sellerCountry = "Nigeria") {
+  const buyerC = buyerCountry || "Nigeria";
+  const sellerC = sellerCountry || "Nigeria";
+  if (buyerC !== sellerC) {
+    return {
+      key: "international",
+      label: "International",
+      fee: 0,
+      isEstimate: true,
+      teamConfirmed: true,
+    };
+  }
+  if (buyerC !== "Nigeria") {
+    return {
+      key: "domestic",
+      label: "Same country",
+      fee: 0,
+      isEstimate: true,
+      teamConfirmed: true,
+    };
+  }
   if (!buyerState || !sellerState || buyerState === sellerState) {
     return { key: "same", label: "Same state", fee: 1500, isEstimate: false };
   }

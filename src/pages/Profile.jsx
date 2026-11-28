@@ -13,7 +13,9 @@ export default function Profile({ user, verification }) {
         <div className="flex-1">
           <p className="font-bold">{user?.email || "Guest"}</p>
           <p className="text-sm text-neutral-500">
-            {verification?.university || "Not verified yet"}
+            {verification?.accountType === "ordinary"
+              ? verification?.fullName || verification?.country || "Not verified yet"
+              : verification?.university || "Not verified yet"}
             {verification ? ` · ${verification.status}` : ""}
           </p>
         </div>
@@ -22,7 +24,7 @@ export default function Profile({ user, verification }) {
             while the line below already showed their real status. */}
         {verification?.status === "approved" ? (
           <span className="rounded-full bg-brown-soft px-2.5 py-1 text-xs font-bold text-brown-dark">
-            Verified student
+            {verification?.accountType === "ordinary" ? "Verified seller" : "Verified student"}
           </span>
         ) : null}
       </div>
@@ -43,7 +45,7 @@ export default function Profile({ user, verification }) {
         <div className="rounded-2xl border border-neutral-200 p-4 text-center dark:border-neutral-800">
           <p className="font-bold">Join PulseMarket</p>
           <p className="mt-1 text-sm text-neutral-500">
-            Create an account and verify your student status to buy and sell.
+            Create an account and verify who you are to buy and sell.
           </p>
           <Link to="/verify" className="mt-3 inline-block">
             <PrimaryButton>Join — get verified</PrimaryButton>
@@ -57,10 +59,19 @@ export default function Profile({ user, verification }) {
           </div>
           {verification ? (
             <>
-              <div className="flex justify-between rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
-                <span className="text-neutral-500">University (locked)</span>
-                <span className="font-semibold">{verification.university}</span>
-              </div>
+              {verification.accountType === "ordinary" ? (
+                <div className="flex justify-between rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+                  <span className="text-neutral-500">Country</span>
+                  <span className="font-semibold">
+                    {verification.country} • Currency: {verification.currency || "NGN"} • Locked
+                  </span>
+                </div>
+              ) : (
+                <div className="flex justify-between rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
+                  <span className="text-neutral-500">University (locked)</span>
+                  <span className="font-semibold">{verification.university}</span>
+                </div>
+              )}
               <div className="flex justify-between rounded-2xl border border-neutral-200 p-4 text-sm dark:border-neutral-800">
                 <span className="text-neutral-500">Invite code</span>
                 <Link to="/invite" className="font-semibold text-brown underline">

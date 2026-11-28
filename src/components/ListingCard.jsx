@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { formatNaira } from "../lib/fees";
+import { formatMoney } from "../lib/fees";
 import { isBoosted } from "../lib/listings";
 
 export function BoostedBadge() {
@@ -11,6 +11,10 @@ export function BoostedBadge() {
 }
 
 export function ListingCard({ listing }) {
+  // Milestone 25: country badge + price in the seller's currency.
+  // Listings from before Milestone 25 carry no country — Nigeria.
+  const country = listing.country || "Nigeria";
+  const currency = listing.currency || "NGN";
   return (
     <Link
       to={`/listing/${listing.id}`}
@@ -33,10 +37,14 @@ export function ListingCard({ listing }) {
         {isBoosted(listing) ? <BoostedBadge /> : null}
       </div>
       <p className="text-sm text-neutral-500">
-        {listing.condition} · {listing.university}
+        {listing.condition}
+        {listing.university ? ` · ${listing.university}` : ""}
       </p>
       <p className="text-sm text-neutral-500">{listing.state}</p>
-      <p className="mt-1 font-bold">{formatNaira(listing.price)}</p>
+      <p className="mt-1 font-bold">{formatMoney(listing.price, currency)}</p>
+      <span className="mt-1 inline-block rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-600 dark:bg-neutral-900 dark:text-neutral-300">
+        {country}
+      </span>{" "}
       {listing.ships_to === "nationwide" ? (
         <span className="mt-1 inline-block rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-600 dark:bg-neutral-900 dark:text-neutral-300">
           Ships nationwide

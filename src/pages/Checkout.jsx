@@ -4,26 +4,15 @@
 // the buyer confirms delivery. No payment provider is wired in.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { SAFE_MEETUP_SPOTS, STATES } from "../lib/data";
-import { FEE_LABELS, feeBreakdown, formatNaira, serviceFeeLabel } from "../lib/fees";
+import { GENERIC_MEETUP_SPOTS, SAFE_MEETUP_SPOTS, STATES, convertApprox, countryByName, currencyForCountry } from "../lib/data";
+import { feeBreakdown, feeLabels, formatMoney, serviceFeeLabel } from "../lib/fees";
 import { fetchListing, fetchVerificationRow } from "../lib/listings";
 import { fetchConversationForListingOrThrow } from "../lib/chat";
-import { courierTiers } from "../lib/shipping";
 import { universityState } from "../lib/data";
 import { createOrder } from "../lib/orders";
 import { OWNER_EMAIL, shippingZone } from "../lib/payments";
 import { useAuth } from "../lib/auth";
 import { EmptyState, GhostButton, PrimaryButton, inputCls } from "../components/ui";
-
-const COURIERS = [
-  "GIG Logistics",
-  "GUO Transport",
-  "Chowdeck Relay",
-  "Peace Logistics",
-  "ABC Transport",
-  "DHL Domestic",
-  "Bus Park Waybill",
-];
 
 export default function Checkout() {
   const { listingId } = useParams();
@@ -32,11 +21,13 @@ export default function Checkout() {
   const [listing, setListing] = useState(null);
   const [loading, setLoading] = useState(true);
   const [buyerState, setBuyerState] = useState("");
+  // Milestone 25: the buyer's country (and region for ordinary
+  // users) — students keep the university state as today.
+  const [buyerCountry, setBuyerCountry] = useState("Nigeria");
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [deliveryMethod, setDeliveryMethod] = useState("meetup");
   const [meetupSpot, setMeetupSpot] = useState("");
   const [shipToState, setShipToState] = useState("");
-  const [courier, setCourier] = useState("");
   const [reserving, setReserving] = useState(false);
   const [error, setError] = useState("");
   // The price the buyer and seller agreed in chat (an accepted
@@ -87,7 +78,6 @@ export default function Checkout() {
         setLoading(false);
         if (row) {
           setMeetupSpot(row.meetup_spot || SAFE_MEETUP_SPOTS[0]);
-          setCourier(row.courier || COURIERS[0]);
           const methods = row.delivery_methods || [];
           if (!methods.includes("meetup") && methods.includes("shipping")) {
             setDeliveryMethod("shipping");
@@ -112,7 +102,12 @@ export default function Checkout() {
       });
     if (user) {
       fetchVerificationRow(user.id).then((row) => {
-        if (!cancelled && row?.university) {
+        if (cancelled || !row) return;
+        // Milestone 25: ordinary buyers have a country (and no
+        // university state); students keep the university state.
+        const country = row.country || (row.university ? "Nigeria" : "Nigeria");
+        setBuyerCountry(country);
+        if (row.university) {
           const state = universityState(row.university);
           setBuyerState(state);
           // Ship-to defaults to the buyer's university state, so the
@@ -163,10 +158,21 @@ export default function Checkout() {
       ? agreedPrice
       : listing?.price ?? null;
 
+  // Milestone 25: fees in the listing's (seller's) currency.
+  const listingCurrency = listing?.currency || "NGN";
+  const listingCountry = listing?.country || "Nigeria";
+  const labels = feeLabels(listingCurrency);
   const fees = useMemo(
-    () => (effectivePrice !== null ? feeBreakdown(effectivePrice, paymentMethod) : null),
-    [effectivePrice, paymentMethod]
+    () => (effectivePrice !== null ? feeBreakdown(effectivePrice, paymentMethod, listingCurrency) : null),
+    [effectivePrice, paymentMethod, listingCurrency]
   );
+  // Approximate conversion into the buyer's own currency, always
+  // labelled an estimate (static reference rates, never live).
+  const buyerCurrency = currencyForCountry(countryByName(buyerCountry)?.code);
+  const approxInBuyerCurrency =
+    fees && buyerCurrency !== listingCurrency
+      ? convertApprox(fees.total, listingCurrency, buyerCurrency)
+      : null;
   // No destination, no shipping fee: pricing the fee from an empty
   // state used to charge the same-state ₦1,500 before the buyer had
   // picked anywhere — the total shown was for a trip that was never
@@ -174,9 +180,9 @@ export default function Checkout() {
   const zone = useMemo(
     () =>
       deliveryMethod === "shipping" && listing && (shipToState || buyerState)
-        ? shippingZone(shipToState || buyerState, listing.state)
+        ? shippingZone(shipToState || buyerState, listing.state, buyerCountry, listingCountry)
         : null,
-    [deliveryMethod, shipToState, buyerState, listing]
+    [deliveryMethod, shipToState, buyerState, buyerCountry, listing, listingCountry]
   );
   const shippingFee = zone ? zone.fee : 0;
   const total = fees ? fees.total + shippingFee : 0;
@@ -191,20 +197,13 @@ export default function Checkout() {
   // also allowed shipping for any nationwide listing, so a meetup-only
   // listing could be ordered for shipping.
   const canShip = !listing || !deliveryMethods ? true : deliveryMethods.includes("shipping");
-  // Chowdeck Relay is same-city only — it must never be offered for
-  // shipping to another state. Tier 1 — items over ₦20,000 travel
-  // with GIG or GUO only (see courierTiers in lib/shipping.js); a
-  // park loader or cheaper courier is not offered for them.
-  const isInterstate = Boolean(shipToState && listing && shipToState !== listing.state);
-  const tier = effectivePrice !== null ? courierTiers(effectivePrice) : null;
-  const courierOptions = !isInterstate
-    ? COURIERS
-    : tier && tier.tier === 1
-      ? tier.allowedCouriers
-      : COURIERS.filter((c) => c !== "Chowdeck Relay");
-  const effectiveCourier = courierOptions.includes(courier)
-    ? courier
-    : courierOptions[0];
+  // The transport comes from the listing — the seller's stated
+  // transport, shown as plain text below. The buyer cannot change
+  // it at checkout, and there is no courier list or tier: the
+  // seller types the transport name when they list the item, and
+  // confirms or corrects it (plus the plate / flight number) when
+  // they submit shipping proof.
+  const listingTransport = listing?.courier || null;
 
   async function retryConversation() {
     if (!user) return;
@@ -262,24 +261,6 @@ export default function Checkout() {
     }
     setReserving(true);
     try {
-      const shipState = deliveryMethod === "shipping" ? shipToState || buyerState : null;
-      // Chowdeck Relay is same-city only. The courier list already
-      // drops it once a different state is picked, but when no
-      // state was picked the ship-to state falls back to the
-      // buyer's university state — which can be interstate — while
-      // the courier stays Chowdeck. Force a tracked interstate
-      // courier in that case instead of booking a same-city rider
-      // for an interstate parcel.
-      let finalCourier = effectiveCourier;
-      if (
-        deliveryMethod === "shipping" &&
-        shipState &&
-        listing &&
-        shipState !== listing.state &&
-        finalCourier === "Chowdeck Relay"
-      ) {
-        finalCourier = "GIG Logistics";
-      }
       const order = await createOrder({
         listing,
         buyerId: user.id,
@@ -287,8 +268,15 @@ export default function Checkout() {
         deliveryMethod,
         meetupSpot: deliveryMethod === "meetup" ? meetupSpot : null,
         shipToState: deliveryMethod === "shipping" ? shipToState || buyerState : null,
-        courier: deliveryMethod === "shipping" ? finalCourier : null,
+        // The transport is the seller's stated transport from the
+        // listing; the buyer cannot change it here. transport_ref
+        // stays null — the seller adds the plate / flight number
+        // when they submit shipping proof.
+        courier: deliveryMethod === "shipping" ? listing.courier : null,
+        transportRef: null,
         buyerState,
+        buyerCountry,
+        shipToCountry: deliveryMethod === "shipping" ? buyerCountry : null,
         agreedPrice: effectivePrice !== null && effectivePrice < listing.price ? effectivePrice : null,
         conversationId,
       });
@@ -356,10 +344,15 @@ export default function Checkout() {
         <p className="text-sm text-neutral-500">
           {listing.seller_label} · {listing.state} · {listing.condition}
         </p>
-        <p className="mt-1 text-lg font-bold">{formatNaira(effectivePrice)}</p>
+        <p className="mt-1 text-lg font-bold">{formatMoney(effectivePrice, listingCurrency)}</p>
+        {approxInBuyerCurrency !== null ? (
+          <p className="text-sm text-neutral-500">
+            About {formatMoney(approxInBuyerCurrency, buyerCurrency)} in your currency (estimate — rates are approximate).
+          </p>
+        ) : null}
         {effectivePrice !== null && effectivePrice < listing.price ? (
           <p className="text-sm text-neutral-500">
-            Agreed price — listed at {formatNaira(listing.price)}.
+            Agreed price — listed at {formatMoney(listing.price, listingCurrency)}.
           </p>
         ) : null}
       </div>
@@ -405,6 +398,7 @@ export default function Checkout() {
             (with photo/video). If you do not confirm within 48 hours of delivery, it
             is released to the seller automatically. The seller keeps the full item
             price — the fees below are paid by you.
+            {listingCurrency !== "NGN" ? " The PulseMarket team will share payment details by email." : ""}
           </p>
         )}
       </section>
@@ -432,14 +426,14 @@ export default function Checkout() {
             }`}
           >
             Ship it
-            <span className="block text-xs font-normal text-neutral-500">GIG / GUO between states, Chowdeck Relay same-city.</span>
+            <span className="block text-xs font-normal text-neutral-500">Sent with the transport the seller named.</span>
           </button>
         </div>
         {deliveryMethod === "meetup" && (
           <label className="block text-sm font-semibold">
             Safe meetup spot
             <select value={meetupSpot} onChange={(e) => setMeetupSpot(e.target.value)} className={`${inputCls} mt-1`}>
-              {SAFE_MEETUP_SPOTS.map((s) => (
+              {(listing.university ? SAFE_MEETUP_SPOTS : GENERIC_MEETUP_SPOTS).map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>
@@ -449,47 +443,46 @@ export default function Checkout() {
         )}
         {deliveryMethod === "shipping" && (
           <div className="space-y-2">
-            <label className="block text-sm font-semibold">
-              Ship to (state)
-              <select
-                value={shipToState}
-                onChange={(e) => {
-                  setShipToState(e.target.value);
-                  // Leaving the seller's state drops Chowdeck Relay
-                  // (same-city only) from the courier list.
-                  if (
-                    e.target.value &&
-                    listing &&
-                    e.target.value !== listing.state &&
-                    courier === "Chowdeck Relay"
-                  ) {
-                    setCourier("GIG Logistics");
-                  }
-                }}
-                className={`${inputCls} mt-1`}
-              >
-                <option value="">Choose a state…</option>
-                {STATES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="block text-sm font-semibold">
-              Courier
-              <select value={effectiveCourier} onChange={(e) => setCourier(e.target.value)} className={`${inputCls} mt-1`}>
-                {courierOptions.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {buyerCountry !== "Nigeria" ? (
+              <label className="block text-sm font-semibold">
+                Ship to (state / region in {buyerCountry})
+                <input
+                  value={shipToState}
+                  onChange={(e) => setShipToState(e.target.value)}
+                  maxLength={120}
+                  placeholder="e.g. Greater Accra"
+                  className={`${inputCls} mt-1`}
+                />
+              </label>
+            ) : (
+              <label className="block text-sm font-semibold">
+                Ship to (state)
+                <select
+                  value={shipToState}
+                  onChange={(e) => {
+                    setShipToState(e.target.value);
+                  }}
+                  className={`${inputCls} mt-1`}
+                >
+                  <option value="">Choose a state…</option>
+                  {STATES.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <p className="text-sm">
+              Transport: Sent with{" "}
+              <span className="font-semibold">{listingTransport || "transport to be agreed"}</span>
+              {" "}— the seller's stated transport. The seller adds the plate or
+              flight number when they submit shipping proof.
+            </p>
             {zone && (
               <p className="text-sm text-neutral-500">
-                Shipping zone: {zone.label} — {formatNaira(zone.fee)}
-                {zone.isEstimate ? " (estimate — the exact fee is confirmed when the parcel is booked)" : ""}
+                Shipping zone: {zone.label} — {formatMoney(zone.fee, listingCurrency)}
+                {zone.isEstimate ? " (estimate — the exact fee is confirmed by the team when the parcel is booked)" : ""}
               </p>
             )}
           </div>
@@ -501,34 +494,45 @@ export default function Checkout() {
         <dl className="mt-2 space-y-1 text-sm">
           <div className="flex justify-between">
             <dt>Item price</dt>
-            <dd className="font-semibold">{formatNaira(fees.price)}</dd>
+            <dd className="font-semibold">{formatMoney(fees.price, listingCurrency)}</dd>
           </div>
           <div className="flex justify-between">
             <dt>
               Service fee{" "}
               {paymentMethod === "cash"
-                ? FEE_LABELS.cashNoFee
-                : serviceFeeLabel(effectivePrice)}
+                ? labels.cashNoFee
+                : serviceFeeLabel(effectivePrice, listingCurrency)}
             </dt>
-            <dd className="font-semibold">{formatNaira(fees.serviceFee)}</dd>
+            <dd className="font-semibold">{formatMoney(fees.serviceFee, listingCurrency)}</dd>
           </div>
           <div className="flex justify-between">
             <dt>
               Secure payment fee{" "}
-              {paymentMethod === "cash" ? FEE_LABELS.cashNoFee : FEE_LABELS.secure}
+              {paymentMethod === "cash" ? labels.cashNoFee : labels.secure}
             </dt>
-            <dd className="font-semibold">{formatNaira(fees.secureFee)}</dd>
+            <dd className="font-semibold">{formatMoney(fees.secureFee, listingCurrency)}</dd>
           </div>
           <div className="flex justify-between">
             <dt>Shipping {zone?.isEstimate ? "(estimate)" : ""}</dt>
             <dd className="font-semibold">
-              {deliveryMethod === "shipping" && !zone ? "—" : formatNaira(shippingFee)}
+              {deliveryMethod === "shipping" && !zone ? "—" : formatMoney(shippingFee, listingCurrency)}
             </dd>
           </div>
+          {zone?.teamConfirmed ? (
+            <p className="text-xs text-neutral-500">
+              Shipping is confirmed by the PulseMarket team — no fee is shown here yet.
+            </p>
+          ) : null}
           <div className="flex justify-between border-t border-neutral-200 pt-2 text-base font-bold dark:border-neutral-800">
             <dt>Total to pay</dt>
-            <dd>{formatNaira(total)}</dd>
+            <dd>{formatMoney(total, listingCurrency)}</dd>
           </div>
+          {approxInBuyerCurrency !== null ? (
+            <div className="flex justify-between text-xs text-neutral-500">
+              <dt>About that in {buyerCurrency} (estimate)</dt>
+              <dd>{formatMoney(approxInBuyerCurrency, buyerCurrency)}</dd>
+            </div>
+          ) : null}
         </dl>
         <p className="mt-2 text-xs text-neutral-500">
           {paymentMethod === "cash"

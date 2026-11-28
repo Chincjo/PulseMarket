@@ -1,8 +1,12 @@
 // Milestone 8 — Tracking (route /tracking/:orderId, added by the
 // coordinator). Seller view: shipping proof (Waybill Snap) + checkpoints.
-// Buyer view: checkpoint timeline, courier + waybill, delivery PIN,
-// PIN confirmation, returns. Same-city (Chowdeck Relay) adds a rider
-// card + progress bar. Interstate shows checkpoint stops only.
+// Buyer view: checkpoint timeline, transport + waybill, delivery PIN,
+// PIN confirmation, returns. Same-city adds a rider card + progress
+// bar. Interstate shows checkpoint stops only.
+//
+// The transport is free text the seller types — no courier list, no
+// dropdown, no tier. Same-city means the ship-to state AND country
+// match the listing's state and country, not a transport name.
 //
 // HONESTY RULE: there is no rider GPS feed in this system. This page
 // never draws a live map with a moving rider marker and never claims
@@ -24,8 +28,6 @@ import {
   RETURN_REASONS,
   addCheckpoint,
   confirmDeliveryWithPin,
-  courierEarnsAdvance,
-  courierTiers,
   fetchTracking,
   openReturn,
   rejectReturn,
@@ -115,6 +117,11 @@ export default function Tracking() {
   const [waybillPhoto, setWaybillPhoto] = useState(null);
   const [receiptPhoto, setReceiptPhoto] = useState(null);
   const [driverPhone, setDriverPhone] = useState("");
+  // Transport the seller types at proof time — free text, prefilled
+  // from the listing's stated transport; the plate / flight number
+  // is optional.
+  const [transportName, setTransportName] = useState("");
+  const [transportRef, setTransportRef] = useState("");
 
   // Checkpoint form (seller)
   const [cpStatus, setCpStatus] = useState("picked_up");
@@ -122,7 +129,7 @@ export default function Tracking() {
   const [cpNote, setCpNote] = useState("");
   const [cpPhoto, setCpPhoto] = useState(null);
 
-  // Rider details form (seller, Chowdeck Relay only — Milestone 19)
+  // Rider details form (seller, same-city shipping orders)
   const [riderName, setRiderName] = useState("");
   const [riderPhone, setRiderPhone] = useState("");
 
@@ -146,7 +153,15 @@ export default function Tracking() {
   const isBuyer = user && order && order.buyer_id === user.id;
   const isSeller = user && order && order.seller_id === user.id;
   const isOwner = user?.email === OWNER_EMAIL;
-  const isSameCity = order?.courier === "Chowdeck Relay";
+  // Same-city is a LOCATION comparison, not a transport name: the
+  // ship-to state AND country match the listing's state and country.
+  const isSameCity =
+    Boolean(order) &&
+    Boolean(listing) &&
+    order.delivery_method === "shipping" &&
+    Boolean(order.ship_to_state) &&
+    order.ship_to_state === listing.state &&
+    (order.ship_to_country || "Nigeria") === (listing.country || "Nigeria");
   const isInterstate = order && !isSameCity;
   // The PIN confirm is gated on the buyer's verified unboxing video
   // (lib rule in orders.js) — disable the button with a hint when
@@ -202,10 +217,15 @@ export default function Tracking() {
   // Pre-fill the rider form with whatever is already saved, so the
   // seller corrects the details instead of retyping them. Only runs
   // when a different order loads, never while the seller is typing.
+  // The transport name is prefilled the same way, from the order's
+  // stored transport (the seller's stated transport from the
+  // listing), with the plate / flight number when one is saved.
   useEffect(() => {
     if (order) {
       setRiderName(order.rider_name || "");
       setRiderPhone(order.rider_phone || "");
+      setTransportName(order.courier || "");
+      setTransportRef(order.transport_ref || "");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order?.id]);
@@ -254,6 +274,18 @@ export default function Tracking() {
   // waybill number or a nonsense driver phone went straight to the
   // order. Validate here before anything is submitted.
   function proofReady() {
+    if (!transportName.trim()) {
+      setError("Type the name of the transport carrying this parcel.");
+      return false;
+    }
+    if (transportName.trim().length > 120) {
+      setError("Keep the transport name under 120 characters.");
+      return false;
+    }
+    if (transportRef.trim().length > 120) {
+      setError("Keep the plate / flight number under 120 characters.");
+      return false;
+    }
     if (!waybillNumber.trim()) {
       setError("Enter the waybill number.");
       return false;
@@ -316,16 +348,6 @@ export default function Tracking() {
     );
   }
 
-  const tiers = courierTiers(order.item_price);
-  // The tiers are interstate-only. Chowdeck Relay is the same-city
-  // courier and Bus Park Waybill is the always-allowed fallback, so
-  // neither is "outside the tier" — the old check warned the seller
-  // to contact the team before shipping every legitimate same-city
-  // or bus-park order.
-  const courierAllowed =
-    order.courier === "Chowdeck Relay" ||
-    order.courier === "Bus Park Waybill" ||
-    tiers.allowedCouriers.includes(order.courier);
   const proofChecklist = {
     waybillNumber: waybillNumber.trim().length > 0 || Boolean(order.waybill_number),
     waybillPhoto: Boolean(waybillPhoto) || Boolean(order.waybill_photo),
@@ -344,10 +366,10 @@ export default function Tracking() {
 
   const showProofForm = isSeller && order.status === "held" && order.delivery_method === "shipping" && !order.frozen;
   const showCheckpointForm = isSeller && ["shipped", "delivered"].includes(order.status) && !order.frozen;
-  // Milestone 19, Decision 6: the seller enters the rider's name
-  // and phone for a same-city Chowdeck Relay order, only while the
-  // money is held or the order has shipped. Any other courier or
-  // status keeps rider details team-only (see the database rule).
+  // The seller enters the rider's name and phone for a same-city
+  // shipping order, only while the money is held or the order has
+  // shipped. Same-city is the location comparison above — the
+  // transport name plays no part in it.
   const showRiderForm = isSeller && isSameCity && ["held", "shipped"].includes(order.status);
 
   return (
@@ -363,7 +385,7 @@ export default function Tracking() {
         <p className="text-sm">
           Status: <span className="font-bold capitalize">{order.status}</span>
           {order.delivery_method === "shipping"
-            ? ` · Shipping to ${order.ship_to_state || "—"} via ${order.courier || "courier to be agreed"}`
+            ? ` · Shipping to ${order.ship_to_state || "—"} · Sent with ${order.courier || "transport to be agreed"}${order.transport_ref ? ` · Plate / flight: ${order.transport_ref}` : ""}`
             : " · Meet in person"}
         </p>
       </div>
@@ -374,7 +396,7 @@ export default function Tracking() {
       {/* ---- Same-city: progress bar + rider card (no live map) ---- */}
       {isSameCity && (
         <section className="space-y-4 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
-          <h2 className="text-lg font-bold">Same-city delivery — Chowdeck Relay</h2>
+          <h2 className="text-lg font-bold">Same-city delivery</h2>
           <ol className="space-y-2">
             {progressSteps.map((step, i) => (
               <li key={step} className="flex items-center gap-2 text-sm">
@@ -423,12 +445,12 @@ export default function Tracking() {
               </p>
             )}
           </div>
-          {/* Milestone 19, Decision 6 — seller enters the rider */}
+          {/* Seller enters the rider details for a same-city order */}
           {showRiderForm && !order.frozen && (
             <div className="space-y-2 rounded-xl border border-neutral-200 p-3 dark:border-neutral-800">
               <h3 className="text-sm font-bold">Rider details</h3>
               <p className="text-xs text-neutral-500">
-                Add the Chowdeck rider's name and phone number so the buyer can
+                Add the rider's or driver's name and phone number so the buyer can
                 call them directly. You can correct them here any time while
                 the order is held or shipped.
               </p>
@@ -490,22 +512,28 @@ export default function Tracking() {
             </p>
           )}
           <p className="mt-3 text-xs text-neutral-500">
-            Interstate parcels move through courier hubs, so you see checkpoint stops, not a
-            live map. Delivery time depends on the courier and the distance — ask the seller
+            Interstate parcels move through transport hubs, so you see checkpoint stops, not a
+            live map. Delivery time depends on the transport and the distance — ask the seller
             in chat if you need a date.
           </p>
         </section>
       )}
 
-      {/* ---- Courier + waybill (buyer + owner) ---- */}
+      {/* ---- Transport + waybill (buyer + owner) ---- */}
       {(isBuyer || isOwner) && order.delivery_method === "shipping" && (
         <section className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800">
-          <h2 className="text-lg font-bold">Courier</h2>
+          <h2 className="text-lg font-bold">Transport</h2>
           <dl className="mt-2 space-y-1 text-sm">
             <div className="flex justify-between gap-2">
-              <dt className="text-neutral-500">Courier</dt>
-              <dd className="font-semibold">{order.courier || "Not chosen yet"}</dd>
+              <dt className="text-neutral-500">Transport</dt>
+              <dd className="font-semibold">{order.courier || "Not stated yet"}</dd>
             </div>
+            {order.transport_ref && (
+              <div className="flex justify-between gap-2">
+                <dt className="text-neutral-500">Plate / flight</dt>
+                <dd className="font-semibold">{order.transport_ref}</dd>
+              </div>
+            )}
             <div className="flex justify-between gap-2">
               <dt className="text-neutral-500">Waybill number</dt>
               <dd className="font-semibold">{order.waybill_number || "Not submitted yet"}</dd>
@@ -557,9 +585,9 @@ export default function Tracking() {
         <section className="rounded-2xl border border-brown bg-brown-soft p-4 text-center">
           <h2 className="text-lg font-bold">Delivery PIN</h2>
           <p className="mt-2 text-4xl font-bold tracking-[0.3em]">{order.delivery_pin}</p>
-          <p className="mt-2 text-sm">Share this PIN with the courier at handover.</p>
+          <p className="mt-2 text-sm">Share this PIN with the driver at handover.</p>
           <p className="mt-1 text-xs text-neutral-500">
-            The courier says the PIN back to you, or you type it below to confirm delivery.
+            The driver says the PIN back to you, or you type it below to confirm delivery.
           </p>
         </section>
       )}
@@ -650,20 +678,12 @@ export default function Tracking() {
           {showProofForm ? (
             <>
               <div className="rounded-xl border border-brown/40 bg-brown-soft p-3 text-sm">
-                <p className="font-bold">{tiers.label}</p>
-                <p className="mt-1">{tiers.note}</p>
+                <p className="font-bold">The 50% shipping advance is proof-based</p>
                 <p className="mt-1">
-                  Allowed for this item: {tiers.allowedCouriers.join(", ")}.
-                </p>
-                {!courierAllowed && order.courier && (
-                  <p className="mt-1 font-semibold">
-                    This order's courier ({order.courier}) is outside the tier for this item
-                    price — tell the PulseMarket team before you ship.
-                  </p>
-                )}
-                <p className="mt-1">
-                  Bus Park Waybill is always possible as a fallback, but a park loader with
-                  only a driver phone and no receipt never earns the 50% shipping advance.
+                  A complete proof — a waybill number and a receipt photo — releases 50%
+                  of the shipping fee to your available balance, whatever the transport
+                  is called. A proof with only a driver phone and no receipt still ships
+                  the order but earns no advance.
                 </p>
               </div>
 
@@ -682,6 +702,28 @@ export default function Tracking() {
                 Waybill Snap is guided capture only: photograph the paper waybill and type the
                 number in yourself. There is no OCR and nothing is auto-filled.
               </p>
+
+              <label className="block text-sm font-semibold">
+                Transport — the company or transport carrying this parcel
+                <input
+                  className={`${inputCls} mt-1`}
+                  placeholder="e.g. GIG Logistics, GUO Transport, Air Peace, God is Good Motors, DHL"
+                  maxLength={120}
+                  value={transportName}
+                  onChange={(e) => setTransportName(e.target.value)}
+                />
+              </label>
+
+              <label className="block text-sm font-semibold">
+                Plate / flight number (optional)
+                <input
+                  className={`${inputCls} mt-1`}
+                  placeholder="e.g. bus plate number or flight number"
+                  maxLength={120}
+                  value={transportRef}
+                  onChange={(e) => setTransportRef(e.target.value)}
+                />
+              </label>
 
               <label className="block text-sm font-semibold">
                 Waybill number
@@ -734,15 +776,13 @@ export default function Tracking() {
               </label>
 
               <p className="text-sm text-neutral-500">
-                Courier: <span className="font-semibold text-neutral-900 dark:text-white">{order.courier || "Not chosen yet"}</span>
-                {order.courier && courierEarnsAdvance(order.courier)
-                  ? " — this courier can earn the 50% shipping advance with a complete proof."
-                  : " — this courier does not earn the 50% shipping advance."}
+                Transport: <span className="font-semibold text-neutral-900 dark:text-white">{order.courier || "Not stated yet"}</span>
+                {" — a complete proof (waybill number + receipt photo) earns the 50% shipping advance, whatever the transport is."}
               </p>
 
               <PrimaryButton
                 className="w-full py-3"
-                disabled={busy !== "" || !waybillNumber.trim() || !waybillPhoto}
+                disabled={busy !== "" || !transportName.trim() || !waybillNumber.trim() || !waybillPhoto}
                 onClick={() => {
                   if (!proofReady()) return;
                   run(
@@ -753,6 +793,8 @@ export default function Tracking() {
                         waybillPhoto,
                         receiptPhoto,
                         driverPhone: driverPhone.trim(),
+                        transportName: transportName.trim(),
+                        transportRef: transportRef.trim(),
                       }),
                     () => {
                       setWaybillNumber("");
@@ -780,8 +822,7 @@ export default function Tracking() {
               {["shipped", "delivered"].includes(order.status) &&
                 !order.shipping_advance_released &&
                 order.waybill_number &&
-                order.receipt_photo &&
-                courierEarnsAdvance(order.courier) && (
+                order.receipt_photo && (
                   <div className="mt-3">
                     <PrimaryButton
                       disabled={busy !== ""}
@@ -795,7 +836,7 @@ export default function Tracking() {
                   </div>
                 )}
               <p className="mt-1 text-neutral-500">
-                The delivery PIN is shown to the buyer on this page — they share it with the courier at handover.
+                The delivery PIN is shown to the buyer on this page — they share it with the driver at handover.
               </p>
               {order.waybill_photo && (
                 <p className="mt-2">

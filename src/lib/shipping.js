@@ -1,19 +1,30 @@
-// Milestone 8 — Shipping: couriers, Waybill Snap proof, 50% shipping
-// advance, checkpoints, delivery PIN, returns. Every read function
-// returns null / [] and logs the error when the tables do not exist yet
-// (owner has not run supabase/milestone-8.sql), so the app says so
-// honestly instead of crashing. Write functions throw a clear Error
-// when the caller is not allowed or the order is in the wrong state.
+// Milestone 8 — Shipping: free-text transport, Waybill Snap proof,
+// 50% shipping advance, checkpoints, delivery PIN, returns. Every
+// read function returns null / [] and logs the error when the tables
+// do not exist yet (owner has not run supabase/milestone-8.sql), so
+// the app says so honestly instead of crashing. Write functions
+// throw a clear Error when the caller is not allowed or the order is
+// in the wrong state.
+//
+// THE TRANSPORT MODEL (no courier list anywhere): there is no list
+// of couriers, no dropdown and no tier that restricts which transport
+// a parcel may travel with. The seller types the transport name as
+// free text — a courier (GIG Logistics, GUO Transport, DHL), a bus
+// company (God is Good Motors), an airline (Air Peace flight) or any
+// cargo company. orders.courier (text column, name unchanged) stores
+// that free-text name, and orders.transport_ref stores the plate /
+// flight number when the seller knows it. The transport is shown as
+// "Transport" / "Sent with {name}", never as a choice from a list.
 //
 // Money model (manual escrow, same ledger as Milestone 6):
 //   - The buyer pays the full total up front; the owner confirms the
 //     transfer and the total sits in the seller's "held" bucket.
-//   - Shipping proof: when the proof is COMPLETE (courier is GIG, GUO,
-//     DHL, Peace or ABC AND a waybill number AND a receipt photo are
-//     present), half the shipping fee moves held -> available as a
-//     'shipping_advance'. A bus-park waybill (driver phone only, no
-//     receipt) ships the order but earns NO advance. A missing receipt
-//     photo earns no advance either.
+//   - Shipping proof: when the proof is COMPLETE (a waybill number
+//     AND a receipt photo are present), half the shipping fee moves
+//     held -> available as a 'shipping_advance' — whatever the
+//     transport is called. A bus-park style proof (driver phone
+//     only, no receipt) ships the order but earns NO advance. A
+//     missing receipt photo earns no advance either.
 //   - Returns are resolved by the PulseMarket team only (see
 //     resolveReturn). Balances are SUM(amount) over wallet_ledger —
 //     never stored.
@@ -26,27 +37,6 @@ import { notifyUser } from "./notifications";
 // evidence-media bucket created by Milestone 7, under <user-id>/,
 // the same path pattern as listing photos.
 export const EVIDENCE_BUCKET = "evidence-media";
-
-export const COURIERS = [
-  "GIG Logistics",
-  "GUO Transport",
-  "Chowdeck Relay",
-  "Peace Logistics",
-  "ABC Transport",
-  "DHL Domestic",
-  "Bus Park Waybill",
-];
-
-// Only these couriers can ever earn the 50% shipping advance, and only
-// with a waybill number AND a receipt photo. Chowdeck Relay (same-city)
-// and Bus Park Waybill never earn an advance.
-export const ADVANCE_COURIERS = [
-  "GIG Logistics",
-  "GUO Transport",
-  "DHL Domestic",
-  "Peace Logistics",
-  "ABC Transport",
-];
 
 export const CHECKPOINT_STATUSES = [
   { value: "picked_up", label: "Picked up" },
@@ -168,62 +158,6 @@ async function ledgerMoveAmount(orderId, kind, bucket) {
 }
 
 // ---------------------------------------------------------------------------
-// Courier tiers
-// ---------------------------------------------------------------------------
-//
-// Tier 1 — items above ₦20,000: GIG or GUO only. Expensive items travel
-//   with the big interstate couriers, not a park loader.
-// Tier 2 — items under ₦10,000: Peace or ABC are allowed (the cheaper
-//   interstate options). GIG / GUO / DHL are also accepted but cost more.
-// Between ₦10,000 and ₦20,000: any tracked courier (GIG, GUO, DHL,
-//   Peace, ABC).
-// Tier 3 — Bus Park Waybill: always available as a fallback, but a park
-//   loader with only a driver phone and no receipt NEVER earns the 50%
-//   shipping advance, whatever the item costs.
-// Chowdeck Relay is same-city only, not an interstate tier.
-export function courierTiers(itemPrice) {
-  const price = Math.max(0, Math.round(Number(itemPrice) || 0));
-  if (price > 20000) {
-    return {
-      tier: 1,
-      label: "Tier 1 — GIG or GUO only",
-      allowedCouriers: ["GIG Logistics", "GUO Transport"],
-      note: "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport. A park loader is not allowed for items this valuable.",
-    };
-  }
-  if (price < 10000) {
-    return {
-      tier: 2,
-      label: "Tier 2 — Peace or ABC (cheapest); GIG, GUO and DHL also allowed",
-      allowedCouriers: [
-        "Peace Logistics",
-        "ABC Transport",
-        "GIG Logistics",
-        "GUO Transport",
-        "DHL Domestic",
-      ],
-      note: "This item costs under ₦10,000, so the cheaper interstate couriers Peace Logistics or ABC Transport are allowed. GIG, GUO and DHL are also accepted but cost more.",
-    };
-  }
-  return {
-    tier: 2,
-    label: "Tier 2 — tracked interstate couriers",
-    allowedCouriers: [
-      "GIG Logistics",
-      "GUO Transport",
-      "DHL Domestic",
-      "Peace Logistics",
-      "ABC Transport",
-    ],
-    note: "Any tracked interstate courier is allowed: GIG, GUO, DHL, Peace or ABC.",
-  };
-}
-
-export function courierEarnsAdvance(courier) {
-  return ADVANCE_COURIERS.includes(courier);
-}
-
-// ---------------------------------------------------------------------------
 // Delivery PIN
 // ---------------------------------------------------------------------------
 
@@ -296,7 +230,7 @@ async function removeEvidencePhoto(publicUrl) {
 }
 
 // The delivery PIN belongs to the buyer only (they share it with the
-// courier at handover). Seller-facing reads strip it from the order
+// driver at handover). Seller-facing reads strip it from the order
 // object so the PIN never sits in the seller's page state — the
 // database still returns the full row to a direct API call (see the
 // coordinator's report: hiding it from a determined caller needs a
@@ -373,7 +307,7 @@ async function sameBytes(a, b) {
 // auto-fill anywhere in this flow.
 export async function submitShippingProof(
   orderId,
-  { waybillNumber, waybillPhoto, receiptPhoto, driverPhone }
+  { waybillNumber, waybillPhoto, receiptPhoto, driverPhone, transportName, transportRef }
 ) {
   if (!supabase) throw new Error("Supabase is not configured.");
   const user = await currentUser();
@@ -395,7 +329,6 @@ export async function submitShippingProof(
       ["shipped", "delivered"].includes(order.status) &&
       order.waybill_number &&
       order.receipt_photo &&
-      courierEarnsAdvance(order.courier) &&
       !order.shipping_advance_released
     ) {
       return retryShippingAdvance(orderId);
@@ -407,43 +340,21 @@ export async function submitShippingProof(
   if (order.delivery_method !== "shipping") {
     throw new Error("This order is a meet-in-person order — there is nothing to ship.");
   }
-  // Night deep check 2026-11-27: Tier 1 — a >₦20,000 interstate
-  // order must travel with GIG or GUO. createOrder enforces it,
-  // but an order created with no courier (or through a direct API
-  // call) could reach here with a park loader. Refuse before the
-  // parcel ships, not after. The listing's state comes from the
-  // listing row — the order only carries where it ships to. A
-  // failed listing read fails open here; the database (M23) is the
-  // hard backstop.
-  const { data: listingRow } = await supabase
-    .from("listings")
-    .select("state")
-    .eq("id", order.listing_id)
-    .maybeSingle();
-  if (
-    order.ship_to_state &&
-    listingRow?.state &&
-    order.ship_to_state !== listingRow.state &&
-    (Number(order.item_price) || 0) > 20000 &&
-    !["GIG Logistics", "GUO Transport"].includes(order.courier)
-  ) {
-    throw new Error(
-      "This item costs over ₦20,000, so it must travel with GIG Logistics or GUO Transport — a park loader or cheaper courier is not allowed for items this valuable."
-    );
+  // The transport is free text the seller types — a courier, a bus
+  // company, an airline or any cargo company. It is required here
+  // (the order carries the seller's stated transport from the
+  // listing, but the seller confirms or corrects it at proof time),
+  // and it is saved back onto the order with the proof.
+  const cleanTransportName = String(transportName || "").trim();
+  if (!cleanTransportName) {
+    throw new Error("Type the name of the transport carrying this parcel.");
   }
-  // Morning deep check 2026-11-28: Chowdeck Relay is same-city
-  // only, at ANY price — the Tier-1 check above only constrains
-  // items over ₦20,000. createOrder refuses it too; this re-check
-  // catches an order created before that fix (or by a direct call).
-  if (
-    order.ship_to_state &&
-    listingRow?.state &&
-    order.ship_to_state !== listingRow.state &&
-    order.courier === "Chowdeck Relay"
-  ) {
-    throw new Error(
-      "Chowdeck Relay only delivers within the same city — this parcel is going to another state."
-    );
+  if (cleanTransportName.length > 120) {
+    throw new Error("Keep the transport name under 120 characters.");
+  }
+  const cleanTransportRef = String(transportRef || "").trim();
+  if (cleanTransportRef.length > 120) {
+    throw new Error("Keep the plate / flight number under 120 characters.");
   }
   const waybill = String(waybillNumber || "").trim();
   if (!waybill) {
@@ -457,32 +368,23 @@ export async function submitShippingProof(
   }
   // One waybill number, one order: a number already used for another
   // order of this seller is either a typo or the same parcel being
-  // "shipped" twice to take two advances. Night deep check
-  // 2026-11-27: the same number + the same courier on ANOTHER
-  // seller's order is the same fraud across two accounts, so the
-  // check below matches on courier as well as seller. Best effort
-  // in the app — the orders read policy only shows the caller their
-  // own orders, so a cross-seller reuse is invisible here; the hard
+  // "shipped" twice to take two advances. The check matches on the
+  // waybill number + the same seller only — the transport name is
+  // free text, so it is not part of the match. Best effort in the
+  // app — the orders read policy only shows the caller their own
+  // orders, so a cross-seller reuse is invisible here; the hard
   // backstop is the unique index on waybill_number alone
-  // (orders_waybill_number_unique_idx, milestone-18.sql) — it is
-  // STRICTER than a (courier, waybill_number) index: the same
-  // number with a different courier is also refused. Loosening it
-  // so two couriers may share a number needs Richard's decision
-  // (see the milestone-24 notes). The same number with a different
-  // courier is a coincidence (couriers number parcels
-  // independently), so it does not count.
+  // (orders_waybill_number_unique_idx, milestone-18.sql). The same
+  // number with a different transport is a coincidence (transport
+  // companies number parcels independently), so it does not count.
   if (supabase) {
     const { data: reuse, error: reuseError } = await supabase
       .from("orders")
-      .select("id, code, courier, seller_id")
+      .select("id, code, seller_id")
       .eq("waybill_number", waybill)
       .neq("id", order.id)
       .limit(5);
-    const hit = (reuse || []).find(
-      (r) =>
-        (order.courier && r.courier === order.courier) ||
-        r.seller_id === user.id
-    );
+    const hit = (reuse || []).find((r) => r.seller_id === user.id);
     if (!reuseError && hit) {
       throw new Error(
         `That waybill number was already used for order ${hit.code} — check the number on the paper waybill.`
@@ -525,12 +427,11 @@ export async function submitShippingProof(
     throw err;
   }
 
-  // The advance is earned only with a complete proof: a tracked courier
-  // (GIG, GUO, DHL, Peace or ABC) AND a waybill number AND a receipt
-  // photo. A bus-park waybill (driver phone only, no receipt) and a
+  // The advance is earned only with a complete proof: a waybill
+  // number AND a receipt photo — whatever the transport is called.
+  // A bus-park style proof (driver phone only, no receipt) and a
   // missing receipt photo earn no advance — the order still ships.
-  const proofComplete =
-    courierEarnsAdvance(order.courier) && Boolean(waybill) && Boolean(receiptUrl);
+  const proofComplete = Boolean(waybill) && Boolean(receiptUrl);
   const advanceAmount = Math.floor((Number(order.shipping_fee) || 0) / 2);
 
   // STEP 1 — save the proof and ship the order FIRST. The database
@@ -542,6 +443,8 @@ export async function submitShippingProof(
   let shipped;
   try {
     shipped = await updateOrder(orderId, {
+      courier: cleanTransportName,
+      transport_ref: cleanTransportRef || null,
       waybill_number: waybill,
       waybill_photo: waybillUrl,
       receipt_photo: receiptUrl,
@@ -645,14 +548,10 @@ export async function submitShippingProof(
         }
       }
     }
-  } else if (!courierEarnsAdvance(order.courier)) {
-    reason =
-      order.courier === "Bus Park Waybill"
-        ? "Proof recorded and the order is now shipped — but a bus-park waybill (driver phone only, no receipt) never earns the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery."
-        : "Proof recorded and the order is now shipped — but this courier does not earn the 50% shipping advance. The full shipping fee is released when the buyer confirms delivery.";
   } else if (!receiptUrl) {
-    reason =
-      "Proof recorded and the order is now shipped — but there is no receipt photo, so no shipping advance was released. The full shipping fee is released when the buyer confirms delivery.";
+    reason = cleanDriverPhone
+      ? "Proof recorded and the order is now shipped — but this proof has only a driver phone and no receipt photo, so no shipping advance was released. The full shipping fee is released when the buyer confirms delivery."
+      : "Proof recorded and the order is now shipped — but there is no receipt photo, so no shipping advance was released. The full shipping fee is released when the buyer confirms delivery.";
   } else {
     reason =
       "Proof recorded and the order is now shipped. The shipping fee is released when the buyer confirms delivery.";
@@ -704,12 +603,8 @@ export async function retryShippingAdvance(orderId) {
       reason: "The 50% shipping advance was already released to your available balance.",
     };
   }
-  if (
-    !courierEarnsAdvance(order.courier) ||
-    !order.waybill_number ||
-    !order.receipt_photo
-  ) {
-    throw new Error("No shipping advance is due for this proof — it needs a tracked courier, a waybill number and a receipt photo.");
+  if (!order.waybill_number || !order.receipt_photo) {
+    throw new Error("No shipping advance is due for this proof — it needs a waybill number and a receipt photo.");
   }
   const advanceAmount = Math.floor((Number(order.shipping_fee) || 0) / 2);
   if (advanceAmount <= 0) {
@@ -894,15 +789,16 @@ export async function fetchTracking(orderId) {
 }
 
 // ---------------------------------------------------------------------------
-// Rider details — seller-entered, Chowdeck Relay only (Milestone 19,
-// Decision 6). The seller types the rider's name and phone for a
-// same-city Chowdeck Relay order while it is held or shipped, so the
-// buyer can call the rider instead of asking in chat. The database
-// (supabase/m19/03-admin-rider-caps.sql) allows exactly this case —
-// seller, own order, courier Chowdeck Relay, status held/shipped —
-// and keeps rider details team-only for every other courier/state.
-// This writes through the normal order-update path; it moves no
-// money and changes no status.
+// Rider details — seller-entered, same-city shipping orders only.
+// The seller types the rider's (or driver's) name and phone for a
+// same-city shipping order while it is held or shipped, so the buyer
+// can call the rider instead of asking in chat. Same-city means the
+// ship-to state AND country match the listing's state and country —
+// the transport name plays no part in it. This writes through the
+// normal order-update path; it moves no money and changes no status.
+// NOTE: the database rider rule (supabase/m19/03-admin-rider-caps.sql)
+// still names a courier — the SQL side needs aligning to this same
+// location rule.
 // ---------------------------------------------------------------------------
 
 export async function updateRiderDetails(orderId, { riderName, riderPhone }) {
@@ -917,8 +813,25 @@ export async function updateRiderDetails(orderId, { riderName, riderPhone }) {
   if (order.frozen) {
     throw new Error("This order is frozen — a dispute is open. The PulseMarket team resolves it first.");
   }
-  if (order.courier !== "Chowdeck Relay") {
-    throw new Error("Rider details are only for same-city Chowdeck Relay orders.");
+  if (order.delivery_method !== "shipping") {
+    throw new Error("Rider details are only for shipping orders.");
+  }
+  // Same-city = ship-to state AND country match the listing's state
+  // and country (the listing row is the seller's location — the
+  // order only carries where it ships to). A failed listing read
+  // refuses: same-city cannot be proved without it.
+  const { data: listingRow } = await supabase
+    .from("listings")
+    .select("state, country")
+    .eq("id", order.listing_id)
+    .maybeSingle();
+  const sameCity =
+    Boolean(listingRow) &&
+    Boolean(order.ship_to_state) &&
+    order.ship_to_state === listingRow.state &&
+    (order.ship_to_country || "Nigeria") === (listingRow.country || "Nigeria");
+  if (!sameCity) {
+    throw new Error("Rider details are only for same-city shipping orders — this parcel is going to another state or country.");
   }
   if (!["held", "shipped"].includes(order.status)) {
     throw new Error(

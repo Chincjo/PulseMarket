@@ -77,6 +77,10 @@ const REJECT_REASONS = [
   { value: "name mismatch", label: "Name doesn't match the ID" },
   { value: "expired", label: "Expired ID" },
   { value: "other", label: "Other" },
+  // Milestone 25 — face-verification reasons (ordinary users).
+  { value: "blurry selfie", label: "Blurry selfie" },
+  { value: "face not clear", label: "Face not clear in the selfie" },
+  { value: "face does not match ID", label: "Face does not match the ID" },
 ];
 
 export default function Admin() {
@@ -343,7 +347,7 @@ export default function Admin() {
     if (
       !window.confirm(
         alreadyShipped
-          ? `Refund order ${order.code}? This order already SHIPPED — the parcel may be with the buyer or the courier. The buyer gets item + shipping back (${formatMoney(
+          ? `Refund order ${order.code}? This order already SHIPPED — the parcel may be with the buyer or the transport company. The buyer gets item + shipping back (${formatMoney(
               (order.item_price || 0) + (order.shipping_fee || 0)
             )}) — the fees stay with PulseMarket — and the listing goes back to active. Only refund if the parcel cannot still be delivered.`
           : `Refund order ${order.code}? The buyer gets item + shipping back (${formatMoney(
@@ -415,9 +419,13 @@ export default function Admin() {
     setError("");
     setBusyAction(`photos-${row.user_id}`);
     try {
+      // Milestone 25: ordinary users have a selfie (+ optional gov
+      // ID); students have ID front/back. Same private bucket, same
+      // signed-URL flow — only the paths differ.
+      const isOrdinary = row.account_type === "ordinary";
       const [front, back] = await Promise.all([
-        verificationIdPhotoUrl(row.id_front_url),
-        verificationIdPhotoUrl(row.id_back_url),
+        verificationIdPhotoUrl(isOrdinary ? row.face_photo_url : row.id_front_url),
+        verificationIdPhotoUrl(isOrdinary ? row.gov_id_front_url : row.id_back_url),
       ]);
       setPhotoUrls((prev) => ({ ...prev, [row.user_id]: { front, back, mintedAt: Date.now() } }));
     } catch (err) {
@@ -436,9 +444,16 @@ export default function Admin() {
     // Approving is one-way — it lets the student post and chat at
     // once — so it needs the same confirm step as refunds and
     // cancels. A single stray tap used to approve with no check.
+    // Milestone 25: the confirm names whoever is being approved —
+    // a student by university + student ID, an ordinary user by
+    // full name + country.
+    const who =
+      row.account_type === "ordinary"
+        ? `${row.full_name || "this user"} (${row.country || "no country"}${row.currency ? ` · ${row.currency}` : ""})`
+        : `${row.student_id} (${row.university})`;
     if (
       !window.confirm(
-        `Approve verification for ${row.student_id} (${row.university})? They will be able to post and chat at once.`
+        `Approve verification for ${who}? They will be able to post and chat at once.`
       )
     ) {
       return;
@@ -448,7 +463,7 @@ export default function Admin() {
     setBusyAction(`approved-${row.user_id}`);
     try {
       await reviewVerification(row.user_id, "approved");
-      setNotice(`Verification approved for ${row.student_id} (${row.university}). They can now post and chat.`);
+      setNotice(`Verification approved for ${who}. They can now post and chat.`);
       setViewingPhotos(null);
       await load();
     } catch (err) {
@@ -485,8 +500,12 @@ export default function Admin() {
       );
       const reasonLabel =
         REJECT_REASONS.find((r) => r.value === rejectReason)?.label || rejectReason;
+      const rejectWho =
+        rejectFor.account_type === "ordinary"
+          ? `${rejectFor.full_name || "this user"} (${rejectFor.country || "no country"})`
+          : `${rejectFor.student_id} (${rejectFor.university})`;
       setNotice(
-        `Verification rejected for ${rejectFor.student_id} (${reasonLabel}). They can submit again with new photos.`
+        `Verification rejected for ${rejectWho} (${reasonLabel}). They can submit again with new photos.`
       );
       setRejectFor(null);
       setRejectReason("");
@@ -624,10 +643,11 @@ export default function Admin() {
           <section className="mt-6">
             <h2 className="font-semibold">Pending verifications ({pendingVerifications.length})</h2>
             <p className="mt-1 text-xs text-neutral-500">
-              Students waiting for approval. Check both sides of their student
-              ID before deciding — approving lets them post and chat, rejecting
-              sends them back to submit again with new photos. Photo links
-              work for an hour, then expire.
+              Students and ordinary users waiting for approval. Check both
+              sides of a student ID — or the selfie (and government ID, if
+              any) for an ordinary user — before deciding. Approving lets
+              them post and chat, rejecting sends them back to submit again
+              with new photos. Photo links work for an hour, then expire.
             </p>
             {pendingError ? <p className="mt-2 text-sm text-red-600">{pendingError}</p> : null}
             {pendingVerifications.length === 0 ? (
@@ -639,13 +659,36 @@ export default function Admin() {
                     key={v.user_id}
                     className="rounded-xl border border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-950"
                   >
-                    <p className="text-sm font-bold">{v.university}</p>
-                    <p className="text-sm">Student ID: {v.student_id}</p>
+                    <span className="inline-block rounded-full bg-brown-soft px-2 py-0.5 text-xs font-bold text-brown-dark">
+                      {v.account_type === "ordinary" ? "Ordinary" : "Student"}
+                    </span>
+                    {v.account_type === "ordinary" ? (
+                      <>
+                        <p className="mt-1 text-sm font-bold">{v.full_name || "No name"}</p>
+                        <p className="text-sm">
+                          {v.country || "No country"} · {v.currency || "NGN"}
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="mt-1 text-sm font-bold">{v.university}</p>
+                        <p className="text-sm">Student ID: {v.student_id}</p>
+                      </>
+                    )}
                     <p className="text-xs text-neutral-500">
-                      {v.student_email || "No student email"} · {timeAgo(v.created_at)}
+                      {v.account_type === "ordinary"
+                        ? ""
+                        : `${v.student_email || "No student email"} · `}
+                      {timeAgo(v.created_at)}
                     </p>
                     <p className="mt-1 text-xs text-neutral-500">User: {v.user_id}</p>
-                    {!v.id_front_url && !v.id_back_url ? (
+                    {v.account_type === "ordinary" ? (
+                      !v.face_photo_url ? (
+                        <p className="mt-2 text-sm text-red-600">
+                          No selfie on file — reject so they can submit one.
+                        </p>
+                      ) : null
+                    ) : !v.id_front_url && !v.id_back_url ? (
                       <p className="mt-2 text-sm text-red-600">
                         No ID photo on file — this student verified before photos
                         were collected. Approve only if you know this student, or
@@ -661,8 +704,12 @@ export default function Admin() {
                         {busyAction === `photos-${v.user_id}`
                           ? "Opening…"
                           : viewingPhotos === v.user_id
-                            ? "Hide ID photos"
-                            : "View ID photos"}
+                            ? v.account_type === "ordinary"
+                              ? "Hide photos"
+                              : "Hide ID photos"
+                            : v.account_type === "ordinary"
+                              ? "View selfie + ID"
+                              : "View ID photos"}
                       </GhostButton>
                       <GhostButton
                         type="button"
@@ -689,9 +736,11 @@ export default function Admin() {
                         through; the note is optional (max 280 chars). */}
                     {rejectFor?.user_id === v.user_id ? (
                       <div className="mt-3 rounded-xl border border-neutral-200 p-3 dark:border-neutral-800">
-                        <p className="text-sm font-bold">Why are you rejecting this student?</p>
+                        <p className="text-sm font-bold">
+                          Why are you rejecting {v.account_type === "ordinary" ? "this user" : "this student"}?
+                        </p>
                         <p className="mt-1 text-xs text-neutral-500">
-                          The student sees this reason, so pick the one that
+                          They see this reason, so pick the one that
                           matches — they resubmit with new photos.
                         </p>
                         <div className="mt-2 space-y-1">
@@ -746,19 +795,25 @@ export default function Admin() {
                     {viewingPhotos === v.user_id && photoUrls[v.user_id] ? (
                       <div className="mt-3 grid grid-cols-2 gap-2">
                         <div>
-                          <p className="text-xs font-semibold text-neutral-500">ID front</p>
+                          <p className="text-xs font-semibold text-neutral-500">
+                            {v.account_type === "ordinary" ? "Selfie" : "ID front"}
+                          </p>
                           {photoUrls[v.user_id].front ? (
-                            <img src={photoUrls[v.user_id].front} alt="Student ID front" className="mt-1 w-full rounded-lg object-contain" />
+                            <img src={photoUrls[v.user_id].front} alt={v.account_type === "ordinary" ? "Selfie" : "Student ID front"} className="mt-1 w-full rounded-lg object-contain" />
                           ) : (
-                            <p className="mt-1 text-sm text-neutral-500">No front photo on file.</p>
+                            <p className="mt-1 text-sm text-neutral-500">No photo on file.</p>
                           )}
                         </div>
                         <div>
-                          <p className="text-xs font-semibold text-neutral-500">ID back</p>
+                          <p className="text-xs font-semibold text-neutral-500">
+                            {v.account_type === "ordinary" ? "Government ID" : "ID back"}
+                          </p>
                           {photoUrls[v.user_id].back ? (
-                            <img src={photoUrls[v.user_id].back} alt="Student ID back" className="mt-1 w-full rounded-lg object-contain" />
+                            <img src={photoUrls[v.user_id].back} alt={v.account_type === "ordinary" ? "Government ID" : "Student ID back"} className="mt-1 w-full rounded-lg object-contain" />
                           ) : (
-                            <p className="mt-1 text-sm text-neutral-500">No back photo on file.</p>
+                            <p className="mt-1 text-sm text-neutral-500">
+                              {v.account_type === "ordinary" ? "No government ID on file (optional)." : "No back photo on file."}
+                            </p>
                           )}
                         </div>
                       </div>
@@ -1055,7 +1110,7 @@ export default function Admin() {
                     className="rounded-xl border border-neutral-200 bg-white p-3 text-sm dark:border-neutral-800 dark:bg-neutral-950"
                   >
                     <span className="font-bold">{o.code}</span> · {formatMoney(o.total)} ·{" "}
-                    {o.delivery_method} via {o.courier || "courier to be agreed"} · shipped{" "}
+                    {o.delivery_method} · Sent with {o.courier || "transport to be agreed"}{o.transport_ref ? ` · Plate / flight: ${o.transport_ref}` : ""} · shipped{" "}
                     {o.daysWaiting} day{o.daysWaiting === 1 ? "" : "s"} ago · {timeAgo(o.shipping_proof_at || o.updated_at)}
                     <div className="mt-2 flex flex-wrap gap-2">
                       <GhostButton
